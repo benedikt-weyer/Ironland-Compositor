@@ -34,9 +34,13 @@
 //!
 //! ## Scope
 //!
-//! - Monitor sources only (`AvailableSourceTypes = MONITOR`); there is no
-//!   picker, so a non-`multiple` request records the first advertised
-//!   output and a `multiple` one gets every output as its own stream.
+//! - Monitor sources only (`AvailableSourceTypes = MONITOR`). A
+//!   non-`multiple` request on a multi-monitor setup shows the compositor's
+//!   own monitor chooser (`ironland-permission-prompt-v1`'s `choose_output`:
+//!   a numbered list, with the same number drawn in each monitor's top-left
+//!   corner) and records the one picked; with a single monitor, or on a
+//!   compositor without the chooser, it records the first output. A
+//!   `multiple` request gets every output as its own stream.
 //! - The cursor is whatever the compositor composites into the frame
 //!   (`AvailableCursorModes = EMBEDDED`); it can't be hidden or sent as
 //!   metadata.
@@ -99,6 +103,7 @@ mod permission_prompt_protocol {
 
     wayland_scanner::generate_client_code!("./protocols/ironland-permission-prompt-v1.xml");
 }
+use permission_prompt_protocol::ironland_output_chooser_v1::{self, IronlandOutputChooserV1};
 use permission_prompt_protocol::ironland_permission_prompt_manager_v1::IronlandPermissionPromptManagerV1;
 use permission_prompt_protocol::ironland_permission_prompt_v1::{self, IronlandPermissionPromptV1};
 
@@ -191,12 +196,16 @@ struct App {
     session: SessionState,
     frame: FrameState,
     prompt_answer: Option<bool>,
+    /// `Some(Some(name))` once the user picked a monitor, `Some(None)` if
+    /// they cancelled.
+    chooser_answer: Option<Option<String>>,
+    /// `wl_output` names, by the index each output was bound with.
+    output_names: HashMap<usize, String>,
 }
 
 wayland_client::delegate_noop!(App: ignore wl_shm::WlShm);
 wayland_client::delegate_noop!(App: ignore wayland_client::protocol::wl_shm_pool::WlShmPool);
 wayland_client::delegate_noop!(App: ignore wayland_client::protocol::wl_buffer::WlBuffer);
-wayland_client::delegate_noop!(App: ignore WlOutput);
 wayland_client::delegate_noop!(App: ignore ExtOutputImageCaptureSourceManagerV1);
 wayland_client::delegate_noop!(App: ignore ExtImageCaptureSourceV1);
 wayland_client::delegate_noop!(App: ignore ExtImageCopyCaptureManagerV1);
@@ -250,6 +259,39 @@ impl Dispatch<ExtImageCopyCaptureFrameV1, ()> for App {
             ext_image_copy_capture_frame_v1::Event::Ready => state.frame.ready = true,
             ext_image_copy_capture_frame_v1::Event::Failed { .. } => state.frame.failed = true,
             _ => {}
+        }
+    }
+}
+
+impl Dispatch<WlOutput, usize> for App {
+    fn event(
+        state: &mut Self,
+        _proxy: &WlOutput,
+        event: wayland_client::protocol::wl_output::Event,
+        index: &usize,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        if let wayland_client::protocol::wl_output::Event::Name { name } = event {
+            state.output_names.insert(*index, name);
+        }
+    }
+}
+
+impl Dispatch<IronlandOutputChooserV1, ()> for App {
+    fn event(
+        state: &mut Self,
+        _proxy: &IronlandOutputChooserV1,
+        event: ironland_output_chooser_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        match event {
+            ironland_output_chooser_v1::Event::Chosen { name } => {
+                state.chooser_answer = Some(Some(name));
+            }
+            ironland_output_chooser_v1::Event::Cancelled => state.chooser_answer = Some(None),
         }
     }
 }
@@ -347,17 +389,89 @@ fn ask_permission(app_id: &str, reason: &str) -> Option<bool> {
     app.prompt_answer
 }
 
-/// How many `wl_output`s the capture socket advertises.
-fn output_count() -> usize {
+/// Binds every `wl_output` the registry lists and waits for their names,
+/// returning `(name, output)` pairs in registry order. An output that
+/// doesn't report a name (`wl_output` older than version 4) is called
+/// `output-<index>`.
+fn bind_outputs(
+    globals: &wayland_client::globals::GlobalList,
+    queue: &mut EventQueue<App>,
+    app: &mut App,
+) -> Vec<(String, WlOutput)> {
+    let qh = queue.handle();
+    let globals_list: Vec<(u32, u32)> = globals.contents().with_list(|list| {
+        list.iter()
+            .filter(|g| g.interface == "wl_output")
+            .map(|g| (g.name, g.version))
+            .collect()
+    });
+    let outputs: Vec<WlOutput> = globals_list
+        .iter()
+        .enumerate()
+        .map(|(index, (name, version))| {
+            globals
+                .registry()
+                .bind(*name, (*version).min(4), &qh, index)
+        })
+        .collect();
+    let _ = queue.roundtrip(app);
+    outputs
+        .into_iter()
+        .enumerate()
+        .map(|(index, output)| {
+            let name = app
+                .output_names
+                .get(&index)
+                .cloned()
+                .unwrap_or_else(|| format!("output-{index}"));
+            (name, output)
+        })
+        .collect()
+}
+
+/// The names of the outputs the capture socket advertises.
+fn list_outputs() -> Vec<String> {
     let Some(conn) = connect_capture_socket() else {
-        return 0;
+        return Vec::new();
     };
-    let Ok((globals, _queue)) = registry_queue_init::<App>(&conn) else {
-        return 0;
+    let Ok((globals, mut queue)) = registry_queue_init::<App>(&conn) else {
+        return Vec::new();
     };
-    globals
-        .contents()
-        .with_list(|list| list.iter().filter(|g| g.interface == "wl_output").count())
+    let mut app = App::default();
+    bind_outputs(&globals, &mut queue, &mut app)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect()
+}
+
+enum ChooseError {
+    /// The user dismissed the chooser (or it timed out).
+    Cancelled,
+    /// The compositor can't show a chooser; the caller falls back.
+    Unsupported,
+}
+
+/// Asks the compositor to show its monitor chooser and blocks for the
+/// user's pick, returning the chosen output's name.
+fn ask_output(app_id: &str, reason: &str) -> Result<String, ChooseError> {
+    let conn = connect_capture_socket().ok_or(ChooseError::Unsupported)?;
+    let (globals, mut queue) =
+        registry_queue_init::<App>(&conn).map_err(|_| ChooseError::Unsupported)?;
+    let qh = queue.handle();
+    let manager = globals
+        .bind::<IronlandPermissionPromptManagerV1, _, _>(&qh, 2..=2, ())
+        .map_err(|_| ChooseError::Unsupported)?;
+
+    let mut app = App::default();
+    manager.choose_output(app_id.to_string(), reason.to_string(), &qh, ());
+
+    let stop = AtomicBool::new(false);
+    if !wait_until(&conn, &mut queue, &mut app, REQUEST_TIMEOUT, &stop, |a| {
+        a.chooser_answer.is_some()
+    }) {
+        return Err(ChooseError::Cancelled);
+    }
+    app.chooser_answer.flatten().ok_or(ChooseError::Cancelled)
 }
 
 /// Creates an anonymous (create + immediately unlink) file of `size` bytes
@@ -418,11 +532,11 @@ struct StartedStream {
     size: (u32, u32),
 }
 
-/// The capture thread: negotiates a session on output `output_index`
+/// The capture thread: negotiates a session on the output called `output_name`
 /// (reporting its size through `init`), then captures frames forever,
 /// forwarding each to the PipeWire thread, until stopped.
 fn run_pump(
-    output_index: usize,
+    output_name: String,
     init: mpsc::Sender<Result<(u32, u32), String>>,
     tx: pw::channel::Sender<PwMsg>,
     shared: Arc<StreamShared>,
@@ -443,18 +557,14 @@ fn run_pump(
         Ok(v) => v,
         Err(err) => return fail(format!("no wl_shm: {err}")),
     };
-    let output_global = globals.contents().with_list(|list| {
-        list.iter()
-            .filter(|g| g.interface == "wl_output")
-            .nth(output_index)
-            .map(|g| (g.name, g.version))
-    });
-    let Some((output_name, output_version)) = output_global else {
-        return fail(format!("no output #{output_index}"));
+    let mut app = App::default();
+    let output = bind_outputs(&globals, &mut queue, &mut app)
+        .into_iter()
+        .find(|(name, _)| *name == output_name)
+        .map(|(_, output)| output);
+    let Some(output) = output else {
+        return fail(format!("no output called {output_name}"));
     };
-    let output: WlOutput = globals
-        .registry()
-        .bind(output_name, output_version.min(4), &qh, ());
     let Ok(source_manager) =
         globals.bind::<ExtOutputImageCaptureSourceManagerV1, _, _>(&qh, 1..=1, ())
     else {
@@ -465,7 +575,6 @@ fn run_pump(
         return fail("compositor doesn't support ext-image-copy-capture-v1".into());
     };
 
-    let mut app = App::default();
     let source = source_manager.create_source(&output, &qh, ());
     // The cursor is composited into the frame by the compositor already.
     let session = copy_manager.create_session(&source, Options::empty(), &qh, ());
@@ -792,8 +901,8 @@ fn run_pipewire(
     shared.stop.store(true, Ordering::Relaxed);
 }
 
-/// Starts capturing output `output_index` into a new PipeWire node.
-fn start_stream(output_index: usize) -> Result<StartedStream, String> {
+/// Starts capturing the output called `output_name` into a new PipeWire node.
+fn start_stream(output_name: String) -> Result<StartedStream, String> {
     let shared = Arc::new(StreamShared {
         stop: AtomicBool::new(false),
         streaming: AtomicBool::new(false),
@@ -805,7 +914,7 @@ fn start_stream(output_index: usize) -> Result<StartedStream, String> {
     {
         let tx = tx.clone();
         let shared = shared.clone();
-        std::thread::spawn(move || run_pump(output_index, init_tx, tx, shared));
+        std::thread::spawn(move || run_pump(output_name, init_tx, tx, shared));
     }
     let (width, height) = init_rx
         .recv_timeout(REQUEST_TIMEOUT)
@@ -1052,15 +1161,36 @@ fn start_session(
         return Err(StartError::Denied);
     }
 
-    let outputs = output_count();
-    if outputs == 0 {
+    let outputs = list_outputs();
+    if outputs.is_empty() {
         return Err(StartError::Failed("no outputs available".into()));
     }
-    let wanted = if multiple { outputs } else { 1 };
+    let shown_id = if app_id.is_empty() {
+        "An application"
+    } else {
+        app_id
+    };
+    let wanted: Vec<String> = if multiple || outputs.len() == 1 {
+        outputs
+    } else {
+        // More than one monitor: let the user pick which one, on screen
+        // (each monitor shows its number). A compositor without the
+        // chooser falls back to the first output.
+        match ask_output(shown_id, "record your screen") {
+            Ok(name) if outputs.contains(&name) => vec![name],
+            Ok(name) => {
+                return Err(StartError::Failed(format!(
+                    "chosen output {name} is no longer available"
+                )));
+            }
+            Err(ChooseError::Cancelled) => return Err(StartError::Denied),
+            Err(ChooseError::Unsupported) => outputs.into_iter().take(1).collect(),
+        }
+    };
 
     let mut started = Vec::new();
-    for index in 0..wanted {
-        match start_stream(index) {
+    for name in wanted {
+        match start_stream(name) {
             Ok(stream) => started.push(stream),
             Err(err) => {
                 for stream in &started {

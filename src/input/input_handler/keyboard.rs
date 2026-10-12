@@ -365,6 +365,40 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                         return FilterResult::Intercept(KeyAction::None);
                     }
 
+                    // The monitor chooser (also `crate::permission_prompt`) grabs
+                    // the keyboard the same way: number keys pick that monitor,
+                    // Escape cancels, everything else is consumed.
+                    if data.permission_prompt.chooser_visible() {
+                        if let KeyState::Pressed = state {
+                            let number = match keysym {
+                                Keysym::_1 | Keysym::KP_1 => Some(1),
+                                Keysym::_2 | Keysym::KP_2 => Some(2),
+                                Keysym::_3 | Keysym::KP_3 => Some(3),
+                                Keysym::_4 | Keysym::KP_4 => Some(4),
+                                Keysym::_5 | Keysym::KP_5 => Some(5),
+                                Keysym::_6 | Keysym::KP_6 => Some(6),
+                                Keysym::_7 | Keysym::KP_7 => Some(7),
+                                Keysym::_8 | Keysym::KP_8 => Some(8),
+                                Keysym::_9 | Keysym::KP_9 => Some(9),
+                                _ => None,
+                            };
+                            if keysym == Keysym::Escape {
+                                crate::permission_prompt::resolve_chooser(
+                                    data,
+                                    crate::permission_prompt::ChooserChoice::Cancel,
+                                );
+                            } else if let Some(choice) =
+                                number.and_then(|n| data.permission_prompt.chooser_choice_for_number(n))
+                            {
+                                crate::permission_prompt::resolve_chooser(data, choice);
+                            }
+                            suppressed_keys.push(keysym);
+                        } else {
+                            suppressed_keys.retain(|k| *k != keysym);
+                        }
+                        return FilterResult::Intercept(KeyAction::None);
+                    }
+
                     // While the launcher overlay is open it grabs the whole keyboard:
                     // every key is consumed here instead of being forwarded to the
                     // focused client, whether or not it maps to a launcher action.

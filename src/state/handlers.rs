@@ -603,6 +603,30 @@ impl<BackendData: Backend> crate::permission_prompt::PermissionPromptHandler for
             }
         }
     }
+
+    fn chooser_outputs(&self) -> Vec<crate::permission_prompt::ChooserOutput> {
+        // Numbered left to right (then top to bottom), matching how the
+        // monitors sit side by side, so "1" is the leftmost.
+        let mut outputs: Vec<_> = self
+            .space
+            .outputs()
+            .filter_map(|output| {
+                let geo = self.space.output_geometry(output)?;
+                Some((geo.loc, output))
+            })
+            .collect();
+        outputs.sort_by_key(|(loc, output)| (loc.x, loc.y, output.name()));
+        outputs
+            .into_iter()
+            .map(|(_, output)| crate::permission_prompt::ChooserOutput {
+                name: output.name(),
+                description: output
+                    .current_mode()
+                    .map(|mode| format!("{}x{}", mode.size.w, mode.size.h))
+                    .unwrap_or_default(),
+            })
+            .collect()
+    }
 }
 
 impl<BackendData: Backend> crate::clipboard::ClipboardHistoryHandler for AnvilState<BackendData> {

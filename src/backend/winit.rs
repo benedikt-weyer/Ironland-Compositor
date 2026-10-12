@@ -359,6 +359,23 @@ pub fn run_winit() {
                     .to_physical(scale)
             });
 
+            // The monitor chooser (also `crate::permission_prompt`): the panel
+            // listing monitors, plus this output's own number + name marker
+            // in its top-left corner.
+            let chooser_buffer = state.permission_prompt.ensure_chooser_buffer().cloned();
+            let chooser_location = chooser_buffer.as_ref().map(|_| {
+                let output_size = state.space.output_geometry(&output).unwrap().size;
+                state
+                    .permission_prompt
+                    .chooser_origin_in(output_size)
+                    .to_f64()
+                    .to_physical(scale)
+            });
+            let chooser_label = state
+                .permission_prompt
+                .chooser_label(&output.name())
+                .map(|(buffer, location)| (buffer.clone(), location.to_f64().to_physical(scale)));
+
             let workspace_overlay = state.workspace_overlay_shown.filter(|shown_at| {
                 shown_at.elapsed().as_millis()
                     < crate::shell::workspace::OVERLAY_DURATION_MS as u128
@@ -488,6 +505,31 @@ pub fn run_winit() {
                         renderer,
                         location,
                         prompt_buffer,
+                        None,
+                        None,
+                        None,
+                        Kind::Unspecified,
+                    ) {
+                        elements.push(CustomRenderElements::Overlay(element));
+                    }
+
+                if let (Some(buffer), Some(location)) = (&chooser_buffer, chooser_location)
+                    && let Ok(element) = MemoryRenderBufferRenderElement::from_buffer(
+                        renderer,
+                        location,
+                        buffer,
+                        None,
+                        None,
+                        None,
+                        Kind::Unspecified,
+                    ) {
+                        elements.push(CustomRenderElements::Overlay(element));
+                    }
+                if let Some((buffer, location)) = &chooser_label
+                    && let Ok(element) = MemoryRenderBufferRenderElement::from_buffer(
+                        renderer,
+                        *location,
+                        buffer,
                         None,
                         None,
                         None,

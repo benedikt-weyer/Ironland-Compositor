@@ -49,7 +49,7 @@
     compositor draws itself.
   </description>
 
-  <interface name="ironland_permission_prompt_manager_v1" version="1">
+  <interface name="ironland_permission_prompt_manager_v1" version="2">
     <description summary="manager for permission prompt objects">
       This interface allows a privileged client to ask that a permission
       prompt be shown to the user.
@@ -62,6 +62,23 @@
         to the returned object once the user answers.
       </description>
       <arg name="id" type="new_id" interface="ironland_permission_prompt_v1"/>
+      <arg name="app_id" type="string" summary="requesting application id, shown to the user"/>
+      <arg name="reason" type="string" summary="human-readable description of what's being requested"/>
+    </request>
+
+    <request name="choose_output" since="2">
+      <description summary="ask the user to pick one monitor">
+        Queues a monitor chooser: the compositor shows a panel listing its
+        outputs (numbered left to right) and marks every monitor with the
+        same number in its top-left corner, so the user can tell which is
+        which. Exactly one of `chosen`/`cancelled` is sent to the returned
+        object once the user answers. Waits behind any showing permission
+        prompt, and behind earlier choosers.
+
+        Like `prompt`, this is drawn and answered by the compositor itself;
+        the requester only learns the answer.
+      </description>
+      <arg name="id" type="new_id" interface="ironland_output_chooser_v1"/>
       <arg name="app_id" type="string" summary="requesting application id, shown to the user"/>
       <arg name="reason" type="string" summary="human-readable description of what's being requested"/>
     </request>
@@ -97,6 +114,35 @@
       <description summary="destroy the prompt">
         If not yet answered, this cancels it (dismissing it from the queue,
         or from the screen if it was showing) with no `allowed`/`denied`
+        event sent for it.
+      </description>
+    </request>
+  </interface>
+
+  <interface name="ironland_output_chooser_v1" version="2">
+    <description summary="a queued or showing monitor chooser">
+      See `ironland_permission_prompt_manager_v1.choose_output`.
+    </description>
+
+    <event name="chosen">
+      <description summary="the user picked a monitor">
+        Sent at most once. `name` is the output's name, the same string its
+        `wl_output.name` event (version 4) carries.
+      </description>
+      <arg name="name" type="string" summary="name of the chosen output"/>
+    </event>
+
+    <event name="cancelled">
+      <description summary="the user cancelled, or the chooser was torn down">
+        Sent at most once, when the user dismisses the chooser or the
+        compositor tears it down before it was answered.
+      </description>
+    </event>
+
+    <request name="destroy" type="destructor">
+      <description summary="destroy the chooser">
+        If not yet answered, this cancels it (dismissing it from the queue,
+        or from the screen if it was showing) with no `chosen`/`cancelled`
         event sent for it.
       </description>
     </request>

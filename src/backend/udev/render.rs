@@ -626,6 +626,40 @@ pub(super) fn render_surface<'a>(
         }
     }
 
+    // The monitor chooser (also `crate::permission_prompt`): the panel
+    // listing monitors, plus this output's own number + name marker in its
+    // top-left corner, pushed right behind the permission prompt.
+    let chooser_location = permission_prompt
+        .chooser_origin_in(output_geometry.size)
+        .to_f64()
+        .to_physical(scale);
+    if let Some(buffer) = permission_prompt.ensure_chooser_buffer()
+        && let Ok(element) = MemoryRenderBufferRenderElement::from_buffer(
+            renderer,
+            chooser_location,
+            buffer,
+            None,
+            None,
+            None,
+            Kind::Unspecified,
+        )
+    {
+        custom_elements.push(CustomRenderElements::Overlay(element));
+    }
+    if let Some((buffer, location)) = permission_prompt.chooser_label(&output.name())
+        && let Ok(element) = MemoryRenderBufferRenderElement::from_buffer(
+            renderer,
+            location.to_f64().to_physical(scale),
+            buffer,
+            None,
+            None,
+            None,
+            Kind::Unspecified,
+        )
+    {
+        custom_elements.push(CustomRenderElements::Overlay(element));
+    }
+
     #[cfg(feature = "debug")]
     if let Some(element) = surface.fps_element.as_mut() {
         element.update_fps(surface.fps.avg().round() as u32);

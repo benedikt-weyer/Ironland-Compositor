@@ -35,6 +35,14 @@
 //! `protocols/ironland-permission-prompt-v1.xml`'s own doc for the same
 //! history from the wire format's side.
 //!
+//! The same queue-and-overlay machinery also backs the **monitor chooser**
+//! (`choose_output`, protocol version 2): a numbered list of outputs drawn as
+//! its own panel, with each monitor additionally showing its number and name
+//! in its top-left corner so the user can tell which is which. A number key
+//! or a click picks one, Escape or Cancel dismisses it, and the requester
+//! only ever learns the chosen output's name. It waits behind any showing
+//! permission prompt.
+//!
 //! The prompt is always composited as the frontmost of this compositor's
 //! own overlay elements (`crate::winit`/`crate::udev` push it right after
 //! the pointer/dnd icon, ahead of the launcher, FPS overlay and workspace
@@ -43,7 +51,7 @@
 //! popups, notifications included - see `crate::render::output_elements`),
 //! so nothing can visually cover the prompt while it's showing.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use smithay::backend::allocator::Fourcc;
 use smithay::reexports::wayland_server::{
@@ -60,6 +68,7 @@ use smithay::{
 
 use crate::font::Canvas;
 use crate::ironland_protocols::permission_prompt::{
+    ironland_output_chooser_v1::{self, IronlandOutputChooserV1},
     ironland_permission_prompt_manager_v1::{self, IronlandPermissionPromptManagerV1},
     ironland_permission_prompt_v1::{self, IronlandPermissionPromptV1},
 };
@@ -77,6 +86,40 @@ pub trait PermissionPromptHandler: 'static {
     fn internal_prompt_resolved(&mut self, kind: PromptKind, subject: String, allowed: bool) {
         let _ = (kind, subject, allowed);
     }
+
+    /// The outputs a monitor chooser (see [`ChooserOutput`]) should offer,
+    /// in the order they're numbered. Snapshotted when the chooser is
+    /// requested.
+    fn chooser_outputs(&self) -> Vec<ChooserOutput> {
+        Vec::new()
+    }
+}
+
+/// One monitor offered by a monitor chooser.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChooserOutput {
+    /// The output's name (what `wl_output.name` reports), sent back to the
+    /// requester when it's picked and matched against each output being
+    /// rendered to place its on-screen number.
+    pub name: String,
+    /// Shown next to the name, e.g. `"2560x1440"`.
+    pub description: String,
+}
+
+/// What a click or key in the monitor chooser picked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChooserChoice {
+    /// The output at this index of the chooser's list.
+    Output(usize),
+    Cancel,
+}
+
+#[derive(Debug)]
+struct PendingChooser {
+    app_id: String,
+    reason: String,
+    outputs: Vec<ChooserOutput>,
+    resource: IronlandOutputChooserV1,
 }
 
 /// Which in-memory grant table an internally-queued prompt (see
@@ -131,6 +174,16 @@ const BUTTON_ROW_TOP_GAP: i32 = 14;
 const DENY_LABEL: &str = "Deny (N)";
 const ALLOW_LABEL: &str = "Allow (Y)";
 
+/// Vertical gap between the monitor chooser's rows.
+const CHOOSER_ROW_GAP: i32 = 8;
+/// Scale of the big number + name marking each monitor while a chooser is
+/// showing, and its distance from that monitor's top-left corner.
+const CHOOSER_LABEL_SCALE: i32 = 4;
+const CHOOSER_LABEL_PADDING: i32 = 12;
+const CHOOSER_LABEL_MARGIN: i32 = 16;
+const CANCEL_LABEL: &str = "Cancel (Esc)";
+const CHOOSER_HEADING: &str = "Choose a monitor (number key or click):";
+
 const COLOR_BACKGROUND: [u8; 4] = [40, 30, 30, 245];
 const COLOR_TITLE: [u8; 4] = [235, 230, 225, 255];
 const COLOR_DENY_BUTTON: [u8; 4] = [110, 50, 50, 255];
@@ -172,7 +225,11 @@ fn button_rects(title_lines: usize) -> (Rectangle<i32, Logical>, Rectangle<i32, 
 /// of overflowing it. A single word wider than a line (a long path, say) is
 /// broken across lines. Always at least one line.
 fn wrap_title(app_id: &str, reason: &str) -> Vec<String> {
-    let title = format!("{app_id} wants to {reason}");
+    wrap_text(&format!("{app_id} wants to {reason}"))
+}
+
+/// Word-wraps `title` to the prompt's content width - see [`wrap_title`].
+fn wrap_text(title: &str) -> Vec<String> {
     let char_width = Canvas::text_width("x", FONT_SCALE);
     let max_chars = ((PROMPT_WIDTH - PROMPT_PADDING * 2) / char_width).max(1) as usize;
 
@@ -214,6 +271,37 @@ fn prompt_height(title_lines: usize) -> i32 {
     PROMPT_PADDING * 2 + title_lines as i32 * LINE_HEIGHT + BUTTON_ROW_TOP_GAP + button_height()
 }
 
+/// The monitor chooser's title lines: who wants what, then the heading.
+fn chooser_title(app_id: &str, reason: &str) -> Vec<String> {
+    let mut lines = wrap_title(app_id, reason);
+    lines.push(CHOOSER_HEADING.to_string());
+    lines
+}
+
+/// Row rectangles, in chooser-local logical pixels: one per output, then
+/// Cancel last. The one source of truth drawing and hit-testing share.
+fn chooser_rows(title_lines: usize, outputs: usize) -> Vec<Rectangle<i32, Logical>> {
+    let top = PROMPT_PADDING + title_lines as i32 * LINE_HEIGHT + BUTTON_ROW_TOP_GAP;
+    let width = PROMPT_WIDTH - PROMPT_PADDING * 2;
+    (0..=outputs)
+        .map(|i| {
+            let y = top + i as i32 * (button_height() + CHOOSER_ROW_GAP);
+            Rectangle::new((PROMPT_PADDING, y).into(), (width, button_height()).into())
+        })
+        .collect()
+}
+
+fn chooser_height(title_lines: usize, outputs: usize) -> i32 {
+    let rows = chooser_rows(title_lines, outputs);
+    let bottom = rows.last().map_or(0, |r| r.loc.y + r.size.h);
+    bottom + PROMPT_PADDING
+}
+
+/// `text` cut to at most `max_chars` characters.
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    text.chars().take(max_chars).collect()
+}
+
 /// State of the `ironland_permission_prompt_manager_v1` global.
 #[derive(Debug)]
 pub struct PermissionPromptManagerState {
@@ -221,6 +309,15 @@ pub struct PermissionPromptManagerState {
     queue: VecDeque<PendingPrompt>,
     buffer: Option<MemoryRenderBuffer>,
     dirty: bool,
+    /// Monitor choosers waiting their turn; only the front one is ever
+    /// shown, and only while no permission prompt is (see
+    /// [`Self::chooser_visible`]).
+    choosers: VecDeque<PendingChooser>,
+    chooser_buffer: Option<MemoryRenderBuffer>,
+    /// Per-output "number + name" corner labels for the showing chooser,
+    /// keyed by output name.
+    chooser_labels: HashMap<String, MemoryRenderBuffer>,
+    chooser_dirty: bool,
 }
 
 impl PermissionPromptManagerState {
@@ -235,7 +332,7 @@ impl PermissionPromptManagerState {
         F: Fn(&Client) -> bool + Send + Sync + 'static,
     {
         let global = dh.create_global::<D, IronlandPermissionPromptManagerV1, _>(
-            1,
+            2,
             ManagerGlobalData {
                 filter: Box::new(filter),
             },
@@ -245,6 +342,10 @@ impl PermissionPromptManagerState {
             queue: VecDeque::new(),
             buffer: None,
             dirty: false,
+            choosers: VecDeque::new(),
+            chooser_buffer: None,
+            chooser_labels: HashMap::new(),
+            chooser_dirty: false,
         }
     }
 
@@ -324,6 +425,175 @@ impl PermissionPromptManagerState {
         } else {
             None
         }
+    }
+
+    // -- monitor chooser ------------------------------------------------
+
+    /// Whether the monitor chooser should be showing: one is queued and no
+    /// permission prompt is (prompts take precedence, and the chooser then
+    /// appears once they've been answered).
+    pub fn chooser_visible(&self) -> bool {
+        self.queue.is_empty() && !self.choosers.is_empty()
+    }
+
+    fn chooser_title_lines(&self) -> usize {
+        self.choosers
+            .front()
+            .map_or(1, |c| chooser_title(&c.app_id, &c.reason).len())
+    }
+
+    /// The logical size of the monitor chooser panel.
+    pub fn chooser_logical_size(&self) -> Size<i32, Logical> {
+        let outputs = self.choosers.front().map_or(0, |c| c.outputs.len());
+        Size::from((
+            PROMPT_WIDTH,
+            chooser_height(self.chooser_title_lines(), outputs),
+        ))
+    }
+
+    /// Where the chooser panel is drawn on an output of `output_size` - the
+    /// same top-centered spot the permission prompt uses.
+    pub fn chooser_origin_in(&self, output_size: Size<i32, Logical>) -> Point<i32, Logical> {
+        Point::from(((output_size.w - self.chooser_logical_size().w) / 2, 24))
+    }
+
+    /// Tests a click at `point` (output-local logical coordinates on an
+    /// output of `output_size`) against the chooser's rows.
+    pub fn chooser_hit_test(
+        &self,
+        output_size: Size<i32, Logical>,
+        point: Point<i32, Logical>,
+    ) -> Option<ChooserChoice> {
+        if !self.chooser_visible() {
+            return None;
+        }
+        let front = self.choosers.front()?;
+        let local = point - self.chooser_origin_in(output_size);
+        let rows = chooser_rows(self.chooser_title_lines(), front.outputs.len());
+        let hit = rows.iter().position(|row| row.contains(local))?;
+        Some(if hit < front.outputs.len() {
+            ChooserChoice::Output(hit)
+        } else {
+            ChooserChoice::Cancel
+        })
+    }
+
+    /// The choice for the `n`th (1-based) number key, if the showing
+    /// chooser has that many outputs.
+    pub fn chooser_choice_for_number(&self, n: usize) -> Option<ChooserChoice> {
+        let front = self.choosers.front()?;
+        (1..=front.outputs.len())
+            .contains(&n)
+            .then(|| ChooserChoice::Output(n - 1))
+    }
+
+    fn rasterize_chooser(front: &PendingChooser) -> Canvas {
+        let lines = chooser_title(&front.app_id, &front.reason);
+        let height = chooser_height(lines.len(), front.outputs.len());
+        let mut canvas = Canvas::new(PROMPT_WIDTH as usize, height as usize, COLOR_BACKGROUND);
+
+        for (i, line) in lines.iter().enumerate() {
+            canvas.draw_text(
+                PROMPT_PADDING,
+                PROMPT_PADDING + i as i32 * LINE_HEIGHT,
+                line,
+                FONT_SCALE,
+                COLOR_TITLE,
+            );
+        }
+
+        let rows = chooser_rows(lines.len(), front.outputs.len());
+        let max_chars = ((PROMPT_WIDTH - PROMPT_PADDING * 2 - BUTTON_PADDING_X * 2)
+            / Canvas::text_width("x", FONT_SCALE))
+        .max(1) as usize;
+        for (i, row) in rows.iter().enumerate() {
+            let (color, label) = match front.outputs.get(i) {
+                Some(output) => (
+                    COLOR_ALLOW_BUTTON,
+                    truncate_chars(
+                        &format!("[{}] {}  {}", i + 1, output.name, output.description),
+                        max_chars,
+                    ),
+                ),
+                None => (COLOR_DENY_BUTTON, CANCEL_LABEL.to_string()),
+            };
+            canvas.fill_rect(row.loc.x, row.loc.y, row.size.w, row.size.h, color);
+            canvas.draw_text(
+                row.loc.x + BUTTON_PADDING_X,
+                row.loc.y + BUTTON_PADDING_Y,
+                &label,
+                FONT_SCALE,
+                COLOR_BUTTON_TEXT,
+            );
+        }
+        canvas
+    }
+
+    fn rasterize_chooser_label(index: usize, name: &str) -> Canvas {
+        let text = format!("{}  {}", index + 1, name);
+        let width = Canvas::text_width(&text, CHOOSER_LABEL_SCALE) + CHOOSER_LABEL_PADDING * 2;
+        let height = crate::font::GLYPH_HEIGHT as i32 * CHOOSER_LABEL_SCALE + CHOOSER_LABEL_PADDING * 2;
+        let mut canvas = Canvas::new(width as usize, height as usize, COLOR_BACKGROUND);
+        canvas.draw_text(
+            CHOOSER_LABEL_PADDING,
+            CHOOSER_LABEL_PADDING,
+            &text,
+            CHOOSER_LABEL_SCALE,
+            COLOR_TITLE,
+        );
+        canvas
+    }
+
+    fn memory_buffer(canvas: &Canvas) -> MemoryRenderBuffer {
+        MemoryRenderBuffer::from_slice(
+            &canvas.pixels,
+            Fourcc::Argb8888,
+            (canvas.width as i32, canvas.height as i32),
+            1,
+            Transform::Normal,
+            None,
+        )
+    }
+
+    /// The chooser panel's overlay buffer, rebuilt if the showing chooser
+    /// changed. `None` unless [`Self::chooser_visible`].
+    pub fn ensure_chooser_buffer(&mut self) -> Option<&MemoryRenderBuffer> {
+        if !self.chooser_visible() {
+            return None;
+        }
+        if self.chooser_dirty || self.chooser_buffer.is_none() {
+            let front = self.choosers.front()?;
+            self.chooser_buffer = Some(Self::memory_buffer(&Self::rasterize_chooser(front)));
+            self.chooser_labels.clear();
+            self.chooser_dirty = false;
+        }
+        self.chooser_buffer.as_ref()
+    }
+
+    /// The number + name marker for the output called `output_name`, with
+    /// its output-local logical position (its top-left corner), while the
+    /// chooser is showing. `None` for an output the chooser doesn't list or
+    /// when no chooser is showing.
+    pub fn chooser_label(
+        &mut self,
+        output_name: &str,
+    ) -> Option<(&MemoryRenderBuffer, Point<i32, Logical>)> {
+        if !self.chooser_visible() {
+            return None;
+        }
+        if !self.chooser_labels.contains_key(output_name) {
+            let index = self
+                .choosers
+                .front()?
+                .outputs
+                .iter()
+                .position(|o| o.name == output_name)?;
+            let buffer = Self::memory_buffer(&Self::rasterize_chooser_label(index, output_name));
+            self.chooser_labels.insert(output_name.to_string(), buffer);
+        }
+        self.chooser_labels
+            .get(output_name)
+            .map(|buffer| (buffer, Point::from((CHOOSER_LABEL_MARGIN, CHOOSER_LABEL_MARGIN))))
     }
 
     fn rasterize(front: &PendingPrompt) -> Canvas {
@@ -425,6 +695,36 @@ pub fn answer<D: PermissionPromptHandler>(state: &mut D, allow: bool) -> bool {
     true
 }
 
+/// Answers the showing monitor chooser with `choice`, notifying its
+/// requester, and shows the next queued chooser (if any). Returns whether
+/// a chooser was actually answered (a stray number key past the last
+/// output, say, answers nothing).
+pub fn resolve_chooser<D: PermissionPromptHandler>(state: &mut D, choice: ChooserChoice) -> bool {
+    let prompt_state = state.permission_prompt_state();
+    if !prompt_state.chooser_visible() {
+        return false;
+    }
+    if let ChooserChoice::Output(i) = choice
+        && prompt_state
+            .choosers
+            .front()
+            .is_none_or(|c| i >= c.outputs.len())
+    {
+        return false;
+    }
+    let Some(chooser) = prompt_state.choosers.pop_front() else {
+        return false;
+    };
+    prompt_state.chooser_dirty = true;
+    prompt_state.chooser_buffer = None;
+    prompt_state.chooser_labels.clear();
+    match choice {
+        ChooserChoice::Output(i) => chooser.resource.chosen(chooser.outputs[i].name.clone()),
+        ChooserChoice::Cancel => chooser.resource.cancelled(),
+    }
+    true
+}
+
 /// Global data for the `ironland_permission_prompt_manager_v1` global: the
 /// client filter it's gated behind.
 #[allow(missing_debug_implementations)]
@@ -448,11 +748,44 @@ pub struct ManagerToken;
 #[derive(Debug)]
 pub struct PromptToken;
 
+/// User data attached to an `ironland_output_chooser_v1` resource (nothing
+/// to carry beyond what's already queued).
+#[derive(Debug)]
+pub struct ChooserToken;
+
+impl<D: PermissionPromptHandler> Dispatch2<IronlandOutputChooserV1, D> for ChooserToken {
+    fn request(
+        &self,
+        _state: &mut D,
+        _client: &Client,
+        _resource: &IronlandOutputChooserV1,
+        request: ironland_output_chooser_v1::Request,
+        _dh: &DisplayHandle,
+        _data_init: &mut DataInit<'_, D>,
+    ) {
+        let ironland_output_chooser_v1::Request::Destroy = request;
+    }
+
+    fn destroyed(&self, state: &mut D, _client: ClientId, resource: &IronlandOutputChooserV1) {
+        let prompt_state = state.permission_prompt_state();
+        let Some(pos) = prompt_state.choosers.iter().position(|c| &c.resource == resource) else {
+            return;
+        };
+        prompt_state.choosers.remove(pos);
+        if pos == 0 {
+            prompt_state.chooser_dirty = true;
+            prompt_state.chooser_buffer = None;
+            prompt_state.chooser_labels.clear();
+        }
+    }
+}
+
 impl<D> GlobalDispatch2<IronlandPermissionPromptManagerV1, D> for ManagerGlobalData
 where
     D: PermissionPromptHandler
         + Dispatch<IronlandPermissionPromptManagerV1, ManagerToken>
-        + Dispatch<IronlandPermissionPromptV1, PromptToken>,
+        + Dispatch<IronlandPermissionPromptV1, PromptToken>
+        + Dispatch<IronlandOutputChooserV1, ChooserToken>,
 {
     fn bind(
         &self,
@@ -472,7 +805,9 @@ where
 
 impl<D> Dispatch2<IronlandPermissionPromptManagerV1, D> for ManagerToken
 where
-    D: PermissionPromptHandler + Dispatch<IronlandPermissionPromptV1, PromptToken>,
+    D: PermissionPromptHandler
+        + Dispatch<IronlandPermissionPromptV1, PromptToken>
+        + Dispatch<IronlandOutputChooserV1, ChooserToken>,
 {
     fn request(
         &self,
@@ -492,6 +827,22 @@ where
                     app_id,
                     reason,
                     target: PromptTarget::Requester(resource),
+                });
+            }
+            ironland_permission_prompt_manager_v1::Request::ChooseOutput { id, app_id, reason } => {
+                let resource = data_init.init(id, ChooserToken);
+                let outputs = state.chooser_outputs();
+                if outputs.is_empty() {
+                    resource.cancelled();
+                    return;
+                }
+                let prompt_state = state.permission_prompt_state();
+                prompt_state.chooser_dirty = true;
+                prompt_state.choosers.push_back(PendingChooser {
+                    app_id,
+                    reason,
+                    outputs,
+                    resource,
                 });
             }
             ironland_permission_prompt_manager_v1::Request::Destroy => {}
@@ -556,6 +907,16 @@ mod tests {
         assert!(lines.len() >= 3);
         assert!(lines.iter().all(|l| l.chars().count() <= max_chars()));
         assert_eq!(lines.join("").replace(' ', ""), format!("{path}wantstocaptureyourscreen"));
+    }
+
+    #[test]
+    fn chooser_has_a_row_per_output_plus_cancel() {
+        let rows = chooser_rows(2, 3);
+        assert_eq!(rows.len(), 4);
+        assert!(rows.windows(2).all(|w| w[1].loc.y > w[0].loc.y + w[0].size.h - 1));
+        let last = rows.last().unwrap();
+        assert_eq!(chooser_height(2, 3), last.loc.y + last.size.h + PROMPT_PADDING);
+        assert!(chooser_height(2, 4) > chooser_height(2, 3));
     }
 
     #[test]

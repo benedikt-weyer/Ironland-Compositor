@@ -28,6 +28,23 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             return;
         }
 
+        // Same grab for the monitor chooser: a left-click release on one of
+        // its rows picks that monitor (or cancels).
+        if self.permission_prompt.chooser_visible() {
+            if wl_pointer::ButtonState::Released == state && evt.button() == Some(MouseButton::Left) {
+                let location = self.pointer.current_location();
+                let hit = self.space.output_under(location).next().and_then(|output| {
+                    let output_geo = self.space.output_geometry(output).unwrap();
+                    let local = (location - output_geo.loc.to_f64()).to_i32_round();
+                    self.permission_prompt.chooser_hit_test(output_geo.size, local)
+                });
+                if let Some(choice) = hit {
+                    crate::permission_prompt::resolve_chooser(self, choice);
+                }
+            }
+            return;
+        }
+
         if wl_pointer::ButtonState::Pressed == state {
             let super_held = self
                 .seat
