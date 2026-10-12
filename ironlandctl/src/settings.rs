@@ -73,6 +73,12 @@ pub enum SettingKey {
     PerformanceStutterLog,
     #[value(name = "performance.fps_overlay_interval_ms")]
     PerformanceFpsOverlayIntervalMs,
+    #[value(name = "key_tracker.enabled")]
+    KeyTrackerEnabled,
+    #[value(name = "key_tracker.keys")]
+    KeyTrackerKeys,
+    #[value(name = "key_tracker.position")]
+    KeyTrackerPosition,
     #[value(name = "appearance.dark_mode")]
     AppearanceDarkMode,
     #[value(name = "workspaces.mode")]
@@ -126,6 +132,9 @@ impl SettingKey {
             PerformanceStutterThresholdMs,
             PerformanceStutterLog,
             PerformanceFpsOverlayIntervalMs,
+            KeyTrackerEnabled,
+            KeyTrackerKeys,
+            KeyTrackerPosition,
             AppearanceDarkMode,
             WorkspacesMode,
             WorkspacesCount,
@@ -170,6 +179,9 @@ impl SettingKey {
             PerformanceStutterThresholdMs => "performance.stutter_threshold_ms",
             PerformanceStutterLog => "performance.stutter_log",
             PerformanceFpsOverlayIntervalMs => "performance.fps_overlay_interval_ms",
+            KeyTrackerEnabled => "key_tracker.enabled",
+            KeyTrackerKeys => "key_tracker.keys",
+            KeyTrackerPosition => "key_tracker.position",
             AppearanceDarkMode => "appearance.dark_mode",
             WorkspacesMode => "workspaces.mode",
             WorkspacesCount => "workspaces.count",
@@ -221,6 +233,9 @@ pub fn get(full: &FullConfig, key: SettingKey) -> String {
         PerformanceStutterThresholdMs => cfg.performance.stutter_threshold_ms.to_string(),
         PerformanceStutterLog => cfg.performance.stutter_log.to_string(),
         PerformanceFpsOverlayIntervalMs => cfg.performance.fps_overlay_interval_ms.to_string(),
+        KeyTrackerEnabled => cfg.key_tracker.enabled.to_string(),
+        KeyTrackerKeys => cfg.key_tracker.keys.join(","),
+        KeyTrackerPosition => overlay_position_str(cfg.key_tracker.position).to_string(),
         AppearanceDarkMode => full.appearance.dark_mode.to_string(),
         WorkspacesMode => workspace_mode_str(cfg.workspaces.mode).to_string(),
         WorkspacesCount => cfg.workspaces.count.to_string(),
@@ -316,6 +331,9 @@ fn table_and_leaf(key: SettingKey) -> (&'static [&'static str], &'static str) {
         PerformanceStutterThresholdMs => (&["performance"], "stutter_threshold_ms"),
         PerformanceStutterLog => (&["performance"], "stutter_log"),
         PerformanceFpsOverlayIntervalMs => (&["performance"], "fps_overlay_interval_ms"),
+        KeyTrackerEnabled => (&["key_tracker"], "enabled"),
+        KeyTrackerKeys => (&["key_tracker"], "keys"),
+        KeyTrackerPosition => (&["key_tracker"], "position"),
         AppearanceDarkMode => (&["appearance"], "dark_mode"),
         WorkspacesMode => (&["workspaces"], "mode"),
         WorkspacesCount => (&["workspaces"], "count"),
@@ -360,6 +378,7 @@ pub fn set(doc: &mut DocumentMut, key: SettingKey, raw: &str) -> Result<()> {
         | FocusFollowsMouse
         | FocusMouseFollowsFocus
         | PerformanceFpsOverlay
+        | KeyTrackerEnabled
         | PerformanceStutterLog
         | WorkspacesDynamic
         | WorkspacesOverlay
@@ -410,7 +429,22 @@ pub fn set(doc: &mut DocumentMut, key: SettingKey, raw: &str) -> Result<()> {
             };
             table[leaf] = value(mode);
         }
-        PerformanceFpsOverlayPosition => {
+        KeyTrackerKeys => {
+            let keys: Vec<&str> = raw
+                .split(',')
+                .map(str::trim)
+                .filter(|k| !k.is_empty())
+                .collect();
+            if keys.is_empty() {
+                bail!("expected a comma-separated list of keysym names, e.g. Control_L,Control_R");
+            }
+            let mut array = toml_edit::Array::new();
+            for key in keys {
+                array.push(key);
+            }
+            table[leaf] = value(array);
+        }
+        PerformanceFpsOverlayPosition | KeyTrackerPosition => {
             let position = match raw {
                 "top_left" => "top_left",
                 "top_right" => "top_right",

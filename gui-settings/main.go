@@ -730,7 +730,35 @@ func buildFocusTab(cfg *Config) fyne.CanvasObject {
 	)
 	hint.Wrapping = fyne.TextWrapWord
 
-	return resets.page(container.NewVBox(form, hint))
+	keyTrackerEnabled := widget.NewCheck("Show key tracker overlay (top-left)", func(checked bool) {
+		cfg.KeyTracker.Enabled = checked
+	})
+	keyTrackerEnabled.SetChecked(cfg.KeyTracker.Enabled)
+
+	keyTrackerKeys := widget.NewEntry()
+	keyTrackerKeys.SetText(strings.Join(cfg.KeyTracker.Keys, ", "))
+	keyTrackerKeys.OnChanged = func(text string) {
+		keys := []string{}
+		for _, key := range strings.Split(text, ",") {
+			if key = strings.TrimSpace(key); key != "" {
+				keys = append(keys, key)
+			}
+		}
+		cfg.KeyTracker.Keys = keys
+	}
+
+	keyTrackerHint := widget.NewLabel(
+		"The key tracker shows whether each listed key is currently pressed (xkb keysym names," +
+			" comma-separated, e.g. Control_L, Control_R) - useful for finding a stuck key.",
+	)
+	keyTrackerHint.Wrapping = fyne.TextWrapWord
+
+	keyTrackerForm := widget.NewForm(
+		widget.NewFormItem("", keyTrackerEnabled),
+		widget.NewFormItem("Keys", keyTrackerKeys),
+	)
+
+	return resets.page(container.NewVBox(form, hint, widget.NewSeparator(), keyTrackerForm, keyTrackerHint))
 }
 
 // formatOptionalColor renders a BorderSettings.GradientColor for display:

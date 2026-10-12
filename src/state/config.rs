@@ -50,6 +50,10 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             self.wallpaper = crate::wallpaper::Wallpaper::load(new_config.wallpaper.as_deref());
         }
 
+        if new_config.key_tracker != old_config.key_tracker {
+            self.key_tracker = crate::key_tracker::KeyTracker::new(&new_config.key_tracker);
+        }
+
         let top_bar_changed = new_config.top_bar != old_config.top_bar;
         self.config = new_config;
 

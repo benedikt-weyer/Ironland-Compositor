@@ -123,6 +123,18 @@ type PerformanceSettings struct {
 	FPSOverlayIntervalMs uint32 `json:"fps_overlay_interval_ms"`
 }
 
+// KeyTrackerSettings mirrors `ironland_config::KeyTrackerSettings`: the
+// stuck-key diagnostic overlay, off by default. Carried here so a `Config`
+// round-tripped through this GUI doesn't wipe it (see PerformanceSettings).
+type KeyTrackerSettings struct {
+	Enabled bool `json:"enabled"`
+	// Keys are xkb keysym names, e.g. "Control_L".
+	Keys []string `json:"keys"`
+	// Position is one of "top_left", "top_right", "bottom_left",
+	// "bottom_right".
+	Position string `json:"position"`
+}
+
 // Config mirrors `ironland_config::FullConfig` field-for-field (its own
 // `#[serde(flatten)]` on the inner `Config` puts these fields at the top
 // level, alongside Appearance) - see `ironlandctl show --json`.
@@ -146,6 +158,7 @@ type Config struct {
 	Cursor      CursorSettings            `json:"cursor"`
 	Focus       FocusSettings             `json:"focus"`
 	Performance PerformanceSettings       `json:"performance"`
+	KeyTracker  KeyTrackerSettings        `json:"key_tracker"`
 	Appearance  AppearanceSettings        `json:"appearance"`
 	Shortcuts   map[string][]string       `json:"shortcuts"`
 	Gestures    map[string][]string       `json:"gestures"` // no GUI tab yet; carried through so saving doesn't drop it

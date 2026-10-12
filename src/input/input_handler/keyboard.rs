@@ -255,7 +255,9 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                 });
                 if let Some(surface) = surface {
                     keyboard.set_focus(self, Some(surface.into()), serial);
-                    keyboard.input::<(), _>(self, keycode, state, serial, time, |_, _, _| {
+                    keyboard.input::<(), _>(self, keycode, state, serial, time, |data, _, handle| {
+                        data.key_tracker
+                            .record(&handle.raw_syms(), state == KeyState::Pressed);
                         FilterResult::Forward
                     });
                     return KeyAction::None;
@@ -282,6 +284,9 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                 time,
                 |data, modifiers, handle| {
                     let keysym = handle.modified_sym();
+
+                    data.key_tracker
+                        .record(&handle.raw_syms(), state == KeyState::Pressed);
 
                     debug!(
                         ?state,

@@ -342,6 +342,13 @@ pub fn run_winit() {
                 (buffer, location)
             });
 
+            let key_tracker_buffer_and_location = {
+                let output_size = state.space.output_geometry(&output).unwrap().size;
+                state.key_tracker.overlay(output_size).map(|(buffer, location)| {
+                    (buffer.clone(), location.to_f64().to_physical(scale))
+                })
+            };
+
             let permission_prompt_buffer = state.permission_prompt.ensure_buffer().cloned();
             let permission_prompt_location = permission_prompt_buffer.as_ref().map(|_| {
                 let output_size = state.space.output_geometry(&output).unwrap().size;
@@ -491,6 +498,19 @@ pub fn run_winit() {
 
                 #[cfg(feature = "debug")]
                 elements.push(CustomRenderElements::Fps(fps_element.clone()));
+
+                if let Some((buffer, location)) = &key_tracker_buffer_and_location
+                    && let Ok(element) = MemoryRenderBufferRenderElement::from_buffer(
+                        renderer,
+                        *location,
+                        buffer,
+                        None,
+                        None,
+                        None,
+                        Kind::Unspecified,
+                    ) {
+                        elements.push(CustomRenderElements::Overlay(element));
+                    }
 
                 if let Some((buffer, location)) = &perf_overlay_buffer_and_location
                     && let Ok(element) = MemoryRenderBufferRenderElement::from_buffer(

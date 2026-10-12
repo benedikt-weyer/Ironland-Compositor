@@ -288,6 +288,10 @@ pub struct AnvilState<BackendData: Backend + 'static> {
     /// `crate::perf_overlay::OverlayCache`.
     pub fps_overlay_cache: HashMap<String, crate::perf_overlay::OverlayCache>,
 
+    /// Pressed/unpressed state of the keys listed in `config.key_tracker`,
+    /// fed from the keyboard filter - see `crate::key_tracker`.
+    pub key_tracker: crate::key_tracker::KeyTracker,
+
     /// How long the most recent `dispatch_clients` call (the Wayland
     /// display socket's calloop source, below) took - fed into
     /// `crate::frame_capture`'s "dispatch_clients" stage by whichever
@@ -617,6 +621,7 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             workspace_overlay_shown: None,
             perf_stats: HashMap::new(),
             fps_overlay_cache: HashMap::new(),
+            key_tracker: crate::key_tracker::KeyTracker::new(&config.key_tracker),
             last_dispatch_duration: Duration::ZERO,
             border_cache: HashMap::new(),
             drop_indicator_cache: HashMap::new(),

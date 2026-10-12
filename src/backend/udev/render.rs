@@ -368,6 +368,7 @@ impl AnvilState<UdevData> {
             &self.config.performance,
             &*perf_stats,
             fps_overlay_cache,
+            &mut self.key_tracker,
             pending_captures,
             presented,
         );
@@ -523,6 +524,7 @@ pub(super) fn render_surface<'a>(
     performance: &crate::config::PerformanceSettings,
     perf_stats: &crate::perf_overlay::FrameStats,
     fps_overlay_cache: &mut crate::perf_overlay::OverlayCache,
+    key_tracker: &mut crate::key_tracker::KeyTracker,
     pending_captures: Vec<smithay::wayland::image_copy_capture::Frame>,
     presented: Duration,
 ) -> Result<(bool, RenderElementStates, RenderTimings), SwapBuffersError> {
@@ -629,6 +631,20 @@ pub(super) fn render_surface<'a>(
         element.update_fps(surface.fps.avg().round() as u32);
         surface.fps.tick();
         custom_elements.push(CustomRenderElements::Fps(element.clone()));
+    }
+
+    if let Some((buffer, location)) = key_tracker.overlay(output_geometry.size)
+        && let Ok(element) = MemoryRenderBufferRenderElement::from_buffer(
+            renderer,
+            location.to_f64().to_physical(scale),
+            buffer,
+            None,
+            None,
+            None,
+            Kind::Unspecified,
+        )
+    {
+        custom_elements.push(CustomRenderElements::Overlay(element));
     }
 
     if performance.fps_overlay {

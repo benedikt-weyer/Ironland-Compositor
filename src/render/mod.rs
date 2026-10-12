@@ -5,6 +5,7 @@ pub mod border;
 pub mod cursor;
 pub mod drawing;
 pub mod font;
+pub mod key_tracker;
 pub mod perf_overlay;
 pub mod rounded_corners;
 pub mod wallpaper;

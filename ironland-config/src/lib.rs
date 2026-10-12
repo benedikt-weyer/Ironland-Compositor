@@ -351,6 +351,33 @@ impl Default for PerformanceSettings {
     }
 }
 
+/// Key-state overlay for diagnosing stuck/phantom keys (e.g. a Ctrl key that
+/// reads as held without being touched). Off by default - purely a
+/// diagnostic tool.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct KeyTrackerSettings {
+    /// Draws a small overlay listing each tracked key with a pressed/
+    /// unpressed keycap icon and its name.
+    pub enabled: bool,
+    /// xkb keysym names of the keys to track, e.g. `"Control_L"`, `"Shift_R"`,
+    /// `"a"` (matched case-insensitively against the key's layout-level-0
+    /// symbol, so it follows the active layout/Caps Lock remap).
+    pub keys: Vec<String>,
+    /// Screen corner the overlay is anchored to.
+    pub position: OverlayPosition,
+}
+
+impl Default for KeyTrackerSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            keys: vec!["Control_L".to_string(), "Control_R".to_string()],
+            position: OverlayPosition::TopLeft,
+        }
+    }
+}
+
 /// GUI/CLI-only appearance state: the compositor itself has no notion of a
 /// color scheme, so this isn't part of [`Config`] - the compositor's
 /// [`RawConfig`]-equivalent parser simply ignores an `[appearance]` table it
@@ -379,6 +406,7 @@ struct RawConfig {
     cursor: CursorSettings,
     focus: FocusSettings,
     performance: PerformanceSettings,
+    key_tracker: KeyTrackerSettings,
     shortcuts: HashMap<String, Vec<String>>,
     gestures: HashMap<String, Vec<String>>,
     outputs: HashMap<String, OutputSettings>,
@@ -419,6 +447,8 @@ pub struct Config {
     pub focus: FocusSettings,
     /// FPS overlay and frame stutter analytics (see [`PerformanceSettings`]).
     pub performance: PerformanceSettings,
+    /// Key-state overlay for finding stuck keys (see [`KeyTrackerSettings`]).
+    pub key_tracker: KeyTrackerSettings,
     /// action name -> key combos, e.g. `"toggle_launcher" -> ["ctrl+space"]`.
     /// Always fully populated: entries not overridden by the config file
     /// keep their built-in default.
@@ -457,6 +487,7 @@ impl Default for Config {
             cursor: CursorSettings::default(),
             focus: FocusSettings::default(),
             performance: PerformanceSettings::default(),
+            key_tracker: KeyTrackerSettings::default(),
             shortcuts: default_shortcuts(),
             gestures: default_gestures(),
             outputs: HashMap::new(),
@@ -790,6 +821,7 @@ impl Config {
                     cursor: raw.cursor,
                     focus: raw.focus,
                     performance: raw.performance,
+                    key_tracker: raw.key_tracker,
                     shortcuts,
                     gestures,
                     outputs: raw.outputs,
@@ -874,6 +906,7 @@ mod tests {
             cursor: CursorSettings::default(),
             focus: FocusSettings::default(),
             performance: PerformanceSettings::default(),
+            key_tracker: KeyTrackerSettings::default(),
             shortcuts,
             gestures: HashMap::new(),
             outputs: HashMap::new(),
@@ -1086,6 +1119,22 @@ mod tests {
         assert_eq!(raw.performance.stutter_threshold_ms, 20.0);
         assert!(!raw.performance.stutter_log);
         assert_eq!(raw.performance.fps_overlay_interval_ms, 1000);
+    }
+
+    #[test]
+    fn key_tracker_defaults_off_and_parses() {
+        let raw: RawConfig = toml::from_str("").unwrap();
+        assert_eq!(raw.key_tracker, KeyTrackerSettings::default());
+        assert!(!raw.key_tracker.enabled);
+        assert_eq!(raw.key_tracker.position, OverlayPosition::TopLeft);
+
+        let raw: RawConfig = toml::from_str(
+            "[key_tracker]\nenabled = true\nkeys = [\"Shift_L\"]\nposition = \"bottom_left\"\n",
+        )
+        .unwrap();
+        assert!(raw.key_tracker.enabled);
+        assert_eq!(raw.key_tracker.keys, vec!["Shift_L".to_string()]);
+        assert_eq!(raw.key_tracker.position, OverlayPosition::BottomLeft);
     }
 
     #[test]
