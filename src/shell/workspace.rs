@@ -818,6 +818,15 @@ pub fn move_focused_window<B: Backend>(state: &mut AnvilState<B>, delta: i32, fo
         for o in &outputs {
             set_active(state, o, target_idx);
         }
+        // In `Combined` mode `set_active` runs once per output, and each run
+        // ends in `focus_first_in_workspace`. Every output other than the
+        // window's own has an empty workspace at `target_idx` (a brand new
+        // one, with dynamic workspaces), so its run clears keyboard focus
+        // entirely - leaving no window focused. Refocus the moved window
+        // last, so nothing after it can take focus away again.
+        if window.alive() {
+            tiling::raise_and_focus(state, &window);
+        }
     } else {
         focus_first_in_workspace(state, &output, active);
         if state.config.workspaces.dynamic {
