@@ -1190,30 +1190,109 @@ pub fn cleanup_dead<BackendData: Backend>(state: &mut AnvilState<BackendData>) -
     changed
 }
 
-/// Move keyboard focus to the tiled window neighboring the currently focused
-/// one in `dir`. No-op if the focused window isn't tiled. If there is no
-/// neighbor in that direction on the current output, hops to the adjacent
-/// monitor in `dir` (per the monitor layout) instead, focusing a window there.
-pub fn focus_direction<BackendData: Backend>(state: &mut AnvilState<BackendData>, dir: Direction) {
-    let Some(focused) = current_focused_window(state) else {
-        return;
-    };
-    let Some((output, idx)) = locate(state, &focused) else {
-        return;
-    };
-    let area = tiling_area(&state.space, &output, state.config.gaps.outer as i32);
-    let rects = TilingState::tree(&output, idx).layout(area, state.config.gaps.inner as i32);
-    if let Some(target) = neighbor(&rects, &focused, dir) {
-        raise_and_focus(state, &target);
-        return;
+/// The output keyboard-driven focus/move actions should treat as "current":
+/// the focused window's output (tiled or floating), else the output under the
+/// pointer (so an empty, unfocused monitor still works as a starting point).
+fn current_output<BackendData: Backend>(
+    state: &AnvilState<BackendData>,
+    focused: Option<&WindowElement>,
+) -> Option<Output> {
+    if let Some(w) = focused {
+        if let Some((o, _)) = locate(state, w) {
+            return Some(o);
+        }
+        if let Some(o) = crate::shell::workspace::home_output(w) {
+            return Some(o);
+        }
     }
-    if let Some(next_output) = output_in_direction(state, &output, dir) {
-        let next_idx = WorkspaceState::get(&next_output).active();
-        crate::shell::workspace::focus_first_in_workspace(state, &next_output, next_idx);
+    state
+        .space
+        .output_under(state.pointer.current_location())
+        .next()
+        .or_else(|| state.space.outputs().next())
+        .cloned()
+}
+
+/// Focus the window on `output`'s active workspace nearest to the edge that
+/// `dir` enters through, lined up with `from_y`/`from_x` of the origin. An
+/// empty monitor takes keyboard focus away from windows and receives the
+/// pointer, so the next directional action starts from it.
+fn focus_on_output<BackendData: Backend>(
+    state: &mut AnvilState<BackendData>,
+    output: &Output,
+    dir: Direction,
+    origin: (i32, i32),
+) {
+    let idx = WorkspaceState::get(output).active();
+    let area = tiling_area(&state.space, output, state.config.gaps.outer as i32);
+    let rects = TilingState::tree(output, idx).layout(area, state.config.gaps.inner as i32);
+
+    const FAR: i32 = 1_000_000;
+    let from = match dir {
+        Direction::Left => (FAR, origin.1),
+        Direction::Right => (-FAR, origin.1),
+        Direction::Up => (origin.0, FAR),
+        Direction::Down => (origin.0, -FAR),
+    };
+    let target = rects
+        .iter()
+        .filter(|(w, _)| w.alive())
+        .filter_map(|(w, r)| directional_score(dir, from, center(r)).map(|s| (s, w.clone())))
+        .min_by_key(|(s, _)| *s)
+        .map(|(_, w)| w);
+
+    match target {
+        Some(window) => raise_and_focus(state, &window),
+        None => {
+            crate::shell::workspace::focus_first_in_workspace(state, output, idx);
+            if current_focused_window(state).is_none()
+                && let Some(geo) = state.space.output_geometry(output)
+            {
+                let c = center(&geo);
+                state.pointer.set_location((c.0 as f64, c.1 as f64).into());
+            }
+        }
     }
 }
 
-/// Swap the currently focused tiled window with its neighbor in `dir`.
+/// Move keyboard focus to the tiled window neighboring the currently focused
+/// one in `dir`. If there is no neighbor in that direction on the current
+/// output (or the focused window is floating, or nothing is focused), hops to
+/// the adjacent monitor in `dir` (per the monitor layout), focusing the
+/// window nearest to the edge it enters through.
+pub fn focus_direction<BackendData: Backend>(state: &mut AnvilState<BackendData>, dir: Direction) {
+    let focused = current_focused_window(state);
+    let Some(output) = current_output(state, focused.as_ref()) else {
+        return;
+    };
+    let mut origin = state
+        .space
+        .output_geometry(&output)
+        .map(|g| center(&g))
+        .unwrap_or((0, 0));
+
+    if let Some(focused) = &focused {
+        if let Some((_, idx)) = locate(state, focused) {
+            let area = tiling_area(&state.space, &output, state.config.gaps.outer as i32);
+            let rects = TilingState::tree(&output, idx).layout(area, state.config.gaps.inner as i32);
+            if let Some(target) = neighbor(&rects, focused, dir) {
+                raise_and_focus(state, &target);
+                return;
+            }
+        }
+        if let Some(geo) = state.space.element_geometry(focused) {
+            origin = center(&geo);
+        }
+    }
+
+    if let Some(next_output) = output_in_direction(state, &output, dir) {
+        focus_on_output(state, &next_output, dir, origin);
+    }
+}
+
+/// Swap the currently focused tiled window with its neighbor in `dir`. If
+/// there is no neighbor, moves the window to the adjacent monitor in `dir`
+/// instead.
 pub fn swap_direction<BackendData: Backend>(state: &mut AnvilState<BackendData>, dir: Direction) {
     let Some(focused) = current_focused_window(state) else {
         return;
@@ -1224,6 +1303,7 @@ pub fn swap_direction<BackendData: Backend>(state: &mut AnvilState<BackendData>,
     let area = tiling_area(&state.space, &output, state.config.gaps.outer as i32);
     let rects = TilingState::tree(&output, idx).layout(area, state.config.gaps.inner as i32);
     let Some(target) = neighbor(&rects, &focused, dir) else {
+        crate::shell::workspace::move_focused_window_to_monitor(state, dir);
         return;
     };
     TilingState::tree_mut(&output, idx).swap(&focused, &target);

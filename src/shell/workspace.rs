@@ -720,6 +720,11 @@ fn set_active<B: Backend>(state: &mut AnvilState<B>, output: &Output, new_idx: u
     }
 }
 
+/// The output a window (tiled or floating) belongs to, if it has been assigned one.
+pub(crate) fn home_output(window: &WindowElement) -> Option<Output> {
+    WindowHome::get(window).output.borrow().clone()
+}
+
 /// Switches `output` (and, in `Combined` mode, every output) `delta`
 /// workspaces over (-1 = previous, +1 = next). No-op if that would go out
 /// of bounds.
