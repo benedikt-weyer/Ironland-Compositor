@@ -346,14 +346,14 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                     // While a screen-capture permission prompt (see
                     // `crate::permission_prompt`) is showing it grabs the
                     // whole keyboard, same as the launcher below: every key
-                    // is consumed, Enter/Escape answer it.
+                    // is consumed, Enter/Y allow and Escape/N deny.
                     if data.permission_prompt.is_visible() {
                         if let KeyState::Pressed = state {
                             match keysym {
-                                Keysym::Return | Keysym::KP_Enter => {
+                                Keysym::Return | Keysym::KP_Enter | Keysym::y | Keysym::Y => {
                                     crate::permission_prompt::answer(data, true);
                                 }
-                                Keysym::Escape => {
+                                Keysym::Escape | Keysym::n | Keysym::N => {
                                     crate::permission_prompt::answer(data, false);
                                 }
                                 _ => {}

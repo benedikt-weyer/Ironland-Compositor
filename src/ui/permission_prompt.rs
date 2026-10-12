@@ -23,7 +23,7 @@
 //! way the launcher does) as a clickable Allow/Deny pair - answered either
 //! by clicking one (`crate::input_handler::on_pointer_button`, hit-tested
 //! against [`PermissionPromptManagerState::hit_test`]) or by the user's
-//! Enter/Escape (`crate::input_handler`'s keyboard path) - there is
+//! Enter/Y (allow) or Escape/N (deny) (`crate::input_handler`'s keyboard path) - there is
 //! deliberately no way for any client to take over rendering a prompt or
 //! to answer on the user's behalf. An earlier version of this module let a
 //! second privileged client (a *renderer*, in practice this compositor's
@@ -126,6 +126,11 @@ const BUTTON_PADDING_Y: i32 = 9;
 const BUTTON_GAP: i32 = 16;
 const BUTTON_ROW_TOP_GAP: i32 = 14;
 
+/// Button labels, with the keyboard shortcut that answers each (see
+/// `crate::input_handler`'s keyboard path).
+const DENY_LABEL: &str = "Deny (N)";
+const ALLOW_LABEL: &str = "Allow (Y)";
+
 const COLOR_BACKGROUND: [u8; 4] = [40, 30, 30, 245];
 const COLOR_TITLE: [u8; 4] = [235, 230, 225, 255];
 const COLOR_DENY_BUTTON: [u8; 4] = [110, 50, 50, 255];
@@ -144,11 +149,11 @@ fn button_height() -> i32 {
 /// [`PermissionPromptManagerState::origin_in`] to place them on an
 /// output). Centered as a pair under the title line; sized to fit each
 /// label plus [`BUTTON_PADDING_X`] on every side. Takes no prompt-specific
-/// input - the labels are fixed strings, so the layout never changes.
+/// input - the labels are fixed strings ([`DENY_LABEL`]/[`ALLOW_LABEL`]), so the layout never changes.
 fn button_rects() -> (Rectangle<i32, Logical>, Rectangle<i32, Logical>) {
     let height = button_height();
-    let deny_width = Canvas::text_width("Deny", FONT_SCALE) + BUTTON_PADDING_X * 2;
-    let allow_width = Canvas::text_width("Allow", FONT_SCALE) + BUTTON_PADDING_X * 2;
+    let deny_width = Canvas::text_width(DENY_LABEL, FONT_SCALE) + BUTTON_PADDING_X * 2;
+    let allow_width = Canvas::text_width(ALLOW_LABEL, FONT_SCALE) + BUTTON_PADDING_X * 2;
     let content_width = PROMPT_WIDTH - PROMPT_PADDING * 2;
     let row_width = deny_width + BUTTON_GAP + allow_width;
     let row_x = PROMPT_PADDING + (content_width - row_width) / 2;
@@ -292,19 +297,19 @@ impl PermissionPromptManagerState {
             COLOR_ALLOW_BUTTON,
         );
 
-        let deny_label_width = Canvas::text_width("Deny", FONT_SCALE);
+        let deny_label_width = Canvas::text_width(DENY_LABEL, FONT_SCALE);
         canvas.draw_text(
             deny.loc.x + (deny.size.w - deny_label_width) / 2,
             deny.loc.y + BUTTON_PADDING_Y,
-            "Deny",
+            DENY_LABEL,
             FONT_SCALE,
             COLOR_BUTTON_TEXT,
         );
-        let allow_label_width = Canvas::text_width("Allow", FONT_SCALE);
+        let allow_label_width = Canvas::text_width(ALLOW_LABEL, FONT_SCALE);
         canvas.draw_text(
             allow.loc.x + (allow.size.w - allow_label_width) / 2,
             allow.loc.y + BUTTON_PADDING_Y,
-            "Allow",
+            ALLOW_LABEL,
             FONT_SCALE,
             COLOR_BUTTON_TEXT,
         );
@@ -351,7 +356,7 @@ fn send_answer<D: PermissionPromptHandler>(state: &mut D, prompt: PendingPrompt,
 }
 
 /// Answers the currently-showing prompt (the compositor's own overlay, via
-/// the user's Enter/Escape - see `crate::input_handler`) and shows the next
+/// the user's Enter/Y or Escape/N - see `crate::input_handler`) and shows the next
 /// queued one, if any. Returns whether a prompt was actually answered, so
 /// callers know whether to consume the key.
 pub fn answer<D: PermissionPromptHandler>(state: &mut D, allow: bool) -> bool {
