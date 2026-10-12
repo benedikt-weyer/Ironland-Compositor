@@ -553,19 +553,18 @@ pub fn default_shortcuts() -> HashMap<String, Vec<String>> {
         ("open_file_manager", vec!["super+f"]),
         ("toggle_floating", vec!["super+shift+space"]),
         ("kill_window", vec!["super+x"]),
-        // `focus_left`/`focus_right` used to default to bare `super+left`/
-        // `super+right`, but those combos now switch workspaces (see
-        // `workspace_left`/`workspace_right` below), so focus-by-direction
-        // moved to `super+ctrl+left/right` for the left/right pair only;
-        // up/down were never in the way and keep their original combo.
-        ("focus_left", vec!["super+ctrl+left"]),
-        ("focus_right", vec!["super+ctrl+right"]),
-        ("focus_up", vec!["super+up"]),
-        ("focus_down", vec!["super+down"]),
-        ("swap_left", vec!["super+shift+left"]),
-        ("swap_right", vec!["super+shift+right"]),
-        ("swap_up", vec!["super+shift+up"]),
-        ("swap_down", vec!["super+shift+down"]),
+        // Focus-by-direction lives on `super+shift+<arrow>`; swapping the
+        // focused window with its neighbor moved to `super+ctrl+<arrow>`.
+        // Bare `super+left/right` switch workspaces (see `workspace_left`/
+        // `workspace_right` below).
+        ("focus_left", vec!["super+shift+left"]),
+        ("focus_right", vec!["super+shift+right"]),
+        ("focus_up", vec!["super+shift+up"]),
+        ("focus_down", vec!["super+shift+down"]),
+        ("swap_left", vec!["super+ctrl+left"]),
+        ("swap_right", vec!["super+ctrl+right"]),
+        ("swap_up", vec!["super+ctrl+up"]),
+        ("swap_down", vec!["super+ctrl+down"]),
         // Likewise, `resize_left`/`resize_right` moved off `super+alt+left/
         // right`, which now moves the focused window to an adjacent
         // workspace and follows it there (see `move_workspace_left_follow`/
