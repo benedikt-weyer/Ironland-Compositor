@@ -123,6 +123,12 @@ type PerformanceSettings struct {
 	FPSOverlayIntervalMs uint32 `json:"fps_overlay_interval_ms"`
 }
 
+// WindowAnimationSettings mirrors `ironland_config::WindowAnimationSettings`.
+type WindowAnimationSettings struct {
+	Enabled    bool   `json:"enabled"`
+	DurationMs uint32 `json:"duration_ms"`
+}
+
 // KeyTrackerSettings mirrors `ironland_config::KeyTrackerSettings`: the
 // stuck-key diagnostic overlay, off by default. Carried here so a `Config`
 // round-tripped through this GUI doesn't wipe it (see PerformanceSettings).
@@ -164,6 +170,9 @@ type Config struct {
 	Gestures    map[string][]string       `json:"gestures"` // no GUI tab yet; carried through so saving doesn't drop it
 	Outputs     map[string]OutputSettings `json:"outputs"`
 	Workspaces  WorkspaceSettings         `json:"workspaces"`
+	// WindowAnimations has no GUI tab yet; carried through so saving doesn't
+	// drop it (or fail to parse, since the Rust side requires the field).
+	WindowAnimations WindowAnimationSettings `json:"window_animations"`
 }
 
 // OutputPosition mirrors `ironland_config::OutputPosition`: exactly one of
