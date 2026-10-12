@@ -93,6 +93,11 @@ use smithay::utils::{Buffer as BufferCoord, Rectangle, Size, Transform};
 use smithay::wayland::image_copy_capture::{CaptureFailureReason, Frame, Session, SessionRef};
 use smithay::wayland::shm::with_buffer_contents_mut;
 
+/// Marker in a capture source's user data: this session has already had its
+/// first capture request queued (see `ImageCopyCaptureHandler::frame` in
+/// `crate::state`).
+pub struct FirstCaptureDone;
+
 /// Compositor-side state for the image-copy-capture pipeline: sessions kept
 /// alive for their duration, capture requests waiting on the next rendered
 /// frame of their output, and the in-memory (see the module doc) per-

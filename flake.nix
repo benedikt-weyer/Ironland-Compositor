@@ -25,6 +25,9 @@
         libdisplay-info
         vulkan-loader
         pixman
+        # PipeWire: `ironland-portal-screencast` publishes captured frames as a
+        # PipeWire video node (the `pipewire` crate links libpipewire).
+        pipewire
       ];
     in
     (flake-utils.lib.eachDefaultSystem (system:
@@ -44,8 +47,17 @@
 
         buildInputs = perSystemBuildInputs pkgs;
 
+        # The `pipewire`/`libspa` crates run bindgen at build time, which
+        # needs libclang plus the libc/clang builtin headers. Set directly
+        # (rather than via `rustPlatform.bindgenHook`) so the clang wrapper
+        # doesn't also replace the C compiler/linker cargo build scripts use.
+        bindgenEnv = {
+          LIBCLANG_PATH = "${pkgs.libclang.lib}/lib";
+          BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.glibc.dev}/include -isystem ${pkgs.libclang.lib}/lib/clang/${pkgs.lib.versions.major pkgs.libclang.version}/include";
+        };
+
         craneLib = crane.mkLib pkgs;
-        commonArgs = { inherit nativeBuildInputs buildInputs; };
+        commonArgs = { inherit nativeBuildInputs buildInputs; } // bindgenEnv;
         # Compiles just the dependency graph (smithay and the rest) against a
         # dummy stub of our own crate. `cleanCargoSource` keeps only
         # Cargo.toml/Cargo.lock/*.rs, so this derivation's hash - and Nix's
@@ -87,8 +99,9 @@
           # there's no Cargo-level way to point it at a store path, so the
           # binary itself needs Xwayland on its PATH instead.
           #
-          # Also installs the `org.freedesktop.impl.portal.GlobalShortcuts`
-          # and `org.freedesktop.impl.portal.Screenshot` backends' D-Bus
+          # Also installs the `org.freedesktop.impl.portal.GlobalShortcuts`,
+          # `org.freedesktop.impl.portal.Screenshot` and
+          # `org.freedesktop.impl.portal.ScreenCast` backends' D-Bus
           # activation + xdg-desktop-portal registration files (see
           # `src/bin/ironland_portal_global_shortcuts.rs` and
           # `src/bin/ironland_portal_screenshot.rs`) - two separate bus
@@ -121,6 +134,15 @@
             [D-BUS Service]
             Name=org.freedesktop.impl.portal.desktop.ironland.screenshot
             Exec=$out/bin/ironland-portal-screenshot
+            EOF
+
+            install -Dm444 resources/ironland-screencast.portal \
+              $out/share/xdg-desktop-portal/portals/ironland-screencast.portal
+            install -Dm444 /dev/stdin \
+              $out/share/dbus-1/services/org.freedesktop.impl.portal.desktop.ironland.screencast.service <<EOF
+            [D-BUS Service]
+            Name=org.freedesktop.impl.portal.desktop.ironland.screencast
+            Exec=$out/bin/ironland-portal-screencast
             EOF
 
             # `ironlandctl` (see `ironlandctl/`) generates its own completion
@@ -162,7 +184,7 @@
           '';
         };
 
-        devShells.default = pkgs.mkShell {
+        devShells.default = pkgs.mkShell (bindgenEnv // {
           packages = with pkgs; [
             cargo
             rustc
@@ -190,7 +212,7 @@
           shellHook = ''
             export __EGL_EXTERNAL_PLATFORM_CONFIG_DIRS="/run/opengl-driver/share/egl/egl_external_platform.d''${__EGL_EXTERNAL_PLATFORM_CONFIG_DIRS:+:$__EGL_EXTERNAL_PLATFORM_CONFIG_DIRS}"
           '';
-        };
+        });
 
         devShells.settings-gui = pkgs.mkShell {
           packages = [ pkgs.go pkgs.gopls pkgs.pkg-config ] ++ guiSettingsBuildInputs;

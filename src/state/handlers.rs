@@ -562,6 +562,19 @@ impl<BackendData: Backend> ImageCopyCaptureHandler for AnvilState<BackendData> {
         // Completed by the next successful render of `output` - see
         // `crate::screencopy::fulfill`, called from each backend's render
         // loop once the frame it just drew is still readable.
+        //
+        // An output with nothing changing renders an empty frame, which
+        // there's nothing to read back from (the capture fails instead), so
+        // a session's very first capture forces a full redraw - otherwise a
+        // recorder started on a static screen would never get an initial
+        // frame. Later frames only ever need to carry what changed.
+        if session
+            .source()
+            .user_data()
+            .insert_if_missing(|| crate::screencopy::FirstCaptureDone)
+        {
+            self.backend_data.reset_buffers(&output);
+        }
         self.screencopy.queue_frame(output.name(), frame);
     }
 
