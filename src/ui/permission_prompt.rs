@@ -147,17 +147,17 @@ fn button_height() -> i32 {
 /// The Deny and Allow buttons' rectangles, in prompt-local logical pixels
 /// (i.e. relative to the prompt's own top-left corner - add
 /// [`PermissionPromptManagerState::origin_in`] to place them on an
-/// output). Centered as a pair under the title line; sized to fit each
+/// output). Centered as a pair under the `title_lines` title lines; sized to fit each
 /// label plus [`BUTTON_PADDING_X`] on every side. Takes no prompt-specific
 /// input - the labels are fixed strings ([`DENY_LABEL`]/[`ALLOW_LABEL`]), so the layout never changes.
-fn button_rects() -> (Rectangle<i32, Logical>, Rectangle<i32, Logical>) {
+fn button_rects(title_lines: usize) -> (Rectangle<i32, Logical>, Rectangle<i32, Logical>) {
     let height = button_height();
     let deny_width = Canvas::text_width(DENY_LABEL, FONT_SCALE) + BUTTON_PADDING_X * 2;
     let allow_width = Canvas::text_width(ALLOW_LABEL, FONT_SCALE) + BUTTON_PADDING_X * 2;
     let content_width = PROMPT_WIDTH - PROMPT_PADDING * 2;
     let row_width = deny_width + BUTTON_GAP + allow_width;
     let row_x = PROMPT_PADDING + (content_width - row_width) / 2;
-    let row_y = PROMPT_PADDING + LINE_HEIGHT + BUTTON_ROW_TOP_GAP;
+    let row_y = PROMPT_PADDING + title_lines as i32 * LINE_HEIGHT + BUTTON_ROW_TOP_GAP;
 
     let deny = Rectangle::new((row_x, row_y).into(), (deny_width, height).into());
     let allow = Rectangle::new(
@@ -165,6 +165,53 @@ fn button_rects() -> (Rectangle<i32, Logical>, Rectangle<i32, Logical>) {
         (allow_width, height).into(),
     );
     (deny, allow)
+}
+
+/// The prompt's title text, word-wrapped to the prompt's content width so a
+/// long app id/executable path or reason grows the prompt downwards instead
+/// of overflowing it. A single word wider than a line (a long path, say) is
+/// broken across lines. Always at least one line.
+fn wrap_title(app_id: &str, reason: &str) -> Vec<String> {
+    let title = format!("{app_id} wants to {reason}");
+    let char_width = Canvas::text_width("x", FONT_SCALE);
+    let max_chars = ((PROMPT_WIDTH - PROMPT_PADDING * 2) / char_width).max(1) as usize;
+
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for word in title.split_whitespace() {
+        let mut word: Vec<char> = word.chars().collect();
+        while word.len() > max_chars {
+            if !current.is_empty() {
+                lines.push(std::mem::take(&mut current));
+            }
+            lines.push(word.drain(..max_chars).collect());
+        }
+        let word: String = word.into_iter().collect();
+        if word.is_empty() {
+            continue;
+        }
+        let needed = if current.is_empty() {
+            word.chars().count()
+        } else {
+            current.chars().count() + 1 + word.chars().count()
+        };
+        if needed > max_chars {
+            lines.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(&word);
+    }
+    if !current.is_empty() || lines.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+/// Total height of a prompt whose title takes `title_lines` lines.
+fn prompt_height(title_lines: usize) -> i32 {
+    PROMPT_PADDING * 2 + title_lines as i32 * LINE_HEIGHT + BUTTON_ROW_TOP_GAP + button_height()
 }
 
 /// State of the `ironland_permission_prompt_manager_v1` global.
@@ -233,12 +280,18 @@ impl PermissionPromptManagerState {
         !self.queue.is_empty()
     }
 
+    /// How many lines the showing prompt's title wraps to (1 when nothing is
+    /// showing, so sizes stay well-defined).
+    fn front_title_lines(&self) -> usize {
+        self.queue
+            .front()
+            .map_or(1, |front| wrap_title(&front.app_id, &front.reason).len())
+    }
+
     /// The logical size of the prompt overlay, for centering by callers.
+    /// Grows with the wrapped title.
     pub fn logical_size(&self) -> Size<i32, Logical> {
-        Size::from((
-            PROMPT_WIDTH,
-            PROMPT_PADDING * 2 + LINE_HEIGHT + BUTTON_ROW_TOP_GAP + button_height(),
-        ))
+        Size::from((PROMPT_WIDTH, prompt_height(self.front_title_lines())))
     }
 
     /// Where this prompt is drawn on an output whose logical size is
@@ -263,7 +316,7 @@ impl PermissionPromptManagerState {
             return None;
         }
         let local = point - self.origin_in(output_size);
-        let (deny, allow) = button_rects();
+        let (deny, allow) = button_rects(self.front_title_lines());
         if allow.contains(local) {
             Some(true)
         } else if deny.contains(local) {
@@ -275,19 +328,21 @@ impl PermissionPromptManagerState {
 
     fn rasterize(front: &PendingPrompt) -> Canvas {
         let width = PROMPT_WIDTH;
-        let height = PROMPT_PADDING * 2 + LINE_HEIGHT + BUTTON_ROW_TOP_GAP + button_height();
+        let lines = wrap_title(&front.app_id, &front.reason);
+        let height = prompt_height(lines.len());
         let mut canvas = Canvas::new(width as usize, height as usize, COLOR_BACKGROUND);
 
-        let title = format!("{} wants to {}", front.app_id, front.reason);
-        canvas.draw_text(
-            PROMPT_PADDING,
-            PROMPT_PADDING,
-            &title,
-            FONT_SCALE,
-            COLOR_TITLE,
-        );
+        for (i, line) in lines.iter().enumerate() {
+            canvas.draw_text(
+                PROMPT_PADDING,
+                PROMPT_PADDING + i as i32 * LINE_HEIGHT,
+                line,
+                FONT_SCALE,
+                COLOR_TITLE,
+            );
+        }
 
-        let (deny, allow) = button_rects();
+        let (deny, allow) = button_rects(lines.len());
         canvas.fill_rect(deny.loc.x, deny.loc.y, deny.size.w, deny.size.h, COLOR_DENY_BUTTON);
         canvas.fill_rect(
             allow.loc.x,
@@ -471,5 +526,43 @@ impl<D: PermissionPromptHandler> Dispatch2<IronlandPermissionPromptV1, D> for Pr
             prompt_state.dirty = true;
             prompt_state.buffer = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn max_chars() -> usize {
+        ((PROMPT_WIDTH - PROMPT_PADDING * 2) / Canvas::text_width("x", FONT_SCALE)) as usize
+    }
+
+    #[test]
+    fn short_title_stays_on_one_line() {
+        assert_eq!(wrap_title("foot", "capture your screen"), vec!["foot wants to capture your screen"]);
+    }
+
+    #[test]
+    fn long_title_wraps_within_the_content_width() {
+        let lines = wrap_title("an unidentified application with a very long name", "record your entire screen and more");
+        assert!(lines.len() > 1);
+        assert!(lines.iter().all(|l| l.chars().count() <= max_chars()));
+    }
+
+    #[test]
+    fn overlong_word_is_broken_across_lines() {
+        let path = format!("/nix/store/{}/bin/app", "a".repeat(120));
+        let lines = wrap_title(&path, "capture your screen");
+        assert!(lines.len() >= 3);
+        assert!(lines.iter().all(|l| l.chars().count() <= max_chars()));
+        assert_eq!(lines.join("").replace(' ', ""), format!("{path}wantstocaptureyourscreen"));
+    }
+
+    #[test]
+    fn more_lines_make_a_taller_prompt() {
+        assert!(prompt_height(3) > prompt_height(1));
+        let (_, one) = button_rects(1);
+        let (_, three) = button_rects(3);
+        assert_eq!(three.loc.y - one.loc.y, 2 * LINE_HEIGHT);
     }
 }
