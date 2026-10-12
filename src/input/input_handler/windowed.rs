@@ -99,6 +99,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                     | KeyAction::ResizeTiled(_)
                     | KeyAction::SwitchWorkspace(_)
                     | KeyAction::MoveWindowWorkspace(_, _)
+                    | KeyAction::MoveWindowMonitor(_)
                     | KeyAction::Shortcut(_)
                     | KeyAction::ShortcutReleased(_)
                     | KeyAction::ShortcutTap(_) => self.process_common_key_action(action),

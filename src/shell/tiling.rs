@@ -771,7 +771,7 @@ fn window_min_size(window: &WindowElement) -> smithay::utils::Size<i32, Logical>
 /// clamped so it starts fully on-screen even when its own size is larger
 /// than the output - the compositor can reposition it, it just can't force
 /// it smaller than the minimum size the client itself has declared.
-fn center_on_output<BackendData: Backend>(
+pub(crate) fn center_on_output<BackendData: Backend>(
     state: &mut AnvilState<BackendData>,
     window: &WindowElement,
     output: &Output,
@@ -1296,7 +1296,7 @@ fn neighbor(
 
 /// The output adjacent to `from` in `dir`, per the outputs' arranged
 /// positions in `state.space` (i.e. the monitor layout), if any.
-fn output_in_direction<BackendData: Backend>(
+pub(crate) fn output_in_direction<BackendData: Backend>(
     state: &AnvilState<BackendData>,
     from: &Output,
     dir: Direction,

@@ -34,6 +34,8 @@ pub(crate) enum KeyAction {
     /// the `bool` selects whether the active workspace follows the window
     /// there (true) or stays put (false).
     MoveWindowWorkspace(i32, bool),
+    /// Move the focused window to the adjacent monitor in a direction
+    MoveWindowMonitor(crate::shell::tiling::Direction),
     /// Open or close the application launcher
     ToggleLauncher,
     /// Append a character to the launcher's search query
@@ -142,6 +144,10 @@ pub(super) fn action_for_name(
         "move_workspace_right" => KeyAction::MoveWindowWorkspace(1, false),
         "move_workspace_left_follow" => KeyAction::MoveWindowWorkspace(-1, true),
         "move_workspace_right_follow" => KeyAction::MoveWindowWorkspace(1, true),
+        "move_monitor_left" => KeyAction::MoveWindowMonitor(Direction::Left),
+        "move_monitor_right" => KeyAction::MoveWindowMonitor(Direction::Right),
+        "move_monitor_up" => KeyAction::MoveWindowMonitor(Direction::Up),
+        "move_monitor_down" => KeyAction::MoveWindowMonitor(Direction::Down),
         "scale_up" => KeyAction::ScaleUp,
         "scale_down" => KeyAction::ScaleDown,
         "toggle_preview" => KeyAction::TogglePreview,

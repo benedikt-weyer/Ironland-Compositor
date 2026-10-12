@@ -194,6 +194,11 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                 }
             }
 
+            KeyAction::MoveWindowMonitor(dir) => {
+                crate::shell::workspace::move_focused_window_to_monitor(self, dir);
+                crate::ext_workspace::ext_workspace_sync(self);
+            }
+
             KeyAction::MoveWindowWorkspace(delta, follow) => {
                 crate::shell::workspace::move_focused_window(self, delta, follow);
                 crate::ext_workspace::ext_workspace_sync(self);

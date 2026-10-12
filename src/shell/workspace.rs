@@ -837,6 +837,70 @@ pub fn move_focused_window<B: Backend>(state: &mut AnvilState<B>, delta: i32, fo
     show_overlay(state);
 }
 
+/// Moves the currently focused window onto the active workspace of the
+/// monitor adjacent to its own in `dir` (per the monitor layout), keeping it
+/// focused. A tiled window is inserted into the destination's tiling tree; a
+/// floating one is centered on the destination monitor. No-op if nothing is
+/// focused, there is no monitor in that direction, or the window is its
+/// monitor's fullscreen surface.
+pub fn move_focused_window_to_monitor<B: Backend>(state: &mut AnvilState<B>, dir: tiling::Direction) {
+    let Some(window) = tiling::current_focused_window(state) else {
+        return;
+    };
+
+    let (source, was_tiled) = match tiling::locate(state, &window) {
+        Some((o, _idx)) => (o, true),
+        None => match WindowHome::get(&window).output.borrow().clone() {
+            Some(o) => (o, false),
+            None => return,
+        },
+    };
+    let Some(target) = tiling::output_in_direction(state, &source, dir) else {
+        return;
+    };
+    if source
+        .user_data()
+        .get::<FullscreenSurface>()
+        .and_then(|f| f.get())
+        .as_ref()
+        == Some(&window)
+    {
+        return;
+    }
+
+    let source_idx = WorkspaceState::get(&source).active();
+    let target_idx = WorkspaceState::get(&target).active();
+
+    if was_tiled {
+        tiling::TilingState::tree_mut(&source, source_idx).remove(&window);
+    } else {
+        WorkspaceState::get(&source)
+            .floating_slot(source_idx)
+            .retain(|w| w != &window);
+    }
+
+    let home = WindowHome::get(&window);
+    *home.output.borrow_mut() = Some(target.clone());
+    *home.index.borrow_mut() = target_idx;
+
+    if was_tiled {
+        let area = tiling::tiling_area(&state.space, &target, state.config.gaps.outer as i32);
+        tiling::TilingState::tree_mut(&target, target_idx).insert(window.clone(), area, None);
+        tiling::apply_layout_animated(state, &source);
+        tiling::apply_layout_animated(state, &target);
+    } else {
+        WorkspaceState::get(&target)
+            .floating_slot(target_idx)
+            .push(window.clone());
+        tiling::center_on_output(state, &window, &target);
+        if let Some(loc) = state.space.element_location(&window) {
+            *home.floating_pos.borrow_mut() = Some(loc);
+        }
+    }
+
+    tiling::raise_and_focus(state, &window);
+}
+
 /// Activates workspace `idx` on `output`, e.g. in response to the
 /// `ext-workspace-v1` protocol's `activate` request. Applies the same
 /// `Combined`-mode fan-out as [`switch_workspace`]. `idx` is expected to

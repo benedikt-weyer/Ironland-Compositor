@@ -554,17 +554,23 @@ pub fn default_shortcuts() -> HashMap<String, Vec<String>> {
         ("toggle_floating", vec!["super+shift+space"]),
         ("kill_window", vec!["super+x"]),
         // Focus-by-direction lives on `super+shift+<arrow>`; swapping the
-        // focused window with its neighbor moved to `super+ctrl+<arrow>`.
+        // focused window with its neighbor is `super+shift+alt+<arrow>`
+        // (`super+ctrl+<arrow>` moves it to another monitor, below).
         // Bare `super+left/right` switch workspaces (see `workspace_left`/
         // `workspace_right` below).
         ("focus_left", vec!["super+shift+left"]),
         ("focus_right", vec!["super+shift+right"]),
         ("focus_up", vec!["super+shift+up"]),
         ("focus_down", vec!["super+shift+down"]),
-        ("swap_left", vec!["super+ctrl+left"]),
-        ("swap_right", vec!["super+ctrl+right"]),
-        ("swap_up", vec!["super+ctrl+up"]),
-        ("swap_down", vec!["super+ctrl+down"]),
+        ("swap_left", vec!["super+shift+alt+left"]),
+        ("swap_right", vec!["super+shift+alt+right"]),
+        ("swap_up", vec!["super+shift+alt+up"]),
+        ("swap_down", vec!["super+shift+alt+down"]),
+        // Moves the focused window to the adjacent monitor in that direction.
+        ("move_monitor_left", vec!["super+ctrl+left"]),
+        ("move_monitor_right", vec!["super+ctrl+right"]),
+        ("move_monitor_up", vec!["super+ctrl+up"]),
+        ("move_monitor_down", vec!["super+ctrl+down"]),
         // Likewise, `resize_left`/`resize_right` moved off `super+alt+left/
         // right`, which now moves the focused window to an adjacent
         // workspace and follows it there (see `move_workspace_left_follow`/
@@ -703,6 +709,10 @@ pub fn known_actions() -> Vec<&'static str> {
         "move_workspace_right",
         "move_workspace_left_follow",
         "move_workspace_right_follow",
+        "move_monitor_left",
+        "move_monitor_right",
+        "move_monitor_up",
+        "move_monitor_down",
         "scale_up",
         "scale_down",
         "toggle_preview",
