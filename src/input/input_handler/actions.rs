@@ -40,9 +40,6 @@ pub(crate) enum KeyAction {
     ToggleLauncher,
     /// Open or close the workspace overview
     ToggleOverview,
-    /// A bare Super key double tap: opens the workspace overview, first
-    /// undoing the toggle the first tap of the pair already fired
-    SuperDoubleTap,
     /// Lock the screen until the user authenticates with PAM again
     LockScreen,
     /// Append a character to the launcher's search query

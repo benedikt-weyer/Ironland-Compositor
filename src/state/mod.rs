@@ -347,9 +347,9 @@ pub struct AnvilState<BackendData: Backend + 'static> {
     /// since, meaning it's still a candidate bare tap; `Some(false)` once
     /// another key has broken that; `None` while Super isn't held.
     pub(crate) super_tap_pending: Option<bool>,
-    /// When the last completed bare Super tap happened, to recognize a
-    /// double tap (see `crate::overview::DOUBLE_TAP_MS`).
-    pub(crate) last_super_tap: Option<Instant>,
+    /// Bumped on every Super press; a long-press timer (see
+    /// `start_super_hold_timer`) only acts if it still matches.
+    pub(crate) super_hold_token: u64,
 
     /// User-facing settings loaded at startup (see [`crate::config::Config`]),
     /// kept around so backends can consult output placement/mirroring/primary
@@ -653,7 +653,7 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             gesture_tracker: None,
             super_tap_action,
             super_tap_pending: None,
-            last_super_tap: None,
+            super_hold_token: 0,
             config,
             config_last_checked: Instant::now(),
         }

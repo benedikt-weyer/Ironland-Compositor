@@ -118,7 +118,6 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                     | KeyAction::ToggleLauncher
                     | KeyAction::LockScreen
                     | KeyAction::ToggleOverview
-                    | KeyAction::SuperDoubleTap
                     | KeyAction::LauncherType(_)
                     | KeyAction::LauncherBackspace
                     | KeyAction::LauncherUp
