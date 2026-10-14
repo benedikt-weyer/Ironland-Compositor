@@ -38,6 +38,6 @@ pub use protocols::{
 #[cfg(any(feature = "udev", feature = "xwayland"))]
 pub use render::cursor;
 pub use render::{border, drawing, font, key_tracker, perf_overlay, rounded_corners, wallpaper};
-pub use ui::{launcher, lock, permission_prompt};
+pub use ui::{launcher, lock, overview, permission_prompt};
 
 pub use state::{AnvilState, ClientState};

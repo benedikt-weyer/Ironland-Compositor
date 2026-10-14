@@ -145,6 +145,21 @@ impl AnvilState<UdevData> {
             return;
         }
 
+        // The workspace overview only takes the keyboard and the mouse.
+        if self.overview.is_visible()
+            && !matches!(
+                event,
+                InputEvent::Keyboard { .. }
+                    | InputEvent::PointerMotion { .. }
+                    | InputEvent::PointerMotionAbsolute { .. }
+                    | InputEvent::PointerButton { .. }
+                    | InputEvent::DeviceAdded { .. }
+                    | InputEvent::DeviceRemoved { .. }
+            )
+        {
+            return;
+        }
+
         match event {
             InputEvent::Keyboard { event, .. } => match self.keyboard_key_to_action::<B>(event) {
                 #[cfg(feature = "udev")]
@@ -314,6 +329,8 @@ impl AnvilState<UdevData> {
                     | KeyAction::ToggleDecorations
                     | KeyAction::ToggleLauncher
                     | KeyAction::LockScreen
+                    | KeyAction::ToggleOverview
+                    | KeyAction::SuperDoubleTap
                     | KeyAction::LauncherType(_)
                     | KeyAction::LauncherBackspace
                     | KeyAction::LauncherUp

@@ -49,6 +49,15 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             return;
         }
 
+        // The workspace overview owns the pointer while it is open.
+        if self.overview.is_visible() {
+            self.overview_button(
+                wl_pointer::ButtonState::Pressed == state,
+                evt.button() == Some(MouseButton::Left),
+            );
+            return;
+        }
+
         if wl_pointer::ButtonState::Pressed == state {
             let super_held = self
                 .seat
@@ -179,8 +188,8 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         &self,
         pos: Point<f64, Logical>,
     ) -> Option<(PointerFocusTarget, Point<f64, Logical>)> {
-        // Nothing is reachable behind the screen lock.
-        if self.lock.is_locked() {
+        // Nothing is reachable behind the screen lock or the overview.
+        if self.lock.is_locked() || self.overview.is_visible() {
             return None;
         }
         let output = self.space.outputs().find(|o| {
@@ -247,6 +256,9 @@ impl<BackendData: Backend> AnvilState<BackendData> {
     }
 
     pub(super) fn on_pointer_axis<B: InputBackend>(&mut self, evt: B::PointerAxisEvent) {
+        if self.overview.is_visible() {
+            return;
+        }
         let horizontal_amount = evt.amount(input::Axis::Horizontal).unwrap_or_else(|| {
             evt.amount_v120(input::Axis::Horizontal).unwrap_or(0.0) * 15.0 / 120.
         });

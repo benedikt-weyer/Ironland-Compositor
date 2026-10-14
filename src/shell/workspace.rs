@@ -25,10 +25,10 @@ use std::cell::{RefCell, RefMut};
 use std::time::{Duration, Instant};
 
 use smithay::{
-    desktop::Space,
+    desktop::{Space, space::SpaceElement},
     output::Output,
     reexports::wayland_protocols::xdg::shell::server::xdg_toplevel,
-    utils::{IsAlive, Logical, Point, SERIAL_COUNTER},
+    utils::{IsAlive, Logical, Point, Rectangle, SERIAL_COUNTER, Size},
 };
 
 use crate::{
@@ -904,6 +904,210 @@ pub fn move_focused_window_to_monitor<B: Backend>(state: &mut AnvilState<B>, dir
     }
 
     tiling::raise_and_focus(state, &window);
+}
+
+/// Moves `window` to workspace `target_idx` of `target` (possibly another
+/// output), wherever it currently lives - unlike [`move_focused_window`]/
+/// [`move_focused_window_to_monitor`] the window needn't be focused and
+/// neither end needs to be the active workspace. Backs the workspace
+/// overview's drag-and-drop. In dynamic mode `target_idx` may be one past
+/// the last workspace, which creates it. Returns whether the window moved.
+pub(crate) fn move_window_to<B: Backend>(
+    state: &mut AnvilState<B>,
+    window: &WindowElement,
+    target: &Output,
+    target_idx: usize,
+) -> bool {
+    let Some((source, source_idx)) = window_home(window) else {
+        return false;
+    };
+    if !window.alive() || (&source == target && source_idx == target_idx) {
+        return false;
+    }
+    if source
+        .user_data()
+        .get::<FullscreenSurface>()
+        .and_then(|f| f.get())
+        .as_ref()
+        == Some(window)
+    {
+        return false;
+    }
+    let dynamic = state.config.workspaces.dynamic;
+    if target_idx >= WorkspaceState::get(target).count() && !(dynamic && target_idx == WorkspaceState::get(target).count()) {
+        return false;
+    }
+
+    // Settle in-flight slide animations so every position read below is a
+    // resting one.
+    finalize_transition(state, &source);
+    finalize_transition(state, target);
+
+    let was_tiled = !is_floating(window);
+    let was_focused = tiling::current_focused_window(state).as_ref() == Some(window);
+    let source_visible = WorkspaceState::get(&source).active() == source_idx;
+    let target_visible = WorkspaceState::get(target).active() == target_idx;
+    let previous_loc = state.space.element_location(window);
+
+    if was_tiled {
+        tiling::TilingState::tree_mut(&source, source_idx).remove(window);
+    } else {
+        WorkspaceState::get(&source)
+            .floating_slot(source_idx)
+            .retain(|w| w != window);
+    }
+
+    let home = WindowHome::get(window);
+    *home.output.borrow_mut() = Some(target.clone());
+    *home.index.borrow_mut() = target_idx;
+    {
+        let ws = WorkspaceState::get(target);
+        if target_idx + 1 > ws.count() {
+            *ws.count.borrow_mut() = target_idx + 1;
+        }
+    }
+
+    if was_tiled {
+        let area = tiling::tiling_area(&state.space, target, state.config.gaps.outer as i32);
+        tiling::TilingState::tree_mut(target, target_idx).insert(window.clone(), area, None);
+    } else {
+        // Keep the spot on the same monitor; centre it when it changes
+        // monitor, since the old coordinates belong to another screen.
+        let pos = if &source == target {
+            previous_loc.or(*home.floating_pos.borrow())
+        } else {
+            None
+        }
+        .or_else(|| {
+            let geo = state.space.output_geometry(target)?;
+            let size = window.geometry().size;
+            Some(Point::from((
+                geo.loc.x + ((geo.size.w - size.w) / 2).max(0),
+                geo.loc.y + ((geo.size.h - size.h) / 2).max(0),
+            )))
+        });
+        *home.floating_pos.borrow_mut() = pos;
+        WorkspaceState::get(target).floating_slot(target_idx).push(window.clone());
+    }
+
+    if !target_visible {
+        if source_visible {
+            state.space.unmap_elem(window);
+        }
+    } else if was_tiled {
+        tiling::apply_layout_animated(state, target);
+    } else if let Some(pos) = *home.floating_pos.borrow() {
+        state.space.map_element(window.clone(), pos, false);
+    }
+    if source_visible && was_tiled {
+        tiling::apply_layout_animated(state, &source);
+    }
+
+    if target_visible && window.alive() {
+        tiling::raise_and_focus_no_warp(state, window);
+    } else if was_focused {
+        focus_first_in_workspace(state, &source, WorkspaceState::get(&source).active());
+    }
+
+    if dynamic {
+        prune_trailing_empty(&source);
+        prune_trailing_empty(target);
+    }
+
+    crate::foreign_toplevel::sync(state);
+    crate::ext_workspace::ext_workspace_sync(state);
+    crate::workspace_windows::sync(state);
+    true
+}
+
+/// One window as the workspace overview draws it.
+#[derive(Clone)]
+pub(crate) struct OverviewWindow {
+    pub window: WindowElement,
+    /// Where it sits on its output, in output-local logical pixels.
+    pub rect: Rectangle<i32, Logical>,
+    pub title: String,
+    pub floating: bool,
+}
+
+/// One output's workspaces as the workspace overview draws them.
+#[derive(Clone)]
+pub(crate) struct OverviewOutput {
+    pub output: Output,
+    pub name: String,
+    pub size: Size<i32, Logical>,
+    pub active: usize,
+    pub count: usize,
+    /// Windows of each workspace, back to front (tiled before floating).
+    pub workspaces: Vec<Vec<OverviewWindow>>,
+}
+
+/// Every output with every workspace's windows and where they sit - tiled
+/// windows from their layout tree (hidden workspaces aren't mapped, so the
+/// space can't tell), floating ones from their remembered position. Outputs
+/// are ordered top-to-bottom, left-to-right.
+pub(crate) fn overview_snapshot<B: Backend>(state: &AnvilState<B>) -> Vec<OverviewOutput> {
+    let mut outputs: Vec<(Output, Rectangle<i32, Logical>)> = state
+        .space
+        .outputs()
+        .filter_map(|o| state.space.output_geometry(o).map(|g| (o.clone(), g)))
+        .collect();
+    outputs.sort_by_key(|(_, g)| (g.loc.y, g.loc.x));
+
+    outputs
+        .into_iter()
+        .map(|(output, geo)| {
+            let ws = WorkspaceState::get(&output);
+            let (active, count) = (ws.active(), ws.count());
+            let area = tiling::tiling_area(&state.space, &output, state.config.gaps.outer as i32);
+            let bounds = Rectangle::from_size(geo.size);
+            let describe = |window: &WindowElement, rect: Rectangle<i32, Logical>, floating: bool| {
+                OverviewWindow {
+                    window: window.clone(),
+                    rect: rect.intersection(bounds).unwrap_or(rect),
+                    title: crate::foreign_toplevel::title_and_app_id(&window.0).0,
+                    floating,
+                }
+            };
+
+            let workspaces = (0..count)
+                .map(|idx| {
+                    let mut windows = Vec::new();
+                    for (window, mut rect) in tiling::TilingState::tree(&output, idx)
+                        .layout(area, state.config.gaps.inner as i32)
+                    {
+                        if window.alive() {
+                            rect.loc -= geo.loc;
+                            windows.push(describe(&window, rect, false));
+                        }
+                    }
+                    for window in ws.floating_at(idx).into_iter().filter(|w| w.alive()) {
+                        let size = window.geometry().size;
+                        let loc = if idx == active {
+                            state.space.element_location(&window)
+                        } else {
+                            *WindowHome::get(&window).floating_pos.borrow()
+                        }
+                        .map(|l| l - geo.loc)
+                        .unwrap_or_else(|| {
+                            Point::from(((geo.size.w - size.w) / 2, (geo.size.h - size.h) / 2))
+                        });
+                        windows.push(describe(&window, Rectangle::new(loc, size), true));
+                    }
+                    windows
+                })
+                .collect();
+
+            OverviewOutput {
+                name: output.name(),
+                size: geo.size,
+                active,
+                count,
+                workspaces,
+                output,
+            }
+        })
+        .collect()
 }
 
 /// Activates workspace `idx` on `output`, e.g. in response to the

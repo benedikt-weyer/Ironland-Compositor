@@ -270,6 +270,8 @@ pub struct AnvilState<BackendData: Backend + 'static> {
     pub launcher: crate::drawing::LauncherState,
     /// Screen lock (see `crate::lock`).
     pub lock: crate::lock::LockState,
+    /// Workspace overview overlay (see `crate::overview`).
+    pub overview: crate::overview::OverviewState,
     /// Keyboard focus held before the screen was locked, restored on unlock.
     pub(crate) focus_before_lock: Option<crate::focus::KeyboardFocusTarget>,
     pub wallpaper: crate::wallpaper::Wallpaper,
@@ -345,6 +347,9 @@ pub struct AnvilState<BackendData: Backend + 'static> {
     /// since, meaning it's still a candidate bare tap; `Some(false)` once
     /// another key has broken that; `None` while Super isn't held.
     pub(crate) super_tap_pending: Option<bool>,
+    /// When the last completed bare Super tap happened, to recognize a
+    /// double tap (see `crate::overview::DOUBLE_TAP_MS`).
+    pub(crate) last_super_tap: Option<Instant>,
 
     /// User-facing settings loaded at startup (see [`crate::config::Config`]),
     /// kept around so backends can consult output placement/mirroring/primary
@@ -632,6 +637,7 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             show_window_preview: false,
             launcher: crate::drawing::LauncherState::default(),
             lock: crate::lock::LockState::new(lock_result_tx),
+            overview: Default::default(),
             focus_before_lock: None,
             wallpaper: crate::wallpaper::Wallpaper::load(config.wallpaper.as_deref()),
             workspace_overlay_shown: None,
@@ -647,6 +653,7 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             gesture_tracker: None,
             super_tap_action,
             super_tap_pending: None,
+            last_super_tap: None,
             config,
             config_last_checked: Instant::now(),
         }
@@ -670,6 +677,7 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
         }
         info!("Locking screen");
         self.launcher.close();
+        self.close_overview();
         self.lock.lock();
 
         // Take focus away from every client so none keeps receiving input

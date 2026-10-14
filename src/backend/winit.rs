@@ -282,6 +282,8 @@ pub fn run_winit() {
                 0.0
             };
 
+            let overview_buffer = state.overview_buffer_for(&output);
+
             let border_cache = state.border_cache.entry(output.name()).or_default();
             let drop_indicator_cache = state.drop_indicator_cache.entry(output.name()).or_default();
 
@@ -543,6 +545,22 @@ pub fn run_winit() {
                     && let Ok(element) = MemoryRenderBufferRenderElement::from_buffer(
                         renderer,
                         *location,
+                        buffer,
+                        None,
+                        None,
+                        None,
+                        Kind::Unspecified,
+                    ) {
+                        elements.push(CustomRenderElements::Overlay(element));
+                    }
+
+                // The workspace overview (see `crate::overview`) covers the
+                // whole output, so it sits behind only the cursor and the
+                // permission prompts.
+                if let Some(buffer) = &overview_buffer
+                    && let Ok(element) = MemoryRenderBufferRenderElement::from_buffer(
+                        renderer,
+                        Point::from((0.0, 0.0)),
                         buffer,
                         None,
                         None,

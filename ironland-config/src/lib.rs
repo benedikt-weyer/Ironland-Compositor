@@ -740,6 +740,7 @@ pub fn known_actions() -> Vec<&'static str> {
         "toggle_tint",
         "toggle_decorations",
         "lock_screen",
+        "toggle_overview",
     ]
     .to_vec()
 }

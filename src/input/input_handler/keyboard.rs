@@ -94,6 +94,22 @@ impl<BackendData: Backend> AnvilState<BackendData> {
 
             KeyAction::LockScreen => self.lock_screen(),
 
+            KeyAction::ToggleOverview => self.toggle_overview(),
+
+            KeyAction::SuperDoubleTap => {
+                // The first tap of the pair already ran the Super-tap action;
+                // when that's a toggle (the launcher), run it again so the
+                // double tap nets out to just the overview.
+                match self.super_tap_action.clone() {
+                    Some(KeyAction::ToggleLauncher) => self.process_common_key_action(KeyAction::ToggleLauncher),
+                    Some(KeyAction::Shortcut(name)) => {
+                        self.process_common_key_action(KeyAction::ShortcutTap(name))
+                    }
+                    _ => {}
+                }
+                self.open_overview();
+            }
+
             KeyAction::LauncherType(c) => {
                 self.launcher.push_char(c);
             }
@@ -362,6 +378,23 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                         } else {
                             let was_tap = data.super_tap_pending == Some(true);
                             data.super_tap_pending = None;
+                            // A tap while the overview is open closes it.
+                            if was_tap && data.overview.is_visible() {
+                                data.last_super_tap = None;
+                                return FilterResult::Intercept(KeyAction::ToggleOverview);
+                            }
+                            // Two taps in quick succession open the overview.
+                            if was_tap && !inhibited {
+                                let now = std::time::Instant::now();
+                                let double = data.last_super_tap.take().is_some_and(|last| {
+                                    now.duration_since(last).as_millis()
+                                        <= crate::overview::DOUBLE_TAP_MS
+                                });
+                                if double {
+                                    return FilterResult::Intercept(KeyAction::SuperDoubleTap);
+                                }
+                                data.last_super_tap = Some(now);
+                            }
                             match (was_tap, inhibited, &data.super_tap_action) {
                                 (true, false, Some(KeyAction::Shortcut(name))) => {
                                     FilterResult::Intercept(KeyAction::ShortcutTap(name.clone()))
@@ -442,6 +475,22 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                         } else {
                             suppressed_keys.retain(|k| *k != keysym);
                         }
+                        return FilterResult::Intercept(KeyAction::None);
+                    }
+
+                    // The workspace overview grabs the keyboard too: Escape/Enter
+                    // close it, everything else is swallowed.
+                    if data.overview.is_visible() {
+                        if let KeyState::Pressed = state {
+                            suppressed_keys.push(keysym);
+                            return FilterResult::Intercept(match keysym {
+                                Keysym::Escape | Keysym::Return | Keysym::KP_Enter => {
+                                    KeyAction::ToggleOverview
+                                }
+                                _ => KeyAction::None,
+                            });
+                        }
+                        suppressed_keys.retain(|k| *k != keysym);
                         return FilterResult::Intercept(KeyAction::None);
                     }
 
