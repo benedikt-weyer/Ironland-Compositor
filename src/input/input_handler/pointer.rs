@@ -257,6 +257,11 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                     .map(|keyboard| keyboard.modifier_state().logo)
                     .unwrap_or(false);
                 if logo_held {
+                    // Super was used as a modifier, so its release must not
+                    // count as a bare tap (which would open the launcher).
+                    if self.super_tap_pending == Some(true) {
+                        self.super_tap_pending = Some(false);
+                    }
                     if let Some(output) = current_output_for_workspace_nav(self) {
                         let delta = if discrete > 0.0 { 1 } else { -1 };
                         crate::shell::workspace::switch_workspace(self, &output, delta);
