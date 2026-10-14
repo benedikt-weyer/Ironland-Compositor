@@ -140,6 +140,9 @@ func buildKeyboardTab(cfg *Config) fyne.CanvasObject {
 	topBar := widget.NewCheck("", func(checked bool) { cfg.TopBar = checked; resets.refresh() })
 	topBar.SetChecked(cfg.TopBar)
 
+	lockOnLid := widget.NewCheck("", func(checked bool) { cfg.Lock.LockOnLidClose = checked; resets.refresh() })
+	lockOnLid.SetChecked(cfg.Lock.LockOnLidClose)
+
 	form := widget.NewForm(
 		widget.NewFormItem("Layout", resets.item(layout, func() bool { return cfg.Keyboard.Layout != defaults.Keyboard.Layout }, func() { layout.SetText(defaults.Keyboard.Layout) })),
 		widget.NewFormItem("Variant", resets.item(variant, func() bool { return cfg.Keyboard.Variant != defaults.Keyboard.Variant }, func() { variant.SetText(defaults.Keyboard.Variant) })),
@@ -151,6 +154,7 @@ func buildKeyboardTab(cfg *Config) fyne.CanvasObject {
 		widget.NewFormItem("Browser command", resets.item(browser, func() bool { return cfg.Browser != defaults.Browser }, func() { browser.SetText(defaults.Browser) })),
 		widget.NewFormItem("File manager command", resets.item(fileManager, func() bool { return cfg.FileManager != defaults.FileManager }, func() { fileManager.SetText(defaults.FileManager) })),
 		widget.NewFormItem("Show top bar", resets.item(topBar, func() bool { return cfg.TopBar != defaults.TopBar }, func() { topBar.SetChecked(defaults.TopBar) })),
+		widget.NewFormItem("Lock on lid close", resets.item(lockOnLid, func() bool { return cfg.Lock.LockOnLidClose != defaults.Lock.LockOnLidClose }, func() { lockOnLid.SetChecked(defaults.Lock.LockOnLidClose) })),
 	)
 
 	hint := widget.NewLabel("Keyboard fields are passed straight to xkbcommon; leave a field empty to use its system default. The top bar is the compositor-drawn window header/title bar; it's off by default, so windows get no server-side decoration no matter what they request.")

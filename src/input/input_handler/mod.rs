@@ -97,6 +97,17 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         }
     }
 
+    /// Locks the screen when the laptop lid closes, if `lock.lock_on_lid_close`.
+    fn on_switch_toggle<B: InputBackend>(&mut self, evt: B::SwitchToggleEvent) {
+        use smithay::backend::input::{Switch, SwitchState, SwitchToggleEvent};
+        if evt.switch() == Some(Switch::Lid)
+            && evt.state() == SwitchState::On
+            && self.config.lock.lock_on_lid_close
+        {
+            self.lock_screen();
+        }
+    }
+
     fn on_device_removed<B: InputBackend>(&mut self, device: B::Device) {
         if device.has_capability(DeviceCapability::TabletTool) {
             let tablet_seat = self.seat.tablet_seat();
@@ -354,6 +365,8 @@ impl AnvilState<UdevData> {
             InputEvent::TouchMotion { event } => self.on_touch_motion::<B>(event),
             InputEvent::TouchFrame { event } => self.on_touch_frame::<B>(event),
             InputEvent::TouchCancel { event } => self.on_touch_cancel::<B>(event),
+
+            InputEvent::SwitchToggle { event } => self.on_switch_toggle::<B>(event),
 
             InputEvent::DeviceAdded { device } => self.on_device_added::<B>(device),
             InputEvent::DeviceRemoved { device } => self.on_device_removed::<B>(device),

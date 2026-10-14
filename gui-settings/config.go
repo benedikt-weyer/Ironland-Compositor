@@ -91,6 +91,12 @@ type WorkspaceSettings struct {
 	TransitionAxis string `json:"transition_axis"`
 }
 
+// LockSettings mirrors `ironland_config::LockSettings`.
+type LockSettings struct {
+	// LockOnLidClose locks the screen when the laptop lid is closed.
+	LockOnLidClose bool `json:"lock_on_lid_close"`
+}
+
 // FocusSettings mirrors `ironland_config::FocusSettings`: both default off,
 // matching the click-to-focus behavior from before either existed.
 type FocusSettings struct {
@@ -163,6 +169,7 @@ type Config struct {
 	Border      BorderSettings            `json:"border"`
 	Cursor      CursorSettings            `json:"cursor"`
 	Focus       FocusSettings             `json:"focus"`
+	Lock        LockSettings              `json:"lock"`
 	Performance PerformanceSettings       `json:"performance"`
 	KeyTracker  KeyTrackerSettings        `json:"key_tracker"`
 	Appearance  AppearanceSettings        `json:"appearance"`

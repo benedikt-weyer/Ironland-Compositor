@@ -296,6 +296,20 @@ pub struct FocusSettings {
     pub mouse_follows_focus: bool,
 }
 
+/// Screen lock behaviour (see `src/ui/lock.rs` in the compositor).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct LockSettings {
+    /// Lock the screen automatically when the laptop lid is closed.
+    pub lock_on_lid_close: bool,
+}
+
+impl Default for LockSettings {
+    fn default() -> Self {
+        Self { lock_on_lid_close: true }
+    }
+}
+
 /// Where the FPS/frame-time overlay is anchored on screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -405,6 +419,7 @@ struct RawConfig {
     border: BorderSettings,
     cursor: CursorSettings,
     focus: FocusSettings,
+    lock: LockSettings,
     performance: PerformanceSettings,
     key_tracker: KeyTrackerSettings,
     shortcuts: HashMap<String, Vec<String>>,
@@ -445,6 +460,8 @@ pub struct Config {
     pub cursor: CursorSettings,
     /// Pointer/keyboard-focus interaction (see [`FocusSettings`]).
     pub focus: FocusSettings,
+    /// Screen lock behaviour (see [`LockSettings`]).
+    pub lock: LockSettings,
     /// FPS overlay and frame stutter analytics (see [`PerformanceSettings`]).
     pub performance: PerformanceSettings,
     /// Key-state overlay for finding stuck keys (see [`KeyTrackerSettings`]).
@@ -486,6 +503,7 @@ impl Default for Config {
             border: BorderSettings::default(),
             cursor: CursorSettings::default(),
             focus: FocusSettings::default(),
+            lock: LockSettings::default(),
             performance: PerformanceSettings::default(),
             key_tracker: KeyTrackerSettings::default(),
             shortcuts: default_shortcuts(),
@@ -832,6 +850,7 @@ impl Config {
                     border: raw.border,
                     cursor: raw.cursor,
                     focus: raw.focus,
+                    lock: raw.lock,
                     performance: raw.performance,
                     key_tracker: raw.key_tracker,
                     shortcuts,
@@ -917,6 +936,7 @@ mod tests {
             border: BorderSettings::default(),
             cursor: CursorSettings::default(),
             focus: FocusSettings::default(),
+            lock: LockSettings::default(),
             performance: PerformanceSettings::default(),
             key_tracker: KeyTrackerSettings::default(),
             shortcuts,
@@ -1072,6 +1092,14 @@ mod tests {
         let raw: RawConfig = toml::from_str("[cursor]\ntheme = \"Adwaita\"\nsize = 32\n").unwrap();
         assert_eq!(raw.cursor.theme.as_deref(), Some("Adwaita"));
         assert_eq!(raw.cursor.size, Some(32));
+    }
+
+    #[test]
+    fn lock_on_lid_close_defaults_on_and_can_be_disabled() {
+        let raw: RawConfig = toml::from_str("").unwrap();
+        assert!(raw.lock.lock_on_lid_close);
+        let raw: RawConfig = toml::from_str("[lock]\nlock_on_lid_close = false").unwrap();
+        assert!(!raw.lock.lock_on_lid_close);
     }
 
     #[test]
