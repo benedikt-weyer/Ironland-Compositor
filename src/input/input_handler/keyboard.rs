@@ -92,6 +92,8 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                 self.launcher.toggle();
             }
 
+            KeyAction::LockScreen => self.lock_screen(),
+
             KeyAction::LauncherType(c) => {
                 self.launcher.push_char(c);
             }
@@ -241,14 +243,17 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         let mut held_shortcut_keys = self.held_shortcut_keys.clone();
         let keyboard = self.seat.get_keyboard().unwrap();
 
-        if let KeyState::Pressed = state {
+        let locked = self.lock.is_locked();
+
+        if !locked && let KeyState::Pressed = state {
             let focused = keyboard
                 .current_focus()
                 .and_then(|f| f.wl_surface().map(|s| s.into_owned()));
             crate::focus_grab::check(self, focused.as_ref());
         }
 
-        for layer in self.layer_shell_state.layer_surfaces().rev() {
+        // While locked, no layer surface (a shell's bar, say) may steal focus.
+        for layer in self.layer_shell_state.layer_surfaces().rev().filter(|_| !locked) {
             let exclusive = layer.with_cached_state(|data| {
                 data.keyboard_interactivity == KeyboardInteractivity::Exclusive
                     && (data.layer == WlrLayer::Top || data.layer == WlrLayer::Overlay)
@@ -299,6 +304,47 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                         keysym = ::xkbcommon::xkb::keysym_get_name(keysym),
                         "keysym"
                     );
+
+                    // The screen lock grabs the whole keyboard before anything
+                    // else (even the Super-tap and every shortcut): keys only
+                    // edit the password, Enter submits it. VT switches stay
+                    // available - the other VT has its own login.
+                    if data.lock.is_locked() {
+                        // Keys still held from before the lock (the `l` of
+                        // Super+L, Super itself) release here: forget them
+                        // so they neither stay "suppressed" nor leave a bare
+                        // Super tap half-tracked once unlocked.
+                        data.super_tap_pending = None;
+                        if state == KeyState::Released {
+                            suppressed_keys.retain(|k| *k != keysym);
+                            held_shortcut_keys.remove(&keysym);
+                        }
+                        if let KeyState::Pressed = state {
+                            if (xkb::KEY_XF86Switch_VT_1..=xkb::KEY_XF86Switch_VT_12)
+                                .contains(&keysym.raw())
+                            {
+                                return FilterResult::Intercept(KeyAction::VtSwitch(
+                                    (keysym.raw() - xkb::KEY_XF86Switch_VT_1 + 1) as i32,
+                                ));
+                            }
+                            match keysym {
+                                Keysym::Return | Keysym::KP_Enter => data.lock.submit(),
+                                Keysym::BackSpace => data.lock.backspace(),
+                                Keysym::Escape => data.lock.clear(),
+                                _ if modifiers.ctrl || modifiers.alt || modifiers.logo => {}
+                                _ => {
+                                    if let Some(c) = xkb_utf8::keysym_to_utf8(keysym)
+                                        .chars()
+                                        .next()
+                                        .filter(|c| !c.is_control())
+                                    {
+                                        data.lock.push_char(c);
+                                    }
+                                }
+                            }
+                        }
+                        return FilterResult::Intercept(KeyAction::None);
+                    }
 
                     // Track whether Super is being tapped alone (pressed and
                     // released with no other key in between), to fire the

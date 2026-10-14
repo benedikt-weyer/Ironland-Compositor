@@ -268,6 +268,10 @@ pub struct AnvilState<BackendData: Backend + 'static> {
 
     pub show_window_preview: bool,
     pub launcher: crate::drawing::LauncherState,
+    /// Screen lock (see `crate::lock`).
+    pub lock: crate::lock::LockState,
+    /// Keyboard focus held before the screen was locked, restored on unlock.
+    pub(crate) focus_before_lock: Option<crate::focus::KeyboardFocusTarget>,
     pub wallpaper: crate::wallpaper::Wallpaper,
 
     /// When the workspace dot overlay was last triggered (a switch or a
@@ -464,6 +468,16 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             )
             .expect("Failed to init wayland server source");
 
+        // Results of background PAM checks for the screen lock.
+        let (lock_result_tx, lock_result_rx) = smithay::reexports::calloop::channel::channel::<bool>();
+        handle
+            .insert_source(lock_result_rx, |event, _, data| {
+                if let smithay::reexports::calloop::channel::Event::Msg(ok) = event {
+                    data.finish_unlock_attempt(ok);
+                }
+            })
+            .expect("Failed to init lock screen channel");
+
         // init globals
         let compositor_state = CompositorState::new::<Self>(&dh);
         let data_device_state = DataDeviceState::new::<Self>(&dh);
@@ -617,6 +631,8 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             renderdoc: renderdoc::RenderDoc::new().ok(),
             show_window_preview: false,
             launcher: crate::drawing::LauncherState::default(),
+            lock: crate::lock::LockState::new(lock_result_tx),
+            focus_before_lock: None,
             wallpaper: crate::wallpaper::Wallpaper::load(config.wallpaper.as_deref()),
             workspace_overlay_shown: None,
             perf_stats: HashMap::new(),
@@ -645,6 +661,57 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
     /// once per successfully rendered frame (see `udev.rs`/`winit.rs`),
     /// whether or not the FPS overlay is currently shown, so the overlay's
     /// history isn't empty the moment it's toggled on.
+    /// Locks the screen: nothing but the lock panel is drawn and every input
+    /// event is swallowed until [`finish_unlock_attempt`](Self::finish_unlock_attempt)
+    /// succeeds.
+    pub fn lock_screen(&mut self) {
+        if self.lock.is_locked() {
+            return;
+        }
+        info!("Locking screen");
+        self.launcher.close();
+        self.lock.lock();
+
+        // Take focus away from every client so none keeps receiving input
+        // (or believes keys are still held) behind the lock.
+        let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+        if let Some(keyboard) = self.seat.get_keyboard() {
+            self.focus_before_lock = keyboard.current_focus();
+            keyboard.set_focus(self, None, serial);
+        }
+        let pointer = self.pointer.clone();
+        pointer.motion(
+            self,
+            None,
+            &smithay::input::pointer::MotionEvent {
+                location: pointer.current_location(),
+                serial,
+                time: smithay::backend::input::InputTime::now(),
+            },
+        );
+        pointer.frame(self);
+    }
+
+    /// Called with the outcome of a PAM check started from the lock screen.
+    pub fn finish_unlock_attempt(&mut self, ok: bool) {
+        if !self.lock.is_locked() {
+            return;
+        }
+        if !ok {
+            self.lock.attempt_failed();
+            return;
+        }
+        info!("Screen unlocked");
+        self.lock.unlock();
+        if let Some(target) = self.focus_before_lock.take()
+            && smithay::utils::IsAlive::alive(&target)
+            && let Some(keyboard) = self.seat.get_keyboard()
+        {
+            let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+            keyboard.set_focus(self, Some(target), serial);
+        }
+    }
+
     pub fn record_frame_stats(&mut self, output: &Output, now: Instant, frame_index: u32) {
         let refresh_mhz = output.current_mode().map(|mode| mode.refresh);
         let threshold = crate::perf_overlay::stutter_threshold(&self.config.performance, refresh_mhz);

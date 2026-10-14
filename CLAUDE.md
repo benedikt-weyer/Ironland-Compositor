@@ -40,6 +40,7 @@ There is no CI config in this repo (no `.github/workflows`); the closest thing i
 - `src/input/input_handler.rs` — keyboard/pointer input dispatch; the single call site that resolves key bindings to actions and routes surface-targeted grabs to `focus_grab.rs`/`shortcuts.rs`.
 - `src/render/` (`mod.rs` is the pipeline; also `drawing.rs`, `font.rs`, `cursor.rs`, `wallpaper.rs`) — rendering pipeline, including a tiny embedded 5x7 bitmap font for the launcher overlay (no font-rendering dependency) and per-output wallpaper scaling/caching.
 - `src/ui/launcher.rs` — XDG desktop entry discovery and fuzzy filtering for the app launcher overlay.
+- `src/ui/lock.rs` — screen lock (`lock_screen` action, `super+l` by default). While `AnvilState::lock` is locked, `keyboard_key_to_action` routes keys to the password field, the input handlers drop clicks/touch/gestures, and both backends render only the cursor + lock panel (`render::output_elements(.., locked)`). The password is checked on a worker thread through a minimal libpam binding (service `ironland-compositor`, registered by `nix/module.nix`); the result returns via a calloop channel to `finish_unlock_attempt`.
 - `src/backend/session.rs` — announces the compositor session to systemd/D-Bus (`graphical-session.target`), required for `xdg-desktop-portal` and portal-backed dialogs to start at all.
 
 ### Custom Wayland protocol extensions (`protocols/*.xml`, `src/protocols/ironland_protocols.rs`)

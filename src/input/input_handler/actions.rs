@@ -38,6 +38,8 @@ pub(crate) enum KeyAction {
     MoveWindowMonitor(crate::shell::tiling::Direction),
     /// Open or close the application launcher
     ToggleLauncher,
+    /// Lock the screen until the user authenticates with PAM again
+    LockScreen,
     /// Append a character to the launcher's search query
     LauncherType(char),
     LauncherBackspace,
@@ -122,6 +124,7 @@ pub(super) fn action_for_name(
         "quit" => KeyAction::Quit,
         "run_terminal" => KeyAction::Run(terminal.to_string()),
         "toggle_launcher" => KeyAction::ToggleLauncher,
+        "lock_screen" => KeyAction::LockScreen,
         "open_browser" => KeyAction::Run(browser.to_string()),
         "open_file_manager" => KeyAction::Run(file_manager.to_string()),
         "toggle_floating" => KeyAction::ToggleFloating,

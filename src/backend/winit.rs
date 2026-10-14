@@ -326,6 +326,18 @@ pub fn run_winit() {
                 .to_physical(scale)
             });
 
+            let locked = state.lock.is_locked();
+            let lock_buffer = state.lock.ensure_buffer().cloned();
+            let lock_location = lock_buffer.as_ref().map(|_| {
+                let panel_size = state.lock.logical_size();
+                Point::<i32, Logical>::from((
+                    (output_size.w - panel_size.w) / 2,
+                    (output_size.h - panel_size.h) / 2,
+                ))
+                .to_f64()
+                .to_physical(scale)
+            });
+
             let performance = state.config.performance.clone();
             let overlay_interval = Duration::from_millis(performance.fps_overlay_interval_ms.into());
             let perf_overlay_buffer_and_location = performance.fps_overlay.then(|| {
@@ -478,6 +490,8 @@ pub fn run_winit() {
                     ),
                 );
 
+                let cursor_element_count = elements.len();
+
                 // draw the dnd icon if any
                 if let Some(icon) = dnd_icon {
                     let dnd_icon_pos = (cursor_pos + icon.offset.to_f64())
@@ -606,6 +620,23 @@ pub fn run_winit() {
                         elements.push(CustomRenderElements::Overlay(element));
                     }
 
+                // Screen lock: keep only the cursor and add the lock panel.
+                if locked {
+                    elements.truncate(cursor_element_count);
+                    if let (Some(buffer), Some(location)) = (&lock_buffer, lock_location)
+                        && let Ok(element) = MemoryRenderBufferRenderElement::from_buffer(
+                            renderer,
+                            location,
+                            buffer,
+                            None,
+                            None,
+                            None,
+                            Kind::Unspecified,
+                        ) {
+                            elements.push(CustomRenderElements::Overlay(element));
+                        }
+                }
+
                 render_output(
                     &output,
                     space,
@@ -623,6 +654,7 @@ pub fn run_winit() {
                     border_cache,
                     drop_indicator,
                     drop_indicator_cache,
+                    locked,
                 )
                 .inspect(|_result| {
                     if let Some(size) = capture_size {

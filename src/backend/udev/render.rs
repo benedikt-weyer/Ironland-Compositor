@@ -355,6 +355,7 @@ impl AnvilState<UdevData> {
             &mut self.cursor_status,
             self.show_window_preview,
             &mut self.launcher,
+            &mut self.lock,
             &mut self.permission_prompt,
             workspace_overlay_shown.is_some(),
             &mut self.wallpaper,
@@ -511,6 +512,7 @@ pub(super) fn render_surface<'a>(
     cursor_status: &mut CursorImageStatus,
     show_window_preview: bool,
     launcher: &mut LauncherState,
+    lock: &mut crate::lock::LockState,
     permission_prompt: &mut crate::permission_prompt::PermissionPromptManagerState,
     show_workspace_overlay: bool,
     wallpaper: &mut crate::wallpaper::Wallpaper,
@@ -538,6 +540,7 @@ pub(super) fn render_surface<'a>(
     });
 
     let mut custom_elements: Vec<CustomRenderElements<_>> = Vec::new();
+    let mut cursor_element_count = 0;
 
     if output_geometry.to_f64().contains(pointer_location) {
         let cursor_hotspot = if let CursorImageStatus::Surface(surface) = cursor_status {
@@ -582,6 +585,8 @@ pub(super) fn render_surface<'a>(
                 1.0,
             ),
         );
+
+        cursor_element_count = custom_elements.len();
 
         // draw the dnd icon if applicable
         {
@@ -749,6 +754,33 @@ pub(super) fn render_surface<'a>(
         }
     }
 
+    // Screen lock: keep only the cursor (everything pushed so far past it
+    // is the dnd icon and overlays) and add the lock panel, centered.
+    let locked = lock.is_locked();
+    if locked {
+        custom_elements.truncate(cursor_element_count);
+        let panel_size = lock.logical_size();
+        let location = Point::<i32, Logical>::from((
+            (output_geometry.size.w - panel_size.w) / 2,
+            (output_geometry.size.h - panel_size.h) / 2,
+        ))
+        .to_f64()
+        .to_physical(scale);
+        if let Some(buffer) = lock.ensure_buffer()
+            && let Ok(element) = MemoryRenderBufferRenderElement::from_buffer(
+                renderer,
+                location,
+                buffer,
+                None,
+                None,
+                None,
+                Kind::Unspecified,
+            )
+        {
+            custom_elements.push(CustomRenderElements::Overlay(element));
+        }
+    }
+
     let wallpaper_buffer = wallpaper.buffer_for(output_geometry.size).clone();
     let blurred_wallpaper_buffer = blur.enabled.then(|| {
         wallpaper
@@ -782,6 +814,7 @@ pub(super) fn render_surface<'a>(
         border_cache,
         drop_indicator,
         drop_indicator_cache,
+        locked,
     );
     let build_elements = build_start.elapsed();
 

@@ -47,6 +47,9 @@ use crate::{
     shell::{FullscreenSurface, WindowElement, WindowRenderElement, tiling},
 };
 
+/// Background of the screen lock (see `crate::lock`).
+const LOCK_CLEAR_COLOR: Color32F = Color32F::new(0.08, 0.07, 0.07, 1.0);
+
 /// Border thickness (logical pixels) of the tiling drag-and-drop indicator.
 const DROP_INDICATOR_THICKNESS: u32 = 3;
 /// Border color of the tiling drag-and-drop indicator (`#rrggbbaa`).
@@ -193,6 +196,7 @@ pub fn output_elements<R>(
     border_cache: &mut crate::border::BorderCache,
     drop_indicator: Option<Rectangle<i32, Logical>>,
     drop_indicator_cache: &mut crate::border::BorderCache,
+    locked: bool,
 ) -> (
     Vec<OutputRenderElements<R, WindowRenderElement<R>>>,
     Color32F,
@@ -201,6 +205,17 @@ where
     R: Renderer + ImportAll + ImportMem + GlesCapable,
     R::TextureId: Clone + Send + 'static,
 {
+    // Screen lock: draw only what the caller passed (the cursor and the
+    // lock panel) - no windows, layer surfaces or wallpaper - over a flat
+    // background, so nothing behind the lock is visible or capturable.
+    if locked {
+        let elements = custom_elements
+            .into_iter()
+            .map(OutputRenderElements::from)
+            .collect::<Vec<_>>();
+        return (elements, LOCK_CLEAR_COLOR);
+    }
+
     if let Some(window) = output
         .user_data()
         .get::<FullscreenSurface>()
@@ -472,6 +487,7 @@ pub fn render_output<'a, 'd, R>(
     border_cache: &mut crate::border::BorderCache,
     drop_indicator: Option<Rectangle<i32, Logical>>,
     drop_indicator_cache: &mut crate::border::BorderCache,
+    locked: bool,
 ) -> Result<RenderOutputResult<'d>, OutputDamageTrackerError<R::Error>>
 where
     R: Renderer + ImportAll + ImportMem + GlesCapable,
@@ -491,6 +507,7 @@ where
         border_cache,
         drop_indicator,
         drop_indicator_cache,
+        locked,
     );
     damage_tracker.render_output(renderer, framebuffer, age, &elements, clear_color)
 }

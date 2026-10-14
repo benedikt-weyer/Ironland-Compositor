@@ -49,7 +49,9 @@ in
       without following with Super+Ctrl+Alt+Left/Right (all rebindable in
       `shortcuts` as `workspace_left`/`workspace_right`,
       `move_workspace_left_follow`/`move_workspace_right_follow`, and
-      `move_workspace_left`/`move_workspace_right`). Pointer/keyboard-focus
+      `move_workspace_left`/`move_workspace_right`). Super+L locks the screen
+      until the user's password is entered again (PAM; rebindable as
+      `lock_screen`). Pointer/keyboard-focus
       interaction is under `focus`, both off by default (click-to-focus,
       unchanged from before either existed): `follows_mouse`, if true,
       focuses whatever window the pointer is over without needing a click
@@ -79,6 +81,11 @@ in
       }
     '';
   };
+
+  # PAM stack the screen lock (Super+L by default) checks the password
+  # against; the compositor authenticates as the user it runs as, using the
+  # service name `ironland-compositor` (see `src/ui/lock.rs`).
+  config.security.pam.services.ironland-compositor = { };
 
   config.environment.etc."ironland-compositor/config.toml".source =
     settingsFormat.generate "ironland-compositor-config.toml" cfg.settings;

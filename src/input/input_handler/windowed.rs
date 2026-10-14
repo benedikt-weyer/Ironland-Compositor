@@ -7,6 +7,21 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         event: InputEvent<B>,
         output_name: &str,
     ) {
+        // While the screen is locked only the keyboard (password entry) and
+        // pointer movement (so the cursor still follows the mouse) get through;
+        // clicks, scrolling, touch, tablets and gestures are dropped.
+        if self.lock.is_locked()
+            && !matches!(
+                event,
+                InputEvent::Keyboard { .. }
+                    | InputEvent::PointerMotionAbsolute { .. }
+                    | InputEvent::DeviceAdded { .. }
+                    | InputEvent::DeviceRemoved { .. }
+            )
+        {
+            return;
+        }
+
         match event {
             InputEvent::Keyboard { event } => match self.keyboard_key_to_action::<B>(event) {
                 KeyAction::ScaleUp => {
@@ -86,6 +101,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                     | KeyAction::TogglePreview
                     | KeyAction::ToggleDecorations
                     | KeyAction::ToggleLauncher
+                    | KeyAction::LockScreen
                     | KeyAction::LauncherType(_)
                     | KeyAction::LauncherBackspace
                     | KeyAction::LauncherUp

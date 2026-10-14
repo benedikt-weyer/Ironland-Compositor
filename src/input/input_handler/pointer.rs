@@ -7,6 +7,10 @@ impl<BackendData: Backend> AnvilState<BackendData> {
 
         let state = wl_pointer::ButtonState::from(evt.state());
 
+        if self.lock.is_locked() {
+            return;
+        }
+
         // While a permission prompt (see `crate::permission_prompt`) is
         // showing it grabs the whole pointer too, same as the keyboard
         // grab below: every button is consumed, and a left-click release
@@ -81,6 +85,9 @@ impl<BackendData: Backend> AnvilState<BackendData> {
     }
 
     pub(super) fn update_keyboard_focus(&mut self, location: Point<f64, Logical>, serial: Serial) {
+        if self.lock.is_locked() {
+            return;
+        }
         let keyboard = self.seat.get_keyboard().unwrap();
         let touch = self.seat.get_touch();
         let input_method = self.seat.input_method();
@@ -172,6 +179,10 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         &self,
         pos: Point<f64, Logical>,
     ) -> Option<(PointerFocusTarget, Point<f64, Logical>)> {
+        // Nothing is reachable behind the screen lock.
+        if self.lock.is_locked() {
+            return None;
+        }
         let output = self.space.outputs().find(|o| {
             let geometry = self.space.output_geometry(o).unwrap();
             geometry.contains(pos.to_i32_round())

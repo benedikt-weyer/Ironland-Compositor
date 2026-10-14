@@ -262,6 +262,7 @@ var knownActions = []string{
 	"rotate_output",
 	"toggle_tint",
 	"toggle_decorations",
+	"lock_screen",
 }
 
 // actionLabels gives each action a human-readable name for the GUI.
@@ -301,6 +302,7 @@ var actionLabels = map[string]string{
 	"rotate_output":               "Rotate output",
 	"toggle_tint":                 "Toggle debug tint",
 	"toggle_decorations":          "Toggle window decorations",
+	"lock_screen":                 "Lock screen",
 }
 
 // advertisedEvent describes one named shortcut a client can register via

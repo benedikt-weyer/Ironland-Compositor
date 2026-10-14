@@ -593,6 +593,8 @@ pub fn default_shortcuts() -> HashMap<String, Vec<String>> {
         ("rotate_output", vec!["super+shift+r"]),
         ("toggle_tint", vec!["super+shift+t"]),
         ("toggle_decorations", vec!["super+shift+d"]),
+        // Locks the screen until the user re-enters their password (PAM).
+        ("lock_screen", vec!["super+l"]),
     ]
     .into_iter()
     .map(|(name, keys)| {
@@ -719,6 +721,7 @@ pub fn known_actions() -> Vec<&'static str> {
         "rotate_output",
         "toggle_tint",
         "toggle_decorations",
+        "lock_screen",
     ]
     .to_vec()
 }

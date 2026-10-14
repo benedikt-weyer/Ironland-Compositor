@@ -28,6 +28,9 @@
         # PipeWire: `ironland-portal-screencast` publishes captured frames as a
         # PipeWire video node (the `pipewire` crate links libpipewire).
         pipewire
+        # The screen lock (`src/ui/lock.rs`) links libpam to check the
+        # user's password.
+        pam
       ];
     in
     (flake-utils.lib.eachDefaultSystem (system:
