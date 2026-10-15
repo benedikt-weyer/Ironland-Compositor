@@ -613,6 +613,8 @@ pub fn default_shortcuts() -> HashMap<String, Vec<String>> {
         ("toggle_decorations", vec!["super+shift+d"]),
         // Locks the screen until the user re-enters their password (PAM).
         ("lock_screen", vec!["super+l"]),
+        // Opens/closes the workspace overview (holding Super opens it too).
+        ("toggle_overview", vec!["super+space"]),
     ]
     .into_iter()
     .map(|(name, keys)| {

@@ -275,6 +275,7 @@ impl AnvilState<UdevData> {
             .and_then(|w| self.space.element_bbox(&w));
         let drop_indicator = self.tiling_drop_indicator;
         let overview_buffer = self.overview_buffer_for(&output);
+        let overview_thumbs = self.overview_thumbnails(&output);
 
         let device = if let Some(device) = self.backend_data.backends.get_mut(&node) {
             device
@@ -359,6 +360,7 @@ impl AnvilState<UdevData> {
             &mut self.lock,
             &mut self.permission_prompt,
             overview_buffer,
+            overview_thumbs,
             workspace_overlay_shown.is_some(),
             &mut self.wallpaper,
             &self.config.blur,
@@ -517,6 +519,7 @@ pub(super) fn render_surface<'a>(
     lock: &mut crate::lock::LockState,
     permission_prompt: &mut crate::permission_prompt::PermissionPromptManagerState,
     overview_buffer: Option<MemoryRenderBuffer>,
+    overview_thumbs: Vec<(WindowElement, Rectangle<i32, Logical>)>,
     show_workspace_overlay: bool,
     wallpaper: &mut crate::wallpaper::Wallpaper,
     blur: &crate::config::BlurSettings,
@@ -669,6 +672,7 @@ pub(super) fn render_surface<'a>(
     }
 
     // The workspace overview (see `crate::overview`) covers the whole output.
+    custom_elements.extend(crate::overview::thumbnail_elements(renderer, output, &overview_thumbs));
     if let Some(buffer) = &overview_buffer
         && let Ok(element) = MemoryRenderBufferRenderElement::from_buffer(
             renderer,

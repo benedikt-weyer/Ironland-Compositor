@@ -65,6 +65,9 @@ smithay::backend::renderer::element::render_elements! {
     // `MemoryRenderBuffer` placed at some location, so one variant covers them.
     Overlay=MemoryRenderBufferRenderElement<R>,
     Blur=CropRenderElement<MemoryRenderBufferRenderElement<R>>,
+    // A live, scaled-down window drawn inside a workspace overview slot (see
+    // `crate::overview::thumbnail_elements`).
+    Thumbnail=CropRenderElement<RelocateRenderElement<RescaleRenderElement<WindowRenderElement<R>>>>,
     // The focus-highlight border around the currently focused window (see
     // `crate::border`).
     Border=crate::border::BorderRenderElement,
@@ -83,6 +86,7 @@ impl<R: Renderer> std::fmt::Debug for CustomRenderElements<R> {
             Self::Surface(arg0) => f.debug_tuple("Surface").field(arg0).finish(),
             Self::Overlay(arg0) => f.debug_tuple("Overlay").field(arg0).finish(),
             Self::Blur(arg0) => f.debug_tuple("Blur").field(arg0).finish(),
+            Self::Thumbnail(arg0) => f.debug_tuple("Thumbnail").field(arg0).finish(),
             Self::Border(_) => f.debug_tuple("Border").finish(),
             #[cfg(feature = "debug")]
             Self::Fps(arg0) => f.debug_tuple("Fps").field(arg0).finish(),

@@ -17,14 +17,24 @@ use std::{
 };
 
 use smithay::{
-    backend::{allocator::Fourcc, renderer::element::memory::MemoryRenderBuffer},
+    backend::{
+        allocator::Fourcc,
+        renderer::{
+            ImportAll, ImportMem, Renderer,
+            element::memory::MemoryRenderBuffer,
+        },
+    },
+    desktop::space::{ConstrainBehavior, ConstrainReference, constrain_space_element},
     input::pointer::MotionEvent,
     output::Output,
     utils::{Logical, Point, Rectangle, Size, Transform},
 };
+use smithay::backend::renderer::element::utils::{ConstrainAlign, ConstrainScaleBehavior};
 
 use crate::{
     font::{Canvas, GLYPH_HEIGHT, GLYPH_WIDTH},
+    rounded_corners::GlesCapable,
+    render::CustomRenderElements,
     shell::{
         WindowElement,
         workspace::{self, OverviewOutput, OverviewWindow},
@@ -238,6 +248,9 @@ fn draw_window(canvas: &mut Canvas, rect: Rectangle<i32, Logical>, window: &Over
     let mut color = WINDOW_COLORS[(window_key(&window.window) % WINDOW_COLORS.len() as u64) as usize];
     if alpha_dim {
         color = [color[0] / 2, color[1] / 2, color[2] / 2, 255];
+        // The live thumbnail covers the rect itself, so highlight just outside it.
+        let outer = Rectangle::new(rect.loc - Point::from((2, 2)), rect.size + Size::from((4, 4)));
+        border(canvas, outer, 2, COLOR_ACTIVE);
     }
     canvas.fill_rect(rect.loc.x, rect.loc.y, rect.size.w, rect.size.h, color);
     border(canvas, rect, 1, COLOR_WINDOW_BORDER);
@@ -361,6 +374,42 @@ fn rasterize(scene: &Scene<'_>) -> Canvas {
     canvas
 }
 
+/// Live, scaled-down render elements for the windows `thumbs` lists (from
+/// [`AnvilState::overview_thumbnails`]), each fitted and cropped to its
+/// rectangle. Windows on hidden workspaces aren't mapped in the space, but a
+/// window's surface tree still renders, so they show their latest frame too.
+pub fn thumbnail_elements<R>(
+    renderer: &mut R,
+    output: &Output,
+    thumbs: &[(WindowElement, Rectangle<i32, Logical>)],
+) -> Vec<CustomRenderElements<R>>
+where
+    R: Renderer + ImportAll + ImportMem + GlesCapable,
+    R::TextureId: Clone + Send + 'static,
+{
+    let scale = output.current_scale().fractional_scale();
+    let behavior = ConstrainBehavior {
+        reference: ConstrainReference::BoundingBox,
+        behavior: ConstrainScaleBehavior::Fit,
+        align: ConstrainAlign::CENTER,
+    };
+    thumbs
+        .iter()
+        .flat_map(|(window, rect)| {
+            constrain_space_element::<_, _, CustomRenderElements<R>, _, _>(
+                renderer,
+                window,
+                Point::<i32, Logical>::from((0, 0)),
+                1.0,
+                scale,
+                *rect,
+                behavior,
+            )
+            .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
 impl<BackendData: Backend> AnvilState<BackendData> {
     /// Arms the Super long-press timer: if Super is still held alone when it
     /// fires, the overview opens and the press no longer counts as a tap.
@@ -482,6 +531,48 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         );
         self.overview.cache.insert(name, (key, buffer.clone()));
         Some(buffer)
+    }
+
+    /// The windows to draw live inside the overview, top-most first, each
+    /// with the output-local rectangle its thumbnail fills. The window being
+    /// dragged comes first, at the pointer.
+    pub fn overview_thumbnails(&self, output: &Output) -> Vec<(WindowElement, Rectangle<i32, Logical>)> {
+        if !self.overview.is_visible() {
+            return Vec::new();
+        }
+        let Some(geo) = self.space.output_geometry(output) else {
+            return Vec::new();
+        };
+        let snapshot = workspace::overview_snapshot(self);
+        let layout = compute_layout(&snapshot, self.config.workspaces.dynamic, geo.size);
+
+        let pointer_global = self.pointer.current_location();
+        let local = (pointer_global - geo.loc.to_f64()).to_i32_round();
+        let carried = self.overview.press.as_ref().filter(|p| {
+            let d = pointer_global - p.start;
+            p.window.is_some() && d.x.hypot(d.y) > DRAG_THRESHOLD
+        });
+
+        let mut out = Vec::new();
+        if let Some(press) = carried
+            && let Some(window) = press.window.clone()
+        {
+            out.push((window, Rectangle::new(local - press.grab, press.size)));
+        }
+        for slot in layout.slots.iter().filter(|s| !s.is_new) {
+            let info = &snapshot[slot.output];
+            let Some(windows) = info.workspaces.get(slot.workspace) else {
+                continue;
+            };
+            // Later windows are on top.
+            for w in windows.iter().rev() {
+                if carried.is_some_and(|p| p.window.as_ref() == Some(&w.window)) {
+                    continue;
+                }
+                out.push((w.window.clone(), window_rect_in(slot, info, w.rect)));
+            }
+        }
+        out
     }
 
     /// Handles a mouse button while the overview is up: a press starts a
