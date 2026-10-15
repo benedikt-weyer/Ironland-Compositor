@@ -257,6 +257,12 @@ impl<BackendData: Backend> AnvilState<BackendData> {
 
     pub(super) fn on_pointer_axis<B: InputBackend>(&mut self, evt: B::PointerAxisEvent) {
         if self.overview.is_visible() {
+            let amount = evt
+                .amount(input::Axis::Vertical)
+                .unwrap_or_else(|| evt.amount_v120(input::Axis::Vertical).unwrap_or(0.0) * 15.0 / 120.);
+            if amount != 0.0 {
+                self.overview_scroll(amount * 3.0);
+            }
             return;
         }
         let horizontal_amount = evt.amount(input::Axis::Horizontal).unwrap_or_else(|| {

@@ -50,7 +50,8 @@ const DRAG_THRESHOLD: f64 = 6.0;
 
 const MARGIN: i32 = 40;
 const TITLE_HEIGHT: i32 = 64;
-const HEADER_HEIGHT: i32 = 30;
+/// When the grid has to scroll, thumbnails are never narrower than this.
+const MIN_SCROLL_SLOT_WIDTH: i32 = 280;
 const SLOT_GAP: i32 = 16;
 const MIN_SLOT_WIDTH: i32 = 48;
 
@@ -94,6 +95,8 @@ struct Press {
 pub struct OverviewState {
     visible: bool,
     press: Option<Press>,
+    /// Pixels the workspace grid is scrolled down (clamped at layout time).
+    scroll: i32,
     /// Per output name: the hash of what the cached buffer shows, and the buffer.
     cache: HashMap<String, (u64, MemoryRenderBuffer)>,
 }
@@ -106,12 +109,14 @@ impl OverviewState {
     fn open(&mut self) {
         self.visible = true;
         self.press = None;
+        self.scroll = 0;
         self.cache.clear();
     }
 
     fn close(&mut self) {
         self.visible = false;
         self.press = None;
+        self.scroll = 0;
         self.cache.clear();
     }
 }
@@ -127,8 +132,9 @@ struct Slot {
 #[derive(Debug, Default)]
 struct Layout {
     slots: Vec<Slot>,
-    /// Per output: where its label goes.
-    headers: Vec<Point<i32, Logical>>,
+    /// How far (pixels) the grid is scrolled down, and the most it can be.
+    scroll: i32,
+    max_scroll: i32,
 }
 
 /// What the pointer is over.
@@ -139,39 +145,62 @@ struct Hit {
     window: Option<(OverviewWindow, Rectangle<i32, Logical>)>,
 }
 
-/// Arranges every output as a band of workspace thumbnails (one per
-/// workspace) on a view of size `view`. Thumbnails keep their output's aspect ratio.
-fn compute_layout(outputs: &[OverviewOutput], view: Size<i32, Logical>) -> Layout {
+/// Arranges `outputs[0]`'s workspaces as a grid of thumbnails on a view of
+/// size `view`, as large as fit entirely - or, when even the smallest
+/// comfortable thumbnails don't, in as many columns as that allows, with the
+/// rest reachable by scrolling. `scroll` (pixels down) is clamped to the
+/// content and returned in [`Layout::scroll`]. Thumbnails keep the output's
+/// aspect ratio.
+fn compute_layout(outputs: &[OverviewOutput], view: Size<i32, Logical>, scroll: i32) -> Layout {
     let mut layout = Layout::default();
-    if outputs.is_empty() {
+    let Some(out) = outputs.first() else {
         return layout;
-    }
-    let band = ((view.h - TITLE_HEIGHT - MARGIN) / outputs.len() as i32).max(1);
+    };
+    let n = out.count.max(1) as i32;
+    let aspect = out.size.w.max(1) as f64 / out.size.h.max(1) as f64;
+    let avail_w = (view.w - 2 * MARGIN).max(MIN_SLOT_WIDTH);
+    let avail_h = (view.h - TITLE_HEIGHT - MARGIN).max(1);
 
-    for (oi, out) in outputs.iter().enumerate() {
-        let top = TITLE_HEIGHT + oi as i32 * band;
-        let slots = out.count;
-        let k = slots as i32;
-        let aspect = out.size.w.max(1) as f64 / out.size.h.max(1) as f64;
+    let size_for = |cols: i32| {
+        let w = ((avail_w - (cols - 1) * SLOT_GAP) / cols).max(MIN_SLOT_WIDTH);
+        (w, (w as f64 / aspect).round() as i32)
+    };
+    let content_h = |cols: i32| {
+        let rows = (n + cols - 1) / cols;
+        let (_, h) = size_for(cols);
+        rows * h + (rows - 1) * SLOT_GAP
+    };
+    // Fewest columns (biggest thumbnails) that show everything at once
+    // without going below the readable width; failing that, the most columns whose thumbnails stay readable.
+    let cols = (1..=n)
+        .find(|&c| content_h(c) <= avail_h && size_for(c).0 >= MIN_SCROLL_SLOT_WIDTH)
+        .unwrap_or_else(|| {
+            (1..=n)
+                .rev()
+                .find(|&c| size_for(c).0 >= MIN_SCROLL_SLOT_WIDTH)
+                .unwrap_or(1)
+        });
+    let (width, height) = size_for(cols);
+    let content = content_h(cols);
+    layout.max_scroll = (content - avail_h).max(0);
+    layout.scroll = scroll.clamp(0, layout.max_scroll);
 
-        let by_height = ((band - HEADER_HEIGHT - SLOT_GAP).max(1) as f64 * aspect) as i32;
-        let by_width = (view.w - 2 * MARGIN - (k - 1) * SLOT_GAP) / k;
-        let width = by_height.min(by_width).max(MIN_SLOT_WIDTH);
-        let height = (width as f64 / aspect).round() as i32;
-
-        let total = k * width + (k - 1) * SLOT_GAP;
-        let x0 = (view.w - total) / 2;
-        layout.headers.push(Point::from((x0, top)));
-        for ws in 0..slots {
-            layout.slots.push(Slot {
-                output: oi,
-                workspace: ws,
-                rect: Rectangle::new(
-                    Point::from((x0 + ws as i32 * (width + SLOT_GAP), top + HEADER_HEIGHT)),
-                    Size::from((width, height)),
-                ),
-            });
-        }
+    let rows_cols = |count: i32| count.min(cols);
+    let first_row_w = rows_cols(n) * width + (rows_cols(n) - 1) * SLOT_GAP;
+    let x0 = (view.w - first_row_w) / 2;
+    for ws in 0..out.count as i32 {
+        let (row, col) = (ws / cols, ws % cols);
+        layout.slots.push(Slot {
+            output: 0,
+            workspace: ws as usize,
+            rect: Rectangle::new(
+                Point::from((
+                    x0 + col * (width + SLOT_GAP),
+                    TITLE_HEIGHT + row * (height + SLOT_GAP) - layout.scroll,
+                )),
+                Size::from((width, height)),
+            ),
+        });
     }
     layout
 }
@@ -192,6 +221,9 @@ fn window_rect_in(slot: &Slot, output: &OverviewOutput, window: Rectangle<i32, L
 
 impl Layout {
     fn hit(&self, outputs: &[OverviewOutput], point: Point<i32, Logical>) -> Hit {
+        if point.y < TITLE_HEIGHT - 4 {
+            return Hit::default();
+        }
         let Some(slot) = self.slots.iter().find(|s| s.rect.contains(point)) else {
             return Hit::default();
         };
@@ -278,32 +310,11 @@ fn rasterize(scene: &Scene<'_>) -> Canvas {
     let view = scene.view;
     let mut canvas = Canvas::new(view.w.max(1) as usize, view.h.max(1) as usize, COLOR_DIM);
 
-    let total: usize = scene.outputs.iter().map(|o| o.count).sum();
-    canvas.draw_text(MARGIN, 18, &plural(total), 3, COLOR_TEXT);
-    canvas.draw_text(
-        MARGIN,
-        18 + GLYPH_HEIGHT as i32 * 3 + 6,
-        "Drag windows between workspaces - click to switch - Esc to close",
-        1,
-        COLOR_MUTED,
-    );
-
     let carried = scene
         .press
         .filter(|_| scene.dragging)
         .and_then(|p| p.window.as_ref());
     let drop_slot = scene.dragging.then_some(scene.hover.slot).flatten();
-
-    for (oi, out) in scene.outputs.iter().enumerate() {
-        let header = scene.layout.headers[oi];
-        canvas.draw_text(
-            header.x,
-            header.y + 4,
-            &format!("{}  -  {}", out.name, plural(out.count)),
-            2,
-            COLOR_TEXT,
-        );
-    }
 
     for slot in &scene.layout.slots {
         let out = &scene.outputs[slot.output];
@@ -342,6 +353,18 @@ fn rasterize(scene: &Scene<'_>) -> Canvas {
             border(&mut canvas, rect, 1, COLOR_MUTED);
         }
     }
+
+    // Slots scrolled under the title area are covered by it.
+    canvas.fill_rect(0, 0, view.w, TITLE_HEIGHT - 4, COLOR_DIM);
+    let total: usize = scene.outputs.iter().map(|o| o.count).sum();
+    canvas.draw_text(MARGIN, 18, &plural(total), 3, COLOR_TEXT);
+    canvas.draw_text(
+        MARGIN,
+        18 + GLYPH_HEIGHT as i32 * 3 + 6,
+        "Drag windows between workspaces - scroll for more - click to switch - Esc to close",
+        1,
+        COLOR_MUTED,
+    );
 
     // The window being dragged follows the pointer, drawn last (on top).
     if let (Some(press), Some(pointer), true) = (scene.press, scene.pointer, scene.dragging)
@@ -421,6 +444,27 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         snapshot
     }
 
+    /// Scrolls the workspace grid by `pixels` (positive = down).
+    pub(crate) fn overview_scroll(&mut self, pixels: f64) {
+        self.overview.scroll = (self.overview.scroll + pixels.round() as i32).max(0);
+        // Out-of-range values are clamped against the real content height the
+        // next time the layout is computed; clamp here too so the stored
+        // value never drifts past the end.
+        let snapshot = workspace::overview_snapshot(self);
+        let max = self
+            .space
+            .outputs()
+            .filter_map(|o| {
+                let geo = self.space.output_geometry(o)?;
+                let snap: Vec<_> = snapshot.iter().filter(|s| &s.output == o).cloned().collect();
+                Some(compute_layout(&snap, geo.size, i32::MAX).scroll)
+            })
+            .max()
+            .unwrap_or(0);
+        self.overview.scroll = self.overview.scroll.min(max);
+        self.overview.cache.clear();
+    }
+
     pub fn toggle_overview(&mut self) {
         if self.overview.is_visible() {
             self.close_overview();
@@ -463,7 +507,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         let geo = self.space.output_geometry(output)?;
         let view = geo.size;
         let snapshot = self.overview_snapshot_for(output);
-        let layout = compute_layout(&snapshot, view);
+        let layout = compute_layout(&snapshot, view, self.overview.scroll);
 
         let pointer_global = self.pointer.current_location();
         let local = (pointer_global - geo.loc.to_f64()).to_i32_round();
@@ -480,7 +524,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         });
 
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        (view.w, view.h, dragging).hash(&mut hasher);
+        (view.w, view.h, dragging, layout.scroll).hash(&mut hasher);
         for out in &snapshot {
             (&out.name, out.size.w, out.size.h, out.active, out.count).hash(&mut hasher);
             for (idx, windows) in out.workspaces.iter().enumerate() {
@@ -538,7 +582,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             return Vec::new();
         };
         let snapshot = self.overview_snapshot_for(output);
-        let layout = compute_layout(&snapshot, geo.size);
+        let layout = compute_layout(&snapshot, geo.size, self.overview.scroll);
 
         let pointer_global = self.pointer.current_location();
         let local = (pointer_global - geo.loc.to_f64()).to_i32_round();
@@ -553,7 +597,13 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         {
             out.push((window, Rectangle::new(local - press.grab, press.size)));
         }
-        for slot in layout.slots.iter() {
+        let viewport = Rectangle::new(
+            Point::from((0, TITLE_HEIGHT - 4)),
+            Size::from((geo.size.w, geo.size.h - TITLE_HEIGHT + 4)),
+        );
+        // Slots cut off by the viewport keep just their placeholders: a live
+        // thumbnail can't be cropped without rescaling.
+        for slot in layout.slots.iter().filter(|s| viewport.contains_rect(s.rect)) {
             let info = &snapshot[slot.output];
             let Some(windows) = info.workspaces.get(slot.workspace) else {
                 continue;
@@ -587,7 +637,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         let geo = self.space.output_geometry(&output).unwrap_or_default();
         let local = (location - geo.loc.to_f64()).to_i32_round();
         let snapshot = self.overview_snapshot_for(&output);
-        let layout = compute_layout(&snapshot, geo.size);
+        let layout = compute_layout(&snapshot, geo.size, self.overview.scroll);
         let hit = layout.hit(&snapshot, local);
         let slot_id = hit
             .slot
@@ -675,14 +725,14 @@ mod tests {
     #[test]
     fn one_slot_per_workspace() {
         let outputs = [out(3, 1920, 1080)];
-        assert_eq!(compute_layout(&outputs, Size::from((1920, 1080))).slots.len(), 3);
+        assert_eq!(compute_layout(&outputs, Size::from((1920, 1080)), 0).slots.len(), 3);
     }
 
     #[test]
     fn slots_keep_their_outputs_aspect_ratio_and_fit_the_view() {
         let outputs = [out(8, 1920, 1080), out(2, 1080, 1920)];
         let view = Size::from((1280, 720));
-        let layout = compute_layout(&outputs, view);
+        let layout = compute_layout(&outputs, view, 0);
         for slot in &layout.slots {
             assert!(slot.rect.loc.x >= 0 && slot.rect.loc.x + slot.rect.size.w <= view.w);
             let o = &outputs[slot.output];
@@ -695,7 +745,7 @@ mod tests {
     #[test]
     fn hit_finds_the_slot_under_a_point() {
         let outputs = [out(2, 1600, 900)];
-        let layout = compute_layout(&outputs, Size::from((1600, 900)));
+        let layout = compute_layout(&outputs, Size::from((1600, 900)), 0);
         let second = layout.slots[1].rect;
         let hit = layout.hit(&outputs, second.loc + Point::from((2, 2)));
         assert_eq!(hit.slot, Some((0, 1)));
@@ -716,6 +766,19 @@ mod tests {
             Rectangle::new(Point::from((500, 250)), Size::from((500, 250))),
         );
         assert_eq!(rect, Rectangle::new(Point::from((200, 100)), Size::from((100, 50))));
+    }
+
+    #[test]
+    fn many_workspaces_form_a_scrollable_grid() {
+        let outputs = [out(30, 1920, 1080)];
+        let view = Size::from((1280, 720));
+        let top = compute_layout(&outputs, view, 0);
+        assert!(top.max_scroll > 0);
+        assert!(top.slots.iter().all(|s| s.rect.size.w >= MIN_SCROLL_SLOT_WIDTH));
+        assert!(top.slots.iter().filter(|s| s.rect.loc.y == top.slots[0].rect.loc.y).count() > 1);
+        let end = compute_layout(&outputs, view, i32::MAX);
+        assert_eq!(end.scroll, end.max_scroll);
+        assert!(end.slots[0].rect.loc.y < top.slots[0].rect.loc.y);
     }
 
     #[test]
