@@ -63,7 +63,6 @@ const COLOR_DIM: [u8; 4] = rgba(0, 0, 0, 200);
 const COLOR_TEXT: [u8; 4] = rgba(235, 230, 225, 255);
 const COLOR_MUTED: [u8; 4] = rgba(150, 140, 130, 255);
 const COLOR_SLOT: [u8; 4] = rgba(34, 30, 28, 255);
-const COLOR_SLOT_NEW: [u8; 4] = rgba(26, 23, 21, 255);
 const COLOR_ACTIVE: [u8; 4] = rgba(137, 180, 250, 255);
 const COLOR_DROP: [u8; 4] = rgba(250, 205, 120, 255);
 const COLOR_WINDOW_BORDER: [u8; 4] = rgba(20, 18, 17, 255);
@@ -123,8 +122,6 @@ struct Slot {
     output: usize,
     workspace: usize,
     rect: Rectangle<i32, Logical>,
-    /// The trailing "+" slot that creates a workspace when something lands on it.
-    is_new: bool,
 }
 
 #[derive(Debug, Default)]
@@ -143,9 +140,8 @@ struct Hit {
 }
 
 /// Arranges every output as a band of workspace thumbnails (one per
-/// workspace, plus a "new workspace" slot when `dynamic`) on a view of size
-/// `view`. Thumbnails keep their output's aspect ratio.
-fn compute_layout(outputs: &[OverviewOutput], dynamic: bool, view: Size<i32, Logical>) -> Layout {
+/// workspace) on a view of size `view`. Thumbnails keep their output's aspect ratio.
+fn compute_layout(outputs: &[OverviewOutput], view: Size<i32, Logical>) -> Layout {
     let mut layout = Layout::default();
     if outputs.is_empty() {
         return layout;
@@ -154,7 +150,7 @@ fn compute_layout(outputs: &[OverviewOutput], dynamic: bool, view: Size<i32, Log
 
     for (oi, out) in outputs.iter().enumerate() {
         let top = TITLE_HEIGHT + oi as i32 * band;
-        let slots = out.count + usize::from(dynamic);
+        let slots = out.count;
         let k = slots as i32;
         let aspect = out.size.w.max(1) as f64 / out.size.h.max(1) as f64;
 
@@ -174,7 +170,6 @@ fn compute_layout(outputs: &[OverviewOutput], dynamic: bool, view: Size<i32, Log
                     Point::from((x0 + ws as i32 * (width + SLOT_GAP), top + HEADER_HEIGHT)),
                     Size::from((width, height)),
                 ),
-                is_new: ws >= out.count,
             });
         }
     }
@@ -318,19 +313,10 @@ fn rasterize(scene: &Scene<'_>) -> Canvas {
             rect.loc.y,
             rect.size.w,
             rect.size.h,
-            if slot.is_new { COLOR_SLOT_NEW } else { COLOR_SLOT },
+            COLOR_SLOT,
         );
 
-        if slot.is_new {
-            let (w, h) = (Canvas::text_width("+", 4), GLYPH_HEIGHT as i32 * 4);
-            canvas.draw_text(
-                rect.loc.x + (rect.size.w - w) / 2,
-                rect.loc.y + (rect.size.h - h) / 2,
-                "+",
-                4,
-                COLOR_MUTED,
-            );
-        } else if let Some(windows) = out.workspaces.get(slot.workspace) {
+        if let Some(windows) = out.workspaces.get(slot.workspace) {
             for window in windows {
                 if carried == Some(&window.window) {
                     continue;
@@ -350,7 +336,7 @@ fn rasterize(scene: &Scene<'_>) -> Canvas {
         let is_drop = drop_slot == Some((slot.output, slot.workspace));
         if is_drop {
             border(&mut canvas, rect, 3, COLOR_DROP);
-        } else if !slot.is_new && slot.workspace == out.active {
+        } else if slot.workspace == out.active {
             border(&mut canvas, rect, 3, COLOR_ACTIVE);
         } else {
             border(&mut canvas, rect, 1, COLOR_MUTED);
@@ -427,6 +413,14 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         });
     }
 
+    /// The overview's snapshot restricted to `output`: each display's overlay
+    /// shows only its own workspaces.
+    fn overview_snapshot_for(&self, output: &Output) -> Vec<OverviewOutput> {
+        let mut snapshot = workspace::overview_snapshot(self);
+        snapshot.retain(|o| &o.output == output);
+        snapshot
+    }
+
     pub fn toggle_overview(&mut self) {
         if self.overview.is_visible() {
             self.close_overview();
@@ -468,8 +462,8 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         }
         let geo = self.space.output_geometry(output)?;
         let view = geo.size;
-        let snapshot = workspace::overview_snapshot(self);
-        let layout = compute_layout(&snapshot, self.config.workspaces.dynamic, view);
+        let snapshot = self.overview_snapshot_for(output);
+        let layout = compute_layout(&snapshot, view);
 
         let pointer_global = self.pointer.current_location();
         let local = (pointer_global - geo.loc.to_f64()).to_i32_round();
@@ -486,7 +480,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         });
 
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        (view.w, view.h, dragging, self.config.workspaces.dynamic).hash(&mut hasher);
+        (view.w, view.h, dragging).hash(&mut hasher);
         for out in &snapshot {
             (&out.name, out.size.w, out.size.h, out.active, out.count).hash(&mut hasher);
             for (idx, windows) in out.workspaces.iter().enumerate() {
@@ -543,8 +537,8 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         let Some(geo) = self.space.output_geometry(output) else {
             return Vec::new();
         };
-        let snapshot = workspace::overview_snapshot(self);
-        let layout = compute_layout(&snapshot, self.config.workspaces.dynamic, geo.size);
+        let snapshot = self.overview_snapshot_for(output);
+        let layout = compute_layout(&snapshot, geo.size);
 
         let pointer_global = self.pointer.current_location();
         let local = (pointer_global - geo.loc.to_f64()).to_i32_round();
@@ -559,7 +553,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         {
             out.push((window, Rectangle::new(local - press.grab, press.size)));
         }
-        for slot in layout.slots.iter().filter(|s| !s.is_new) {
+        for slot in layout.slots.iter() {
             let info = &snapshot[slot.output];
             let Some(windows) = info.workspaces.get(slot.workspace) else {
                 continue;
@@ -592,8 +586,8 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         };
         let geo = self.space.output_geometry(&output).unwrap_or_default();
         let local = (location - geo.loc.to_f64()).to_i32_round();
-        let snapshot = workspace::overview_snapshot(self);
-        let layout = compute_layout(&snapshot, self.config.workspaces.dynamic, geo.size);
+        let snapshot = self.overview_snapshot_for(&output);
+        let layout = compute_layout(&snapshot, geo.size);
         let hit = layout.hit(&snapshot, local);
         let slot_id = hit
             .slot
@@ -679,20 +673,16 @@ mod tests {
     }
 
     #[test]
-    fn one_slot_per_workspace_plus_a_new_slot_when_dynamic() {
+    fn one_slot_per_workspace() {
         let outputs = [out(3, 1920, 1080)];
-        let view = Size::from((1920, 1080));
-        assert_eq!(compute_layout(&outputs, false, view).slots.len(), 3);
-        let dynamic = compute_layout(&outputs, true, view);
-        assert_eq!(dynamic.slots.len(), 4);
-        assert!(dynamic.slots[3].is_new && !dynamic.slots[2].is_new);
+        assert_eq!(compute_layout(&outputs, Size::from((1920, 1080))).slots.len(), 3);
     }
 
     #[test]
     fn slots_keep_their_outputs_aspect_ratio_and_fit_the_view() {
         let outputs = [out(8, 1920, 1080), out(2, 1080, 1920)];
         let view = Size::from((1280, 720));
-        let layout = compute_layout(&outputs, false, view);
+        let layout = compute_layout(&outputs, view);
         for slot in &layout.slots {
             assert!(slot.rect.loc.x >= 0 && slot.rect.loc.x + slot.rect.size.w <= view.w);
             let o = &outputs[slot.output];
@@ -705,7 +695,7 @@ mod tests {
     #[test]
     fn hit_finds_the_slot_under_a_point() {
         let outputs = [out(2, 1600, 900)];
-        let layout = compute_layout(&outputs, false, Size::from((1600, 900)));
+        let layout = compute_layout(&outputs, Size::from((1600, 900)));
         let second = layout.slots[1].rect;
         let hit = layout.hit(&outputs, second.loc + Point::from((2, 2)));
         assert_eq!(hit.slot, Some((0, 1)));
@@ -719,7 +709,6 @@ mod tests {
             output: 0,
             workspace: 0,
             rect: Rectangle::new(Point::from((100, 50)), Size::from((200, 100))),
-            is_new: false,
         };
         let rect = window_rect_in(
             &slot,
