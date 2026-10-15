@@ -343,6 +343,15 @@ impl AnvilState<UdevData> {
         let fps_overlay_cache = self.fps_overlay_cache.entry(output.name()).or_default();
         let border_cache = self.border_cache.entry(output.name()).or_default();
         let drop_indicator_cache = self.drop_indicator_cache.entry(output.name()).or_default();
+        let tint_kelvin = self.display_filter_state.kelvin();
+        let tint = self.space.output_geometry(&output).and_then(|geometry| {
+            self.display_tint.element(
+                &output.name(),
+                geometry.size,
+                output.current_scale().fractional_scale(),
+                tint_kelvin,
+            )
+        });
         let capture_frame_index = surface.capture_frame_index;
         let since_vblank = surface.pending_vblank_at.take().map(|at| at.elapsed());
         let result = render_surface(
@@ -370,6 +379,7 @@ impl AnvilState<UdevData> {
             border_cache,
             drop_indicator,
             drop_indicator_cache,
+            tint,
             &self.config.performance,
             &*perf_stats,
             fps_overlay_cache,
@@ -529,6 +539,7 @@ pub(super) fn render_surface<'a>(
     border_cache: &mut crate::border::BorderCache,
     drop_indicator: Option<Rectangle<i32, Logical>>,
     drop_indicator_cache: &mut crate::border::BorderCache,
+    tint: Option<smithay::backend::renderer::element::solid::SolidColorRenderElement>,
     performance: &crate::config::PerformanceSettings,
     perf_stats: &crate::perf_overlay::FrameStats,
     fps_overlay_cache: &mut crate::perf_overlay::OverlayCache,
@@ -801,6 +812,11 @@ pub(super) fn render_surface<'a>(
         {
             custom_elements.push(CustomRenderElements::Overlay(element));
         }
+    }
+
+    // Night mode: frontmost, so it also tints the cursor and the lock panel.
+    if let Some(tint) = tint {
+        custom_elements.insert(0, CustomRenderElements::Tint(tint));
     }
 
     let wallpaper_buffer = wallpaper.buffer_for(output_geometry.size).clone();

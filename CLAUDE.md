@@ -45,11 +45,12 @@ There is no CI config in this repo (no `.github/workflows`); the closest thing i
 
 ### Custom Wayland protocol extensions (`protocols/*.xml`, `src/protocols/ironland_protocols.rs`)
 
-Three protocols are custom to this compositor, generated at compile time via `wayland-scanner` (see `src/protocols/ironland_protocols.rs` module doc for why these aren't reused from `hyprland-*` equivalents — this compositor's needs are narrower):
+Four protocols are custom to this compositor, generated at compile time via `wayland-scanner` (see `src/protocols/ironland_protocols.rs` module doc for why these aren't reused from `hyprland-*` equivalents — this compositor's needs are narrower):
 
 - `ironland-shortcuts-v1` (`src/protocols/shortcuts.rs`) — named keybinding actions exposed to clients; `fire()` is the single entry point, called from `input_handler.rs`. Also backs the `GlobalShortcuts` xdg-desktop-portal backend.
 - `ironland-focus-grab-v1` (`src/protocols/focus_grab.rs`) — single-surface pointer/key focus grabs (e.g. Quickshell popups); `check()` is the single entry point.
 - `ironland-workspace-windows-v1` (`src/protocols/workspace_windows.rs`) — per-window workspace membership; `sync()` is the single entry point, called alongside `foreign_toplevel::sync` and `ext_workspace::ext_workspace_sync` on the same event set (window map/unmap, title/app-id change, workspace move).
+- `ironland-display-filter-v1` (`src/protocols/display_filter.rs`, rendered by `src/render/tint.rs`) — a client sets a color temperature in kelvin and the compositor draws a warm translucent overlay over every output (night mode); the filter lives only as long as the requesting protocol object. Scheduling is the client's job.
 
 ### Standard protocol integrations that bridge to the shell
 

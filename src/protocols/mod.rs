@@ -2,6 +2,7 @@
 //! standard protocols bridged to the shell.
 
 pub mod clipboard;
+pub mod display_filter;
 pub mod ext_workspace;
 pub mod focus_grab;
 pub mod foreign_toplevel;

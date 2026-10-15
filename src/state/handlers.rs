@@ -74,6 +74,12 @@ impl<BackendData: Backend> crate::frame_capture::FrameCaptureHandler for AnvilSt
     }
 }
 
+impl<BackendData: Backend> crate::display_filter::DisplayFilterHandler for AnvilState<BackendData> {
+    fn display_filter_state(&mut self) -> &mut crate::display_filter::DisplayFilterState {
+        &mut self.display_filter_state
+    }
+}
+
 impl<BackendData: Backend> crate::workspace_windows::WorkspaceWindowsHandler for AnvilState<BackendData> {
     fn workspace_windows_state(&mut self) -> &mut crate::workspace_windows::WorkspaceWindowsState {
         &mut self.workspace_windows_state

@@ -207,6 +207,9 @@ pub struct AnvilState<BackendData: Backend + 'static> {
     pub focus_grab_manager_state: crate::focus_grab::FocusGrabManagerState,
     pub frame_capture_manager_state: crate::frame_capture::FrameCaptureManagerState,
     pub workspace_windows_state: crate::workspace_windows::WorkspaceWindowsState,
+    pub display_filter_state: crate::display_filter::DisplayFilterState,
+    /// Per-output buffers for the night-mode tint overlay (see `crate::tint`).
+    pub display_tint: crate::tint::DisplayTint,
     pub output_manager_state: OutputManagerState,
     pub primary_selection_state: PrimarySelectionState,
     pub data_control_state: DataControlState,
@@ -494,6 +497,7 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
         let focus_grab_manager_state = crate::focus_grab::FocusGrabManagerState::new::<Self>(&dh);
         let frame_capture_manager_state = crate::frame_capture::FrameCaptureManagerState::new::<Self>(&dh);
         let workspace_windows_state = crate::workspace_windows::WorkspaceWindowsState::new::<Self>(&dh);
+        let display_filter_state = crate::display_filter::DisplayFilterState::new::<Self>(&dh);
         let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(&dh);
         let primary_selection_state = PrimarySelectionState::new::<Self>(&dh);
         let data_control_state =
@@ -593,6 +597,8 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             focus_grab_manager_state,
             frame_capture_manager_state,
             workspace_windows_state,
+            display_filter_state,
+            display_tint: Default::default(),
             output_manager_state,
             primary_selection_state,
             data_control_state,

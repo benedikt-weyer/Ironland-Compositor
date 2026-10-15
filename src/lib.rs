@@ -32,12 +32,12 @@ pub use backend::winit;
 pub use backend::x11;
 pub use input::{focus, input_handler, keybindings};
 pub use protocols::{
-    clipboard, ext_workspace, focus_grab, foreign_toplevel, frame_capture, ironland_protocols,
+    clipboard, display_filter, ext_workspace, focus_grab, foreign_toplevel, frame_capture, ironland_protocols,
     screencopy, shortcuts, workspace_windows,
 };
 #[cfg(any(feature = "udev", feature = "xwayland"))]
 pub use render::cursor;
-pub use render::{border, drawing, font, key_tracker, perf_overlay, rounded_corners, wallpaper};
+pub use render::{border, drawing, font, key_tracker, perf_overlay, rounded_corners, tint, wallpaper};
 pub use ui::{launcher, lock, overview, permission_prompt};
 
 pub use state::{AnvilState, ClientState};

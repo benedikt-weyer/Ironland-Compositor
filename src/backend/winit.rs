@@ -285,6 +285,16 @@ pub fn run_winit() {
             let overview_buffer = state.overview_buffer_for(&output);
             let overview_thumbs = state.overview_thumbnails(&output);
 
+            let tint_kelvin = state.display_filter_state.kelvin();
+            let tint = state.space.output_geometry(&output).and_then(|geometry| {
+                state.display_tint.element(
+                    &output.name(),
+                    geometry.size,
+                    output.current_scale().fractional_scale(),
+                    tint_kelvin,
+                )
+            });
+
             let border_cache = state.border_cache.entry(output.name()).or_default();
             let drop_indicator_cache = state.drop_indicator_cache.entry(output.name()).or_default();
 
@@ -655,6 +665,11 @@ pub fn run_winit() {
                         ) {
                             elements.push(CustomRenderElements::Overlay(element));
                         }
+                }
+
+                // Night mode: frontmost, so it also tints the cursor and lock panel.
+                if let Some(tint) = tint {
+                    elements.insert(0, CustomRenderElements::Tint(tint));
                 }
 
                 render_output(

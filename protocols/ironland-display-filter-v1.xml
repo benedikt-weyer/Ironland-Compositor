@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="ironland_display_filter_v1">
+  <copyright>
+    Copyright © 2026 the ironland-compositor contributors
+
+    Permission is hereby granted, free of charge, to any person obtaining a
+    copy of this software and associated documentation files (the
+    "Software"), to deal in the Software without restriction, including
+    without limitation the rights to use, copy, modify, merge, publish,
+    distribute, sublicense, and/or sell copies of the Software, and to
+    permit persons to whom the Software is furnished to do so, subject to
+    the following conditions:
+
+    The above copyright notice and this permission notice shall be included
+    in all copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+    OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+    MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+    IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+    CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+    TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+    SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+  </copyright>
+
+  <description summary="screen-wide color filter (night mode)">
+    Lets a client tint everything the compositor shows with a warm color, the
+    way a "night light" does, to be easier on the eyes in the evening. The
+    compositor only applies the filter; *when* it should be on (a schedule,
+    a manual toggle) is entirely the client's business, so the shell can own
+    that policy without the compositor knowing about clocks or settings.
+
+    The filter is tied to the lifetime of the object: when a client destroys
+    it or disconnects (including by crashing), the filter it requested is
+    removed, so a dead shell can never leave the screen tinted. If several
+    live objects have requested a filter, the most recent request wins.
+  </description>
+
+  <interface name="ironland_display_filter_v1" version="1">
+    <request name="destroy" type="destructor">
+      <description summary="stop filtering">
+        Removes whatever filter this object requested.
+      </description>
+    </request>
+
+    <request name="set_color_temperature">
+      <description summary="warm the display to a color temperature">
+        Tints every output toward `kelvin`, a correlated color temperature in
+        the usual night-light sense: 6500 is neutral (no tint), and lower
+        values are progressively warmer/more orange. Values above 6500 are
+        treated as 6500 (neutral) and values below 1000 as 1000. Passing 0
+        is a convenience for "no filter" and is equivalent to 6500.
+
+        Takes effect on the next frame. The change applies to every output,
+        including ones connected later.
+      </description>
+      <arg name="kelvin" type="uint" summary="color temperature in kelvin, 6500 = neutral"/>
+    </request>
+  </interface>
+</protocol>

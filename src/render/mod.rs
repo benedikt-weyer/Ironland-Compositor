@@ -8,6 +8,7 @@ pub mod font;
 pub mod key_tracker;
 pub mod perf_overlay;
 pub mod rounded_corners;
+pub mod tint;
 pub mod wallpaper;
 
 use smithay::{
@@ -71,6 +72,8 @@ smithay::backend::renderer::element::render_elements! {
     // The focus-highlight border around the currently focused window (see
     // `crate::border`).
     Border=crate::border::BorderRenderElement,
+    // The night-mode tint over the whole output (see `crate::tint`).
+    Tint=smithay::backend::renderer::element::solid::SolidColorRenderElement,
     #[cfg(feature = "debug")]
     // Note: We would like to borrow this element instead, but that would introduce
     // a feature-dependent lifetime, which introduces a lot more feature bounds
@@ -88,6 +91,7 @@ impl<R: Renderer> std::fmt::Debug for CustomRenderElements<R> {
             Self::Blur(arg0) => f.debug_tuple("Blur").field(arg0).finish(),
             Self::Thumbnail(arg0) => f.debug_tuple("Thumbnail").field(arg0).finish(),
             Self::Border(_) => f.debug_tuple("Border").finish(),
+            Self::Tint(arg0) => f.debug_tuple("Tint").field(arg0).finish(),
             #[cfg(feature = "debug")]
             Self::Fps(arg0) => f.debug_tuple("Fps").field(arg0).finish(),
             Self::_GenericCatcher(arg0) => f.debug_tuple("_GenericCatcher").field(arg0).finish(),
