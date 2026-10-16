@@ -1242,18 +1242,14 @@ fn main() {
         sessions: Mutex::new(HashMap::new()),
     });
 
-    let connection = match async_io::block_on(async {
-        zbus::connection::Builder::session()?
-            .name(BUS_NAME)?
-            .build()
-            .await
-    }) {
-        Ok(conn) => conn,
-        Err(err) => {
-            eprintln!("ironland-portal-screencast: failed to connect to session bus: {err}");
-            std::process::exit(1);
-        }
-    };
+    let connection =
+        match async_io::block_on(async { zbus::connection::Builder::session()?.build().await }) {
+            Ok(conn) => conn,
+            Err(err) => {
+                eprintln!("ironland-portal-screencast: failed to connect to session bus: {err}");
+                std::process::exit(1);
+            }
+        };
 
     let iface = ScreenCastIface {
         shared,
@@ -1261,6 +1257,15 @@ fn main() {
     };
     if let Err(err) = async_io::block_on(connection.object_server().at(PORTAL_PATH, iface)) {
         eprintln!("ironland-portal-screencast: failed to register ScreenCast interface: {err}");
+        std::process::exit(1);
+    }
+
+    // Claim the bus name only once the interface is exported: xdg-desktop-portal
+    // reads this backend's properties (e.g. `AvailableSourceTypes`) once, when
+    // the name appears, and never re-reads them, so an interface that shows up
+    // after the name leaves it cached as empty.
+    if let Err(err) = async_io::block_on(connection.request_name(BUS_NAME)) {
+        eprintln!("ironland-portal-screencast: failed to request bus name: {err}");
         std::process::exit(1);
     }
 
