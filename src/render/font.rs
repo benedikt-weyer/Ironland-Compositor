@@ -118,6 +118,20 @@ impl Canvas {
         }
     }
 
+    /// Fills a circle of `diameter` pixels whose bounding box has its
+    /// top-left corner at `(x0, y0)`.
+    pub fn fill_circle(&mut self, x0: i32, y0: i32, diameter: i32, color: Color) {
+        let r = diameter as f32 / 2.0;
+        for dy in 0..diameter {
+            for dx in 0..diameter {
+                let (px, py) = (dx as f32 + 0.5 - r, dy as f32 + 0.5 - r);
+                if px * px + py * py <= r * r {
+                    self.put_pixel(x0 + dx, y0 + dy, color);
+                }
+            }
+        }
+    }
+
     /// Draws `text` with its top-left corner at `(x0, y0)`, each font pixel
     /// scaled up to a `scale x scale` block. Returns the width drawn, in pixels.
     pub fn draw_text(&mut self, x0: i32, y0: i32, text: &str, scale: i32, color: Color) -> i32 {

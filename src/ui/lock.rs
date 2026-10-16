@@ -31,7 +31,7 @@ use smithay::{
 };
 use tracing::{debug, error, info};
 
-use crate::font::{Canvas, GLYPH_HEIGHT, GLYPH_WIDTH};
+use crate::font::{Canvas, GLYPH_HEIGHT};
 
 /// `/etc/pam.d/<this>` is the PAM stack used to check the password.
 pub const PAM_SERVICE: &str = "ironland-compositor";
@@ -191,12 +191,21 @@ impl LockState {
         let field_y = PANEL_HEIGHT / 2 + 4;
         let field_h = line + 16;
         canvas.fill_rect(PANEL_PADDING, field_y, PANEL_WIDTH - PANEL_PADDING * 2, field_h, COLOR_FIELD_BG);
-        let advance = (GLYPH_WIDTH as i32 + 1) * FONT_SCALE;
-        let max_dots = ((PANEL_WIDTH - PANEL_PADDING * 2 - 24) / advance).max(1) as usize;
+        let dot = line - 4;
+        let advance = dot + 8;
+        let inner_w = PANEL_WIDTH - PANEL_PADDING * 2 - 24;
+        let max_dots = ((inner_w + 8) / advance).max(1) as usize;
         let count = self.password.chars().count();
         // Show only the tail so the field never overflows.
-        let dots = "*".repeat(count.min(max_dots));
-        canvas.draw_text(PANEL_PADDING + 12, field_y + 8, &dots, FONT_SCALE, COLOR_TEXT);
+        let shown = count.min(max_dots) as i32;
+        for i in 0..shown {
+            canvas.fill_circle(
+                PANEL_PADDING + 12 + i * advance,
+                field_y + (field_h - dot) / 2,
+                dot,
+                COLOR_TEXT,
+            );
+        }
 
         let (text, color) = match &self.message {
             Some(m) if self.authenticating => (m.as_str(), COLOR_MUTED_TEXT),
