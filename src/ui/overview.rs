@@ -491,8 +491,12 @@ where
     R::TextureId: Clone + Send + 'static,
 {
     let scale = output.current_scale().fractional_scale();
+    // The window's geometry (not its bounding box, which includes client
+    // shadows and popups) is what fills the thumbnail rectangle, and the
+    // elements are laid out from the rectangle's own corner - the origin
+    // `constrain_space_element` positions and scales them around.
     let behavior = ConstrainBehavior {
-        reference: ConstrainReference::BoundingBox,
+        reference: ConstrainReference::Geometry,
         behavior: ConstrainScaleBehavior::Fit,
         align: ConstrainAlign::CENTER,
     };
@@ -503,7 +507,7 @@ where
             constrain_space_element::<_, _, CropRenderElement<_>, _, _>(
                 renderer,
                 window,
-                Point::<i32, Logical>::from((0, 0)),
+                rect.loc,
                 1.0,
                 scale,
                 *rect,
