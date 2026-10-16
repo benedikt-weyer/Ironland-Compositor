@@ -91,6 +91,7 @@ pub fn write(doc: &mut DocumentMut, full: &FullConfig) {
     workspaces["count"] = value(cfg.workspaces.count as i64);
     workspaces["dynamic"] = value(cfg.workspaces.dynamic);
     workspaces["overlay"] = value(cfg.workspaces.overlay);
+    workspaces["keep_disconnected"] = value(cfg.workspaces.keep_disconnected);
     workspaces["transition_ms"] = value(cfg.workspaces.transition_ms as i64);
     workspaces["transition_axis"] = value(match cfg.workspaces.transition_axis {
         WorkspaceTransitionAxis::Horizontal => "horizontal",
