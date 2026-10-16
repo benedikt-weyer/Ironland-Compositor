@@ -306,7 +306,9 @@ pub struct LockSettings {
 
 impl Default for LockSettings {
     fn default() -> Self {
-        Self { lock_on_lid_close: true }
+        Self {
+            lock_on_lid_close: true,
+        }
     }
 }
 
@@ -563,7 +565,10 @@ pub fn default_shortcuts() -> HashMap<String, Vec<String>> {
         // `XF86AudioPlay`/`XF86AudioPause` both map to `mediaToggle` since
         // keyboards vary in which one they actually send for a play/pause
         // key.
-        ("shortcut:mediaToggle", vec!["XF86AudioPlay", "XF86AudioPause"]),
+        (
+            "shortcut:mediaToggle",
+            vec!["XF86AudioPlay", "XF86AudioPause"],
+        ),
         ("shortcut:mediaPrev", vec!["XF86AudioPrev"]),
         ("shortcut:mediaNext", vec!["XF86AudioNext"]),
         ("shortcut:volumeMute", vec!["XF86AudioMute"]),
@@ -640,7 +645,10 @@ pub enum SwipeDirection {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Gesture {
     /// Multi-finger swipe, e.g. `swipe:3:left`.
-    Swipe { fingers: u32, direction: SwipeDirection },
+    Swipe {
+        fingers: u32,
+        direction: SwipeDirection,
+    },
     /// Multi-finger pinch, e.g. `pinch:2:in` (fingers moving together) or
     /// `pinch:2:out` (fingers spreading apart).
     Pinch { fingers: u32, zoom_in: bool },
@@ -680,8 +688,14 @@ pub fn parse_gesture(spec: &str) -> Option<Gesture> {
             Some(Gesture::Swipe { fingers, direction })
         }
         "pinch" if (2..=5).contains(&fingers) => match arg.as_str() {
-            "in" => Some(Gesture::Pinch { fingers, zoom_in: true }),
-            "out" => Some(Gesture::Pinch { fingers, zoom_in: false }),
+            "in" => Some(Gesture::Pinch {
+                fingers,
+                zoom_in: true,
+            }),
+            "out" => Some(Gesture::Pinch {
+                fingers,
+                zoom_in: false,
+            }),
             _ => None,
         },
         _ => None,
@@ -697,7 +711,12 @@ pub fn default_gestures() -> HashMap<String, Vec<String>> {
         ("workspace_right", vec!["swipe:3:left"]),
     ]
     .into_iter()
-    .map(|(name, specs)| (name.to_string(), specs.into_iter().map(String::from).collect()))
+    .map(|(name, specs)| {
+        (
+            name.to_string(),
+            specs.into_iter().map(String::from).collect(),
+        )
+    })
     .collect()
 }
 
@@ -1137,10 +1156,17 @@ mod tests {
     #[test]
     fn workspace_transition_axis_defaults_to_horizontal_and_parses() {
         let raw: RawConfig = toml::from_str("").unwrap();
-        assert_eq!(raw.workspaces.transition_axis, WorkspaceTransitionAxis::Horizontal);
+        assert_eq!(
+            raw.workspaces.transition_axis,
+            WorkspaceTransitionAxis::Horizontal
+        );
 
-        let raw: RawConfig = toml::from_str("[workspaces]\ntransition_axis = \"vertical\"\n").unwrap();
-        assert_eq!(raw.workspaces.transition_axis, WorkspaceTransitionAxis::Vertical);
+        let raw: RawConfig =
+            toml::from_str("[workspaces]\ntransition_axis = \"vertical\"\n").unwrap();
+        assert_eq!(
+            raw.workspaces.transition_axis,
+            WorkspaceTransitionAxis::Vertical
+        );
     }
 
     #[test]
@@ -1148,7 +1174,10 @@ mod tests {
         let raw: RawConfig = toml::from_str("").unwrap();
         assert_eq!(raw.performance, PerformanceSettings::default());
         assert!(!raw.performance.fps_overlay);
-        assert_eq!(raw.performance.fps_overlay_position, OverlayPosition::TopRight);
+        assert_eq!(
+            raw.performance.fps_overlay_position,
+            OverlayPosition::TopRight
+        );
         assert_eq!(raw.performance.stutter_threshold_ms, 0.0);
         assert!(raw.performance.stutter_log);
         assert_eq!(raw.performance.fps_overlay_interval_ms, 500);
@@ -1158,7 +1187,10 @@ mod tests {
         )
         .unwrap();
         assert!(raw.performance.fps_overlay);
-        assert_eq!(raw.performance.fps_overlay_position, OverlayPosition::BottomLeft);
+        assert_eq!(
+            raw.performance.fps_overlay_position,
+            OverlayPosition::BottomLeft
+        );
         assert_eq!(raw.performance.stutter_threshold_ms, 20.0);
         assert!(!raw.performance.stutter_log);
         assert_eq!(raw.performance.fps_overlay_interval_ms, 1000);
@@ -1184,11 +1216,17 @@ mod tests {
     fn parses_gesture_specs() {
         assert_eq!(
             parse_gesture("swipe:3:left"),
-            Some(Gesture::Swipe { fingers: 3, direction: SwipeDirection::Left })
+            Some(Gesture::Swipe {
+                fingers: 3,
+                direction: SwipeDirection::Left
+            })
         );
         assert_eq!(
             parse_gesture(" Pinch:2:IN "),
-            Some(Gesture::Pinch { fingers: 2, zoom_in: true })
+            Some(Gesture::Pinch {
+                fingers: 2,
+                zoom_in: true
+            })
         );
         assert_eq!(parse_gesture("swipe:2:left"), None);
         assert_eq!(parse_gesture("swipe:3:sideways"), None);

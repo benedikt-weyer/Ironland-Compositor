@@ -131,7 +131,9 @@ fn describe(settings: &OutputSettings) -> String {
     } else {
         match &settings.position {
             None => parts.push("position=auto".to_string()),
-            Some(OutputPosition::RightOf { right_of }) => parts.push(format!("right of {right_of}")),
+            Some(OutputPosition::RightOf { right_of }) => {
+                parts.push(format!("right of {right_of}"))
+            }
             Some(OutputPosition::LeftOf { left_of }) => parts.push(format!("left of {left_of}")),
             Some(OutputPosition::Above { above }) => parts.push(format!("above {above}")),
             Some(OutputPosition::Below { below }) => parts.push(format!("below {below}")),
@@ -259,7 +261,9 @@ fn parse_wayland_info(data: &str) -> Vec<DetectedOutput> {
     let mut current: Option<DetectedOutput> = None;
     let mut modes: Vec<DetectedMode> = Vec::new();
 
-    let finish = |current: &mut Option<DetectedOutput>, modes: &mut Vec<DetectedMode>, outputs: &mut Vec<DetectedOutput>| {
+    let finish = |current: &mut Option<DetectedOutput>,
+                  modes: &mut Vec<DetectedMode>,
+                  outputs: &mut Vec<DetectedOutput>| {
         let Some(mut out) = current.take() else {
             modes.clear();
             return;
@@ -320,15 +324,18 @@ fn parse_wayland_info(data: &str) -> Vec<DetectedOutput> {
             }
             continue;
         }
-        let Some(out) = current.as_mut() else { continue };
+        let Some(out) = current.as_mut() else {
+            continue;
+        };
 
         if let Some(rest) = trimmed.strip_prefix("x: ") {
             if let Some((x, rest)) = rest.split_once(", y: ")
-                && let Some((y, rest)) = rest.split_once(", scale: ") {
-                    out.x = x.trim().parse().unwrap_or(0);
-                    out.y = y.trim().parse().unwrap_or(0);
-                    out.scale = rest.trim().trim_end_matches(',').parse().unwrap_or(1);
-                }
+                && let Some((y, rest)) = rest.split_once(", scale: ")
+            {
+                out.x = x.trim().parse().unwrap_or(0);
+                out.y = y.trim().parse().unwrap_or(0);
+                out.scale = rest.trim().trim_end_matches(',').parse().unwrap_or(1);
+            }
         } else if let Some(rest) = trimmed.strip_prefix("make: '") {
             if let Some((make, rest)) = rest.split_once("', model: '") {
                 out.make = make.to_string();
@@ -346,23 +353,25 @@ fn parse_wayland_info(data: &str) -> Vec<DetectedOutput> {
         if let Some(rest) = trimmed.strip_prefix("width: ") {
             if let Some((width, rest)) = rest.split_once(" px, height: ")
                 && let Some((height, rest)) = rest.split_once(" px, refresh: ")
-                    && let Some(hz) = rest.split_whitespace().next() {
-                        let width: i32 = width.trim().parse().unwrap_or(0);
-                        let height: i32 = height.trim().parse().unwrap_or(0);
-                        let hz: f64 = hz.parse().unwrap_or(0.0);
-                        modes.push(DetectedMode {
-                            width,
-                            height,
-                            refresh: (hz * 1000.0).round() as i32,
-                            current: false,
-                            preferred: false,
-                        });
-                    }
-        } else if trimmed.contains("flags:")
-            && let Some(last) = modes.last_mut() {
-                last.current = trimmed.contains("current");
-                last.preferred = trimmed.contains("preferred");
+                && let Some(hz) = rest.split_whitespace().next()
+            {
+                let width: i32 = width.trim().parse().unwrap_or(0);
+                let height: i32 = height.trim().parse().unwrap_or(0);
+                let hz: f64 = hz.parse().unwrap_or(0.0);
+                modes.push(DetectedMode {
+                    width,
+                    height,
+                    refresh: (hz * 1000.0).round() as i32,
+                    current: false,
+                    preferred: false,
+                });
             }
+        } else if trimmed.contains("flags:")
+            && let Some(last) = modes.last_mut()
+        {
+            last.current = trimmed.contains("current");
+            last.preferred = trimmed.contains("preferred");
+        }
     }
     finish(&mut current, &mut modes, &mut outputs);
     outputs.sort_by(|a, b| a.name.cmp(&b.name));

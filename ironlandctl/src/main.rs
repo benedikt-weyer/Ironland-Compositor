@@ -195,10 +195,18 @@ fn set(explicit: &Option<PathBuf>, key: SettingKey, raw: &str, no_apply_live: bo
     let mut doc = paths::load_doc(&path)?;
     settings::set(&mut doc, key, raw)?;
     paths::write_atomic(&path, &doc.to_string())?;
-    println!("Set {} = {} (saved to {})", key.dotted(), raw, path.display());
+    println!(
+        "Set {} = {} (saved to {})",
+        key.dotted(),
+        raw,
+        path.display()
+    );
 
     if key == SettingKey::AppearanceDarkMode && !no_apply_live {
-        let dark = matches!(raw.to_ascii_lowercase().as_str(), "true" | "on" | "yes" | "1");
+        let dark = matches!(
+            raw.to_ascii_lowercase().as_str(),
+            "true" | "on" | "yes" | "1"
+        );
         apply_live_color_scheme(dark);
     }
     Ok(())
@@ -233,7 +241,10 @@ fn reset(explicit: &Option<PathBuf>, yes: bool) -> Result<()> {
         }
     }
     std::fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
-    println!("Removed {}; every setting is back to its default.", path.display());
+    println!(
+        "Removed {}; every setting is back to its default.",
+        path.display()
+    );
     Ok(())
 }
 

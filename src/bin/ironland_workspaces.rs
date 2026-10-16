@@ -71,7 +71,13 @@ use wayland_protocols::ext::workspace::v1::client::ext_workspace_manager_v1::{
 /// way `crate::ironland_protocols` generates the compositor's server side
 /// of it (and the other two protocols in that module).
 mod workspace_windows_protocol {
-    #![allow(dead_code, non_camel_case_types, unused_imports, missing_docs, clippy::all)]
+    #![allow(
+        dead_code,
+        non_camel_case_types,
+        unused_imports,
+        missing_docs,
+        clippy::all
+    )]
 
     use wayland_client;
     use wayland_client::protocol::*;
@@ -426,11 +432,15 @@ impl Dispatch<IronlandWorkspaceWindowsV1, ()> for App {
                 app_id,
                 floating,
             } => {
-                state.pending_windows.entry((output, workspace)).or_default().push(WindowJson {
-                    title,
-                    app_id,
-                    floating: floating != 0,
-                });
+                state
+                    .pending_windows
+                    .entry((output, workspace))
+                    .or_default()
+                    .push(WindowJson {
+                        title,
+                        app_id,
+                        floating: floating != 0,
+                    });
             }
             ironland_workspace_windows_v1::Event::Done => {
                 state.windows_by_workspace = std::mem::take(&mut state.pending_windows);

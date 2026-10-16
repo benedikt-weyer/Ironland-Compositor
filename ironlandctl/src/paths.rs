@@ -42,8 +42,7 @@ pub fn write_atomic(path: &Path, contents: &str) -> Result<()> {
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(dir)
-        .with_context(|| format!("creating {}", dir.display()))?;
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
 
     let unique = format!(
         "{}-{}",

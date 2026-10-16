@@ -3,8 +3,8 @@
 //! "Save" - which always has a complete, fully-merged config in hand rather
 //! than one changed field.
 
-use ironland_config::{FullConfig, OutputPosition, WorkspaceMode, WorkspaceTransitionAxis};
 use crate::settings::caps_lock_str;
+use ironland_config::{FullConfig, OutputPosition, WorkspaceMode, WorkspaceTransitionAxis};
 use toml_edit::{Array, DocumentMut, Item, Table, value};
 
 fn ensure_table<'a>(doc: &'a mut DocumentMut, key: &str) -> &'a mut Table {
