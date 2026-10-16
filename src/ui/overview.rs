@@ -53,6 +53,14 @@ const MIN_SCROLL_SLOT_WIDTH: i32 = 280;
 const SLOT_GAP: i32 = 16;
 const MIN_SLOT_WIDTH: i32 = 48;
 
+/// Zoom slider: thumbnail size relative to the size that fits every
+/// workspace (1.0), from [`ZOOM_MIN`] to [`ZOOM_MAX`].
+pub const ZOOM_MIN: f64 = 0.5;
+pub const ZOOM_MAX: f64 = 2.0;
+const SLIDER_WIDTH: i32 = 220;
+const SLIDER_TRACK_Y: i32 = 30;
+const SLIDER_KNOB: i32 = 16;
+
 // Canvas pixels are B, G, R, A.
 const fn rgba(r: u8, g: u8, b: u8, a: u8) -> [u8; 4] {
     [b, g, r, a]
@@ -89,14 +97,31 @@ struct Press {
     size: Size<i32, Logical>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct OverviewState {
     visible: bool,
     press: Option<Press>,
     /// Pixels the workspace strip is scrolled along its axis (clamped at layout time).
     scroll: i32,
+    /// Thumbnail zoom set by the slider; kept across openings.
+    zoom: f64,
+    /// The zoom slider's knob is being dragged.
+    slider_drag: bool,
     /// Per output name: the hash of what the cached buffer shows, and the buffer.
     cache: HashMap<String, (u64, MemoryRenderBuffer)>,
+}
+
+impl Default for OverviewState {
+    fn default() -> Self {
+        Self {
+            visible: false,
+            press: None,
+            scroll: 0,
+            zoom: 1.0,
+            slider_drag: false,
+            cache: HashMap::new(),
+        }
+    }
 }
 
 impl OverviewState {
@@ -107,6 +132,7 @@ impl OverviewState {
     fn open(&mut self) {
         self.visible = true;
         self.press = None;
+        self.slider_drag = false;
         self.scroll = 0;
         self.cache.clear();
     }
@@ -114,6 +140,7 @@ impl OverviewState {
     fn close(&mut self) {
         self.visible = false;
         self.press = None;
+        self.slider_drag = false;
         self.scroll = 0;
         self.cache.clear();
     }
@@ -155,6 +182,7 @@ fn compute_layout(
     view: Size<i32, Logical>,
     scroll: i32,
     axis: WorkspaceTransitionAxis,
+    zoom: f64,
 ) -> Layout {
     let mut layout = Layout::default();
     let Some(out) = outputs.first() else {
@@ -166,9 +194,9 @@ fn compute_layout(
     let avail_h = (view.h - TITLE_HEIGHT - MARGIN).max(1);
     let horizontal = axis == WorkspaceTransitionAxis::Horizontal;
 
-    // Thumbnail width: the largest that fits every slot along the axis and
-    // the whole thumbnail across it, but never below the readable minimum
-    // (the strip scrolls instead).
+    // Thumbnail width: the largest that fits every slot along the axis,
+    // never below the readable minimum (the strip scrolls instead), scaled by
+    // `zoom` but never past what fits across the axis.
     let fit_along = if horizontal {
         (avail_w - (n - 1) * SLOT_GAP) / n
     } else {
@@ -179,9 +207,9 @@ fn compute_layout(
     } else {
         avail_w
     };
-    let width = fit_along
+    let fitted = fit_along.min(fit_across).max(MIN_SCROLL_SLOT_WIDTH);
+    let width = ((fitted as f64 * zoom.clamp(ZOOM_MIN, ZOOM_MAX)).round() as i32)
         .min(fit_across)
-        .max(MIN_SCROLL_SLOT_WIDTH)
         .min(avail_w)
         .max(MIN_SLOT_WIDTH);
     let height = (width as f64 / aspect).round() as i32;
@@ -220,6 +248,22 @@ fn compute_layout(
         });
     }
     layout
+}
+
+/// The zoom slider's hit area in a view of width `view_w`: the track plus
+/// room for the knob, in the title band.
+fn slider_rect(view_w: i32) -> Rectangle<i32, Logical> {
+    Rectangle::new(
+        Point::from((view_w - MARGIN - SLIDER_WIDTH - SLIDER_KNOB / 2, SLIDER_TRACK_Y - SLIDER_KNOB)),
+        Size::from((SLIDER_WIDTH + SLIDER_KNOB, SLIDER_KNOB * 2)),
+    )
+}
+
+/// The zoom a pointer at view-local `x` selects on the slider.
+fn zoom_at(view_w: i32, x: i32) -> f64 {
+    let left = view_w - MARGIN - SLIDER_WIDTH;
+    let t = ((x - left) as f64 / SLIDER_WIDTH as f64).clamp(0.0, 1.0);
+    ZOOM_MIN + t * (ZOOM_MAX - ZOOM_MIN)
 }
 
 /// `window`'s rectangle inside `slot`'s thumbnail.
@@ -321,6 +365,7 @@ struct Scene<'a> {
     press: Option<&'a Press>,
     dragging: bool,
     hover: &'a Hit,
+    zoom: f64,
 }
 
 fn rasterize(scene: &Scene<'_>) -> Canvas {
@@ -379,6 +424,33 @@ fn rasterize(scene: &Scene<'_>) -> Canvas {
         MARGIN,
         18 + GLYPH_HEIGHT as i32 * 3 + 6,
         "Drag windows between workspaces - scroll for more - click to switch - Esc to close",
+        1,
+        COLOR_MUTED,
+    );
+
+    // Zoom slider, right-aligned in the title band.
+    let left = view.w - MARGIN - SLIDER_WIDTH;
+    let t = (scene.zoom - ZOOM_MIN) / (ZOOM_MAX - ZOOM_MIN);
+    canvas.fill_rect(left, SLIDER_TRACK_Y - 2, SLIDER_WIDTH, 4, COLOR_MUTED);
+    let knob_x = left + (t.clamp(0.0, 1.0) * SLIDER_WIDTH as f64).round() as i32;
+    canvas.fill_rect(
+        left,
+        SLIDER_TRACK_Y - 2,
+        knob_x - left,
+        4,
+        COLOR_ACTIVE,
+    );
+    canvas.fill_rect(
+        knob_x - SLIDER_KNOB / 2,
+        SLIDER_TRACK_Y - SLIDER_KNOB / 2,
+        SLIDER_KNOB,
+        SLIDER_KNOB,
+        COLOR_TEXT,
+    );
+    canvas.draw_text(
+        left,
+        SLIDER_TRACK_Y + SLIDER_KNOB,
+        &format!("Zoom {}%", (scene.zoom * 100.0).round() as i32),
         1,
         COLOR_MUTED,
     );
@@ -453,13 +525,14 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         // value never drifts past the end.
         let snapshot = workspace::overview_snapshot(self);
         let axis = self.config.workspaces.transition_axis;
+        let zoom = self.overview.zoom;
         let max = self
             .space
             .outputs()
             .filter_map(|o| {
                 let geo = self.space.output_geometry(o)?;
                 let snap: Vec<_> = snapshot.iter().filter(|s| &s.output == o).cloned().collect();
-                Some(compute_layout(&snap, geo.size, i32::MAX, axis).scroll)
+                Some(compute_layout(&snap, geo.size, i32::MAX, axis, zoom).scroll)
             })
             .max()
             .unwrap_or(0);
@@ -509,7 +582,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         let geo = self.space.output_geometry(output)?;
         let view = geo.size;
         let snapshot = self.overview_snapshot_for(output);
-        let layout = compute_layout(&snapshot, view, self.overview.scroll, self.config.workspaces.transition_axis);
+        let layout = compute_layout(&snapshot, view, self.overview.scroll, self.config.workspaces.transition_axis, self.overview.zoom);
 
         let pointer_global = self.pointer.current_location();
         let local = (pointer_global - geo.loc.to_f64()).to_i32_round();
@@ -526,7 +599,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         });
 
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        (view.w, view.h, dragging, layout.scroll).hash(&mut hasher);
+        (view.w, view.h, dragging, layout.scroll, (self.overview.zoom * 1000.0) as i32).hash(&mut hasher);
         for out in &snapshot {
             (&out.name, out.size.w, out.size.h, out.active, out.count).hash(&mut hasher);
             for (idx, windows) in out.workspaces.iter().enumerate() {
@@ -560,6 +633,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             press: press.as_ref(),
             dragging,
             hover: &hover,
+            zoom: self.overview.zoom,
         });
         let buffer = MemoryRenderBuffer::from_slice(
             &canvas.pixels,
@@ -584,7 +658,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             return Vec::new();
         };
         let snapshot = self.overview_snapshot_for(output);
-        let layout = compute_layout(&snapshot, geo.size, self.overview.scroll, self.config.workspaces.transition_axis);
+        let layout = compute_layout(&snapshot, geo.size, self.overview.scroll, self.config.workspaces.transition_axis, self.overview.zoom);
 
         let pointer_global = self.pointer.current_location();
         let local = (pointer_global - geo.loc.to_f64()).to_i32_round();
@@ -621,6 +695,27 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         out
     }
 
+    fn overview_set_zoom(&mut self, zoom: f64) {
+        self.overview.zoom = zoom.clamp(ZOOM_MIN, ZOOM_MAX);
+        self.overview.cache.clear();
+    }
+
+    /// Called after the pointer moves: keeps a zoom-slider drag following it.
+    pub(crate) fn overview_pointer_moved(&mut self) {
+        if !self.overview.is_visible() || !self.overview.slider_drag {
+            return;
+        }
+        let location = self.pointer.current_location();
+        let Some(output) = self.space.output_under(location).next().cloned() else {
+            return;
+        };
+        let Some(geo) = self.space.output_geometry(&output) else {
+            return;
+        };
+        let x = (location.x - geo.loc.x as f64).round() as i32;
+        self.overview_set_zoom(zoom_at(geo.size.w, x));
+    }
+
     /// Handles a mouse button while the overview is up: a press starts a
     /// click-or-drag, the release finishes it - dropping a dragged window
     /// onto a workspace moves it there, a plain click activates what's under
@@ -638,8 +733,17 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         };
         let geo = self.space.output_geometry(&output).unwrap_or_default();
         let local = (location - geo.loc.to_f64()).to_i32_round();
+        if pressed && slider_rect(geo.size.w).contains(local) {
+            self.overview.slider_drag = true;
+            self.overview_set_zoom(zoom_at(geo.size.w, local.x));
+            return;
+        }
+        if !pressed && self.overview.slider_drag {
+            self.overview.slider_drag = false;
+            return;
+        }
         let snapshot = self.overview_snapshot_for(&output);
-        let layout = compute_layout(&snapshot, geo.size, self.overview.scroll, self.config.workspaces.transition_axis);
+        let layout = compute_layout(&snapshot, geo.size, self.overview.scroll, self.config.workspaces.transition_axis, self.overview.zoom);
         let hit = layout.hit(&snapshot, local);
         let slot_id = hit
             .slot
@@ -727,14 +831,14 @@ mod tests {
     #[test]
     fn one_slot_per_workspace() {
         let outputs = [out(3, 1920, 1080)];
-        assert_eq!(compute_layout(&outputs, Size::from((1920, 1080)), 0, WorkspaceTransitionAxis::Horizontal).slots.len(), 3);
+        assert_eq!(compute_layout(&outputs, Size::from((1920, 1080)), 0, WorkspaceTransitionAxis::Horizontal, 1.0).slots.len(), 3);
     }
 
     #[test]
     fn slots_keep_their_outputs_aspect_ratio_and_fit_the_view() {
         let outputs = [out(3, 1920, 1080), out(2, 1080, 1920)];
         let view = Size::from((1280, 720));
-        let layout = compute_layout(&outputs, view, 0, WorkspaceTransitionAxis::Horizontal);
+        let layout = compute_layout(&outputs, view, 0, WorkspaceTransitionAxis::Horizontal, 1.0);
         for slot in &layout.slots {
             assert!(slot.rect.loc.x >= 0 && slot.rect.loc.x + slot.rect.size.w <= view.w);
             let o = &outputs[slot.output];
@@ -747,7 +851,7 @@ mod tests {
     #[test]
     fn hit_finds_the_slot_under_a_point() {
         let outputs = [out(2, 1600, 900)];
-        let layout = compute_layout(&outputs, Size::from((1600, 900)), 0, WorkspaceTransitionAxis::Horizontal);
+        let layout = compute_layout(&outputs, Size::from((1600, 900)), 0, WorkspaceTransitionAxis::Horizontal, 1.0);
         let second = layout.slots[1].rect;
         let hit = layout.hit(&outputs, second.loc + Point::from((2, 2)));
         assert_eq!(hit.slot, Some((0, 1)));
@@ -773,7 +877,7 @@ mod tests {
     #[test]
     fn horizontal_axis_lays_workspaces_out_in_one_row() {
         let outputs = [out(5, 1920, 1080)];
-        let layout = compute_layout(&outputs, Size::from((1920, 1080)), 0, WorkspaceTransitionAxis::Horizontal);
+        let layout = compute_layout(&outputs, Size::from((1920, 1080)), 0, WorkspaceTransitionAxis::Horizontal, 1.0);
         let y = layout.slots[0].rect.loc.y;
         assert!(layout.slots.iter().all(|s| s.rect.loc.y == y));
         assert!(layout.slots.windows(2).all(|w| w[0].rect.loc.x < w[1].rect.loc.x));
@@ -782,7 +886,7 @@ mod tests {
     #[test]
     fn vertical_axis_lays_workspaces_out_in_one_column() {
         let outputs = [out(5, 1920, 1080)];
-        let layout = compute_layout(&outputs, Size::from((1920, 1080)), 0, WorkspaceTransitionAxis::Vertical);
+        let layout = compute_layout(&outputs, Size::from((1920, 1080)), 0, WorkspaceTransitionAxis::Vertical, 1.0);
         let x = layout.slots[0].rect.loc.x;
         assert!(layout.slots.iter().all(|s| s.rect.loc.x == x));
         assert!(layout.slots.windows(2).all(|w| w[0].rect.loc.y < w[1].rect.loc.y));
@@ -793,10 +897,10 @@ mod tests {
         let outputs = [out(30, 1920, 1080)];
         let view = Size::from((1280, 720));
         for axis in [WorkspaceTransitionAxis::Horizontal, WorkspaceTransitionAxis::Vertical] {
-            let top = compute_layout(&outputs, view, 0, axis);
+            let top = compute_layout(&outputs, view, 0, axis, 1.0);
             assert!(top.max_scroll > 0);
             assert!(top.slots.iter().all(|s| s.rect.size.w >= MIN_SCROLL_SLOT_WIDTH));
-            let end = compute_layout(&outputs, view, i32::MAX, axis);
+            let end = compute_layout(&outputs, view, i32::MAX, axis, 1.0);
             assert_eq!(end.scroll, end.max_scroll);
             let (a, b) = (top.slots[0].rect.loc, end.slots[0].rect.loc);
             match axis {
@@ -804,6 +908,18 @@ mod tests {
                 WorkspaceTransitionAxis::Vertical => assert!(b.y < a.y && b.x == a.x),
             }
         }
+    }
+
+    #[test]
+    fn zoom_scales_thumbnails_and_the_slider_maps_its_ends() {
+        let outputs = [out(4, 1920, 1080)];
+        let view = Size::from((1920, 1080));
+        let axis = WorkspaceTransitionAxis::Horizontal;
+        let w = |zoom| compute_layout(&outputs, view, 0, axis, zoom).slots[0].rect.size.w;
+        assert!(w(0.5) < w(1.0) && w(1.0) < w(1.5));
+        let slider = slider_rect(view.w);
+        assert_eq!(zoom_at(view.w, slider.loc.x), ZOOM_MIN);
+        assert_eq!(zoom_at(view.w, slider.loc.x + slider.size.w), ZOOM_MAX);
     }
 
     #[test]

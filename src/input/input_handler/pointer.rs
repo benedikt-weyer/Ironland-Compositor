@@ -448,6 +448,7 @@ impl AnvilState<UdevData> {
             },
         );
         pointer.frame(self);
+        self.overview_pointer_moved();
 
         // If pointer is now in a constraint region, activate it
         // TODO Anywhere else pointer is moved needs to do this
@@ -510,6 +511,7 @@ impl AnvilState<UdevData> {
             },
         );
         pointer.frame(self);
+        self.overview_pointer_moved();
     }
 
     pub(super) fn clamp_coords(&self, pos: Point<f64, Logical>) -> Point<f64, Logical> {
