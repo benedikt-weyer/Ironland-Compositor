@@ -21,7 +21,7 @@ use smithay::{
         allocator::Fourcc,
         renderer::{
             ImportAll, ImportMem, Renderer,
-            element::memory::MemoryRenderBuffer,
+            element::{memory::MemoryRenderBuffer, utils::CropRenderElement},
         },
     },
     desktop::space::{ConstrainBehavior, ConstrainReference, constrain_space_element},
@@ -145,6 +145,10 @@ impl OverviewState {
         self.cache.clear();
     }
 }
+
+/// A live window thumbnail: the window, the output-local rectangle it is
+/// scaled into, and the part of that rectangle that may be drawn.
+pub type Thumb = (WindowElement, Rectangle<i32, Logical>, Rectangle<i32, Logical>);
 
 /// One workspace thumbnail's place on screen.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -473,13 +477,14 @@ fn rasterize(scene: &Scene<'_>) -> Canvas {
 }
 
 /// Live, scaled-down render elements for the windows `thumbs` lists (from
-/// [`AnvilState::overview_thumbnails`]), each fitted and cropped to its
-/// rectangle. Windows on hidden workspaces aren't mapped in the space, but a
-/// window's surface tree still renders, so they show their latest frame too.
+/// [`AnvilState::overview_thumbnails`]), each fitted into its rectangle and
+/// cropped to its clip (the part of it on screen). Windows on hidden
+/// workspaces aren't mapped in the space, but a window's surface tree still
+/// renders, so they show their latest frame too.
 pub fn thumbnail_elements<R>(
     renderer: &mut R,
     output: &Output,
-    thumbs: &[(WindowElement, Rectangle<i32, Logical>)],
+    thumbs: &[Thumb],
 ) -> Vec<CustomRenderElements<R>>
 where
     R: Renderer + ImportAll + ImportMem + GlesCapable,
@@ -493,8 +498,9 @@ where
     };
     thumbs
         .iter()
-        .flat_map(|(window, rect)| {
-            constrain_space_element::<_, _, CustomRenderElements<R>, _, _>(
+        .flat_map(|(window, rect, clip)| {
+            let clip = clip.to_f64().to_physical(scale).to_i32_round();
+            constrain_space_element::<_, _, CropRenderElement<_>, _, _>(
                 renderer,
                 window,
                 Point::<i32, Logical>::from((0, 0)),
@@ -503,6 +509,8 @@ where
                 *rect,
                 behavior,
             )
+            .filter_map(|element| CropRenderElement::from_element(element, scale, clip))
+            .map(CustomRenderElements::Thumbnail)
             .collect::<Vec<_>>()
         })
         .collect()
@@ -650,7 +658,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
     /// The windows to draw live inside the overview, top-most first, each
     /// with the output-local rectangle its thumbnail fills. The window being
     /// dragged comes first, at the pointer.
-    pub fn overview_thumbnails(&self, output: &Output) -> Vec<(WindowElement, Rectangle<i32, Logical>)> {
+    pub fn overview_thumbnails(&self, output: &Output) -> Vec<Thumb> {
         if !self.overview.is_visible() {
             return Vec::new();
         }
@@ -671,15 +679,17 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         if let Some(press) = carried
             && let Some(window) = press.window.clone()
         {
-            out.push((window, Rectangle::new(local - press.grab, press.size)));
+            out.push((window, Rectangle::new(local - press.grab, press.size), Rectangle::from_size(geo.size)));
         }
         let viewport = Rectangle::new(
             Point::from((0, TITLE_HEIGHT - 4)),
             Size::from((geo.size.w, geo.size.h - TITLE_HEIGHT + 4)),
         );
-        // Slots cut off by the viewport keep just their placeholders: a live
-        // thumbnail can't be cropped without rescaling.
-        for slot in layout.slots.iter().filter(|s| viewport.contains_rect(s.rect)) {
+        // Slots cut off by the viewport show the part that's on screen.
+        for slot in &layout.slots {
+            let Some(clip) = viewport.intersection(slot.rect) else {
+                continue;
+            };
             let info = &snapshot[slot.output];
             let Some(windows) = info.workspaces.get(slot.workspace) else {
                 continue;
@@ -689,7 +699,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                 if carried.is_some_and(|p| p.window.as_ref() == Some(&w.window)) {
                     continue;
                 }
-                out.push((w.window.clone(), window_rect_in(slot, info, w.rect)));
+                out.push((w.window.clone(), window_rect_in(slot, info, w.rect), clip));
             }
         }
         out

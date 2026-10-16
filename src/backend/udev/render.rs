@@ -529,7 +529,7 @@ pub(super) fn render_surface<'a>(
     lock: &mut crate::lock::LockState,
     permission_prompt: &mut crate::permission_prompt::PermissionPromptManagerState,
     overview_buffer: Option<MemoryRenderBuffer>,
-    overview_thumbs: Vec<(WindowElement, Rectangle<i32, Logical>)>,
+    overview_thumbs: Vec<crate::overview::Thumb>,
     show_workspace_overlay: bool,
     wallpaper: &mut crate::wallpaper::Wallpaper,
     blur: &crate::config::BlurSettings,
@@ -790,6 +790,7 @@ pub(super) fn render_surface<'a>(
     // Screen lock: keep only the cursor (everything pushed so far past it
     // is the dnd icon and overlays) and add the lock panel, centered.
     let locked = lock.is_locked();
+    let overview_visible = overview_buffer.is_some();
     if locked {
         custom_elements.truncate(cursor_element_count);
         let panel_size = lock.logical_size();
@@ -853,6 +854,7 @@ pub(super) fn render_surface<'a>(
         drop_indicator,
         drop_indicator_cache,
         locked,
+        overview_visible,
     );
     let build_elements = build_start.elapsed();
 

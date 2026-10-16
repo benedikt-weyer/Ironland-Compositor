@@ -68,7 +68,7 @@ smithay::backend::renderer::element::render_elements! {
     Blur=CropRenderElement<MemoryRenderBufferRenderElement<R>>,
     // A live, scaled-down window drawn inside a workspace overview slot (see
     // `crate::overview::thumbnail_elements`).
-    Thumbnail=CropRenderElement<RelocateRenderElement<RescaleRenderElement<WindowRenderElement<R>>>>,
+    Thumbnail=CropRenderElement<CropRenderElement<RelocateRenderElement<RescaleRenderElement<WindowRenderElement<R>>>>>,
     // The focus-highlight border around the currently focused window (see
     // `crate::border`).
     Border=crate::border::BorderRenderElement,
@@ -205,6 +205,7 @@ pub fn output_elements<R>(
     drop_indicator: Option<Rectangle<i32, Logical>>,
     drop_indicator_cache: &mut crate::border::BorderCache,
     locked: bool,
+    overview: bool,
 ) -> (
     Vec<OutputRenderElements<R, WindowRenderElement<R>>>,
     Color32F,
@@ -224,10 +225,15 @@ where
         return (elements, LOCK_CLEAR_COLOR);
     }
 
+    // While the workspace overview is up the windows are drawn only as its
+    // thumbnails: rendering the real ones too would put two elements with the
+    // same surface ids in one frame, which confuses the damage tracker and
+    // leaves some thumbnails blank.
     if let Some(window) = output
         .user_data()
         .get::<FullscreenSurface>()
         .and_then(|f| f.get())
+        .filter(|_| !overview)
     {
         let scale = output.current_scale().fractional_scale().into();
         let window_render_elements: Vec<WindowRenderElement<R>> =
@@ -249,7 +255,7 @@ where
             .map(OutputRenderElements::from)
             .collect::<Vec<_>>();
 
-        if show_window_preview && space.elements_for_output(output).count() > 0 {
+        if show_window_preview && !overview && space.elements_for_output(output).count() > 0 {
             output_render_elements.extend(space_preview_elements(renderer, space, output));
         }
 
@@ -293,7 +299,7 @@ where
         // behind top/overlay layer-shell surfaces (bars, popups) pushed just
         // above, so a maximized/tiled window's border never paints over the
         // shell's own chrome (list order is front-to-back).
-        if let Some(window_rect) = focused_window_rect {
+        if let Some(window_rect) = focused_window_rect.filter(|_| !overview) {
             // Follow the same cutoff the window itself gets, so the border
             // hugs the visible part instead of the window's full extent.
             let clip = space
@@ -340,7 +346,7 @@ where
         // scaled/relocated into its current eased rect instead (see
         // `crate::shell::tiling`), which `Space`'s own helper has no hook
         // for.
-        for window in space.elements_for_output(output).rev() {
+        for window in space.elements_for_output(output).rev().filter(|_| !overview) {
             let Some(element_location) = space.element_location(window) else {
                 continue;
             };
@@ -496,6 +502,7 @@ pub fn render_output<'a, 'd, R>(
     drop_indicator: Option<Rectangle<i32, Logical>>,
     drop_indicator_cache: &mut crate::border::BorderCache,
     locked: bool,
+    overview: bool,
 ) -> Result<RenderOutputResult<'d>, OutputDamageTrackerError<R::Error>>
 where
     R: Renderer + ImportAll + ImportMem + GlesCapable,
@@ -516,6 +523,7 @@ where
         drop_indicator,
         drop_indicator_cache,
         locked,
+        overview,
     );
     damage_tracker.render_output(renderer, framebuffer, age, &elements, clear_color)
 }

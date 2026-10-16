@@ -284,6 +284,7 @@ pub fn run_winit() {
 
             let overview_buffer = state.overview_buffer_for(&output);
             let overview_thumbs = state.overview_thumbnails(&output);
+            let overview_visible = overview_buffer.is_some();
 
             let tint_kelvin = state.display_filter_state.kelvin();
             let tint = state.space.output_geometry(&output).and_then(|geometry| {
@@ -690,6 +691,7 @@ pub fn run_winit() {
                     drop_indicator,
                     drop_indicator_cache,
                     locked,
+                    overview_visible,
                 )
                 .inspect(|_result| {
                     if let Some(size) = capture_size {
