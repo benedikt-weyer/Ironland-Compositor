@@ -678,7 +678,7 @@ pub(crate) fn locate<BackendData: Backend>(
     state: &AnvilState<BackendData>,
     window: &WindowElement,
 ) -> Option<(Output, usize)> {
-    for output in state.space.outputs() {
+    for output in state.all_outputs() {
         for (idx, layout) in TilingState::all(output).iter().enumerate() {
             if layout.contains(window) {
                 return Some((output.clone(), idx));
@@ -1146,7 +1146,7 @@ pub fn retile_all_outputs<BackendData: Backend>(state: &mut AnvilState<BackendDa
 /// whatever else is left on that workspace. Returns whether any window was
 /// removed.
 pub fn cleanup_dead<BackendData: Backend>(state: &mut AnvilState<BackendData>) -> bool {
-    let outputs: Vec<Output> = state.space.outputs().cloned().collect();
+    let outputs: Vec<Output> = state.all_outputs().cloned().collect();
     let mut changed = false;
 
     let dead_focus = current_focused_window(state).filter(|w| !w.alive());
@@ -1166,7 +1166,9 @@ pub fn cleanup_dead<BackendData: Backend>(state: &mut AnvilState<BackendData>) -
             changed |= workspace_changed;
             active_changed |= workspace_changed && idx == active;
         }
-        if active_changed {
+        // A parked (disconnected) output has no geometry to lay out into; its
+        // tree is re-flowed when it's restored.
+        if active_changed && state.space.output_geometry(output).is_some() {
             apply_layout_animated(state, output);
         }
     }

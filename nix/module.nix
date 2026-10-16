@@ -43,7 +43,11 @@ in
       (default 4); `dynamic` (default false), if true, grows the count on
       demand and prunes empty trailing workspaces automatically instead of
       keeping it fixed at `count`; `overlay` (default true) shows a row of
-      dots on screen briefly whenever the active workspace changes. Switch
+      dots on screen briefly whenever the active workspace changes;
+      `keep_disconnected` (default true) parks a disconnected monitor's
+      workspaces and windows (even if it was the last monitor) and restores
+      them when a monitor returns on the same connector, instead of moving
+      its windows onto another monitor. Switch
       workspaces with Super+Left/Right; move the focused window to an
       adjacent one and follow it there with Super+Alt+Left/Right, or move it
       without following with Super+Ctrl+Alt+Left/Right (all rebindable in

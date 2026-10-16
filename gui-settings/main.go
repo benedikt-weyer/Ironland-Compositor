@@ -649,6 +649,12 @@ func buildWorkspacesTab(cfg *Config) fyne.CanvasObject {
 	})
 	overlay.SetChecked(cfg.Workspaces.Overlay)
 
+	keepDisconnected := widget.NewCheck("Keep workspaces and windows of disconnected monitors", func(checked bool) {
+		cfg.Workspaces.KeepDisconnected = checked
+		resets.refresh()
+	})
+	keepDisconnected.SetChecked(cfg.Workspaces.KeepDisconnected)
+
 	transitionMs := widget.NewEntry()
 	transitionMs.SetText(fmt.Sprintf("%d", cfg.Workspaces.TransitionMs))
 	transitionMs.OnChanged = func(s string) {
@@ -681,6 +687,7 @@ func buildWorkspacesTab(cfg *Config) fyne.CanvasObject {
 		widget.NewFormItem("Starting workspace count", resets.item(count, func() bool { return cfg.Workspaces.Count != defaults.Count }, func() { count.SetText(fmt.Sprintf("%d", defaults.Count)) })),
 		widget.NewFormItem("Dynamic count", resets.item(dynamic, func() bool { return cfg.Workspaces.Dynamic != defaults.Dynamic }, func() { dynamic.SetChecked(defaults.Dynamic) })),
 		widget.NewFormItem("On-screen overlay", resets.item(overlay, func() bool { return cfg.Workspaces.Overlay != defaults.Overlay }, func() { overlay.SetChecked(defaults.Overlay) })),
+		widget.NewFormItem("Disconnected monitors", resets.item(keepDisconnected, func() bool { return cfg.Workspaces.KeepDisconnected != defaults.KeepDisconnected }, func() { keepDisconnected.SetChecked(defaults.KeepDisconnected) })),
 		widget.NewFormItem("Switch animation (ms, 0 = off)", resets.item(transitionMs, func() bool { return cfg.Workspaces.TransitionMs != defaults.TransitionMs }, func() { transitionMs.SetText(fmt.Sprintf("%d", defaults.TransitionMs)) })),
 		widget.NewFormItem("Switch animation direction", resets.item(transitionAxis, func() bool { return cfg.Workspaces.TransitionAxis != defaults.TransitionAxis }, func() { transitionAxis.SetSelected(axisLabels[defaults.TransitionAxis]) })),
 	)
@@ -689,7 +696,9 @@ func buildWorkspacesTab(cfg *Config) fyne.CanvasObject {
 		"Switch workspaces with Super+Left/Right, and move the focused window to an adjacent workspace" +
 			" with Super+Alt+Left/Right (both rebindable in the Shortcuts tab). With \"Dynamic count\" on," +
 			" navigating or moving a window past the last workspace creates a new one, and empty trailing" +
-			" workspaces are dropped again automatically; otherwise the count above is fixed.",
+			" workspaces are dropped again automatically; otherwise the count above is fixed. With \"Keep workspaces" +
+			" and windows of disconnected monitors\" on, unplugging a monitor (even the last one) hides its windows" +
+			" instead of moving them, and plugging it back into the same connector restores them where they were.",
 	)
 	hint.Wrapping = fyne.TextWrapWord
 

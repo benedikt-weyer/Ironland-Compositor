@@ -146,6 +146,13 @@ pub struct WorkspaceSettings {
     pub transition_ms: u32,
     /// Axis the slide animation moves along.
     pub transition_axis: WorkspaceTransitionAxis,
+    /// Whether a disconnected monitor's workspaces, windows and window
+    /// positions are kept alive (parked, hidden) while it's unplugged -
+    /// even if that was the last monitor - and restored when a monitor
+    /// shows up again on the same connector. If false, a disconnected
+    /// monitor's state is dropped and its windows are moved onto whichever
+    /// monitor is left.
+    pub keep_disconnected: bool,
 }
 
 impl Default for WorkspaceSettings {
@@ -157,6 +164,7 @@ impl Default for WorkspaceSettings {
             overlay: true,
             transition_ms: 220,
             transition_axis: WorkspaceTransitionAxis::default(),
+            keep_disconnected: true,
         }
     }
 }
@@ -1038,6 +1046,7 @@ mod tests {
         assert_eq!(raw.workspaces.count, 4);
         assert!(!raw.workspaces.dynamic);
         assert!(raw.workspaces.overlay);
+        assert!(raw.workspaces.keep_disconnected);
     }
 
     #[test]
@@ -1151,6 +1160,16 @@ mod tests {
         assert_eq!(raw.workspaces.count, 6);
         assert!(raw.workspaces.dynamic);
         assert!(!raw.workspaces.overlay);
+    }
+
+    #[test]
+    fn workspace_keep_disconnected_defaults_on_and_can_be_disabled() {
+        let raw: RawConfig = toml::from_str("").unwrap();
+        assert!(raw.workspaces.keep_disconnected);
+
+        let raw: RawConfig =
+            toml::from_str("[workspaces]\nkeep_disconnected = false\n").unwrap();
+        assert!(!raw.workspaces.keep_disconnected);
     }
 
     #[test]

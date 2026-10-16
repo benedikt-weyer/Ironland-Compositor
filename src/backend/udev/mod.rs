@@ -166,10 +166,27 @@ impl<'a> crate::rounded_corners::GlesCapable for UdevRenderer<'a> {
     }
 }
 
+/// Which DRM device/CRTC an [`Output`] is currently driven by. The fields are
+/// cells because a parked output (see `workspaces.keep_disconnected`) is
+/// reused when its monitor returns, possibly on a different CRTC.
 #[derive(Debug, PartialEq)]
 struct UdevOutputId {
-    device_id: DrmNode,
-    crtc: crtc::Handle,
+    device_id: std::cell::Cell<DrmNode>,
+    crtc: std::cell::Cell<crtc::Handle>,
+}
+
+impl UdevOutputId {
+    fn new(device_id: DrmNode, crtc: crtc::Handle) -> Self {
+        UdevOutputId {
+            device_id: std::cell::Cell::new(device_id),
+            crtc: std::cell::Cell::new(crtc),
+        }
+    }
+
+    fn set(&self, device_id: DrmNode, crtc: crtc::Handle) {
+        self.device_id.set(device_id);
+        self.crtc.set(crtc);
+    }
 }
 
 pub struct UdevData {
@@ -245,8 +262,8 @@ impl Backend for UdevData {
 
     fn reset_buffers(&mut self, output: &Output) {
         if let Some(id) = output.user_data().get::<UdevOutputId>()
-            && let Some(gpu) = self.backends.get_mut(&id.device_id)
-                && let Some(surface) = gpu.surfaces.get_mut(&id.crtc) {
+            && let Some(gpu) = self.backends.get_mut(&id.device_id.get())
+                && let Some(surface) = gpu.surfaces.get_mut(&id.crtc.get()) {
                     surface.drm_output.reset_buffers();
                 }
     }

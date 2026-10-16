@@ -257,16 +257,23 @@ impl<BackendData: Backend> WlrLayerShellHandler for AnvilState<BackendData> {
         _layer: Layer,
         namespace: String,
     ) {
-        let output = wl_output
+        let Some(output) = wl_output
             .as_ref()
             .and_then(Output::from_resource)
-            .unwrap_or_else(|| self.space.outputs().next().unwrap().clone());
+            .or_else(|| self.space.outputs().next().cloned())
+        else {
+            // No monitor is connected, so there's nowhere to put it.
+            surface.send_close();
+            return;
+        };
         let mut map = layer_map_for_output(&output);
         map.map_layer(&LayerSurface::new(surface, namespace)).unwrap();
     }
 
     fn layer_destroyed(&mut self, surface: WlrLayerSurface) {
-        if let Some((mut map, layer)) = self.space.outputs().find_map(|o| {
+        // Also search parked outputs: a layer surface of a disconnected
+        // monitor can be destroyed while that output is kept alive.
+        if let Some((mut map, layer)) = self.all_outputs().find_map(|o| {
             let map = layer_map_for_output(o);
             let layer = map
                 .layers()

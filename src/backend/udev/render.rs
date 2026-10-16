@@ -39,10 +39,7 @@ impl AnvilState<UdevData> {
 
         let output = if let Some(output) = self.space.outputs().find(|o| {
             o.user_data().get::<UdevOutputId>()
-                == Some(&UdevOutputId {
-                    device_id: surface.device_id,
-                    crtc,
-                })
+                == Some(&UdevOutputId::new(surface.device_id, crtc))
         }) {
             output.clone()
         } else {
@@ -252,10 +249,7 @@ impl AnvilState<UdevData> {
 
         let output = if let Some(output) = self.space.outputs().find(|o| {
             o.user_data().get::<UdevOutputId>()
-                == Some(&UdevOutputId {
-                    device_id: node,
-                    crtc,
-                })
+                == Some(&UdevOutputId::new(node, crtc))
         }) {
             output.clone()
         } else {

@@ -285,6 +285,15 @@ pub struct AnvilState<BackendData: Backend + 'static> {
     /// [`crate::shell::workspace::OVERLAY_DURATION_MS`]; see the render loops.
     pub workspace_overlay_shown: Option<std::time::Instant>,
 
+    /// Outputs whose monitor is currently disconnected but whose workspaces
+    /// and windows are being kept alive (see
+    /// `config.workspaces.keep_disconnected` and
+    /// [`crate::shell::workspace::park_output`]). They are not in `space`;
+    /// their per-output state lives in their user data, and their windows
+    /// stay homed to them (hidden) until a monitor with the same connector
+    /// name returns.
+    pub parked_outputs: Vec<Output>,
+
     /// FPS/frame-time history and stutter counters, keyed by output name -
     /// see `crate::perf_overlay` and `config.performance`. Entries are
     /// created lazily the first time a given output renders a frame and
@@ -374,6 +383,19 @@ mod repaint;
 pub use repaint::{SurfaceDmabufFeedback, take_presentation_feedback, update_primary_scanout_output};
 
 impl<BackendData: Backend + 'static> AnvilState<BackendData> {
+    /// Every output the compositor still tracks workspace/window state for:
+    /// the connected ones (in `space`) followed by the parked, disconnected
+    /// ones (see [`Self::parked_outputs`]).
+    pub fn all_outputs(&self) -> impl Iterator<Item = &Output> {
+        self.space.outputs().chain(self.parked_outputs.iter())
+    }
+
+    /// Removes and returns the parked output called `name`, if there is one.
+    pub fn take_parked_output(&mut self, name: &str) -> Option<Output> {
+        let pos = self.parked_outputs.iter().position(|o| o.name() == name)?;
+        Some(self.parked_outputs.remove(pos))
+    }
+
     pub fn init(
         display: Display<AnvilState<BackendData>>,
         handle: LoopHandle<'static, AnvilState<BackendData>>,
@@ -644,6 +666,7 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             focus_before_lock: None,
             wallpaper: crate::wallpaper::Wallpaper::load(config.wallpaper.as_deref()),
             workspace_overlay_shown: None,
+            parked_outputs: Vec::new(),
             perf_stats: HashMap::new(),
             fps_overlay_cache: HashMap::new(),
             key_tracker: crate::key_tracker::KeyTracker::new(&config.key_tracker),

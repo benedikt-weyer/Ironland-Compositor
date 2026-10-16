@@ -89,6 +89,9 @@ type WorkspaceSettings struct {
 	// TransitionAxis is either "horizontal" (windows slide left/right) or
 	// "vertical" (windows slide up/down).
 	TransitionAxis string `json:"transition_axis"`
+	// KeepDisconnected keeps a disconnected monitor's workspaces and windows
+	// parked, and restores them when a monitor returns on the same connector.
+	KeepDisconnected bool `json:"keep_disconnected"`
 }
 
 // LockSettings mirrors `ironland_config::LockSettings`.

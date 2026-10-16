@@ -140,6 +140,129 @@ pub fn init_output(config: &Config, space: &Space<WindowElement>, output: &Outpu
     *ws.count.borrow_mut() = count;
 }
 
+/// Where a parked output sat in the space when its monitor was unplugged,
+/// so its floating windows can follow it if it comes back somewhere else.
+struct ParkedAt(RefCell<Point<i32, Logical>>);
+
+/// Keeps `output`'s workspaces and windows alive after its monitor is
+/// unplugged (`workspaces.keep_disconnected`): its active workspace's windows
+/// are hidden exactly as if the user had switched away (floating positions
+/// and fullscreen state remembered), and the output - which owns the
+/// per-output workspace and tiling state - is parked in
+/// [`AnvilState::parked_outputs`] instead of being dropped. Windows stay
+/// homed to it. [`restore_output`] undoes this.
+///
+/// Call this while `output` is still mapped in the space, before unmapping it.
+pub(crate) fn park_output<B: Backend>(state: &mut AnvilState<B>, output: &Output) {
+    finalize_transition(state, output);
+
+    if let Some(geo) = state.space.output_geometry(output) {
+        output
+            .user_data()
+            .insert_if_missing(|| ParkedAt(RefCell::new(geo.loc)));
+        *output.user_data().get::<ParkedAt>().unwrap().0.borrow_mut() = geo.loc;
+    }
+
+    let idx = WorkspaceState::get(output).active();
+    hide_workspace(state, output, idx);
+
+    if !state.parked_outputs.contains(output) {
+        state.parked_outputs.push(output.clone());
+    }
+
+    // Keyboard focus must not stay on a window that was just hidden.
+    let focus_was_here = tiling::current_focused_window(state)
+        .and_then(|w| window_home(&w))
+        .is_some_and(|(home, _)| home == *output);
+    if focus_was_here {
+        let other = state.space.outputs().find(|o| *o != output).cloned();
+        match other {
+            Some(other) => {
+                let active = WorkspaceState::get(&other).active();
+                focus_first_in_workspace(state, &other, active);
+            }
+            None => {
+                if let Some(keyboard) = state.seat.get_keyboard() {
+                    keyboard.set_focus(state, None, SERIAL_COUNTER.next_serial());
+                }
+            }
+        }
+    }
+}
+
+/// Brings a previously [parked](park_output) output back: its floating
+/// windows are shifted to follow it if it was placed somewhere else this
+/// time (and pulled back on-screen if its new monitor is smaller), and its
+/// active workspace is shown again - tiled windows reflowed into the new
+/// geometry, floating ones put back where they were.
+///
+/// `output` must already be mapped in the space and removed from
+/// [`AnvilState::parked_outputs`].
+pub(crate) fn restore_output<B: Backend>(state: &mut AnvilState<B>, output: &Output) {
+    let Some(geo) = state.space.output_geometry(output) else {
+        return;
+    };
+    let ws = WorkspaceState::get(output);
+
+    // In `Combined` mode every monitor shows the same workspace, so a
+    // returning one rejoins whatever the others are on now.
+    if state.config.workspaces.mode == WorkspaceMode::Combined
+        && let Some(other) = state.space.outputs().find(|o| *o != output)
+    {
+        let other = WorkspaceState::get(other);
+        let (active, count) = (other.active(), other.count());
+        *ws.active.borrow_mut() = active;
+        let merged = ws.count().max(count);
+        *ws.count.borrow_mut() = merged;
+    }
+
+    let delta = output
+        .user_data()
+        .get::<ParkedAt>()
+        .map(|at| geo.loc - *at.0.borrow())
+        .unwrap_or_default();
+    for window in ws.floating.borrow().iter().flatten() {
+        if let Some(pos) = WindowHome::get(window).floating_pos.borrow_mut().as_mut() {
+            let moved = *pos + delta;
+            *pos = if geo.contains(moved) {
+                moved
+            } else {
+                Point::from((
+                    moved
+                        .x
+                        .clamp(geo.loc.x + 32, (geo.loc.x + geo.size.w - 64).max(geo.loc.x + 32)),
+                    moved
+                        .y
+                        .clamp(geo.loc.y + 32, (geo.loc.y + geo.size.h - 64).max(geo.loc.y + 32)),
+                ))
+            };
+        }
+    }
+
+    // Windows that were opened while no monitor was connected never got a
+    // home (there was no output to assign them to); adopt them now, but only
+    // when this is the first monitor back so ordinary hotplugs don't touch
+    // windows other code is mid-way through placing.
+    if state.space.outputs().count() == 1 {
+        let unhomed: Vec<WindowElement> = state
+            .space
+            .elements()
+            .filter(|w| window_home(w).is_none())
+            .cloned()
+            .collect();
+        for window in unhomed {
+            assign_new_window(&window, output, true);
+        }
+    }
+
+    let idx = ws.active();
+    show_workspace(state, output, idx);
+
+    if tiling::current_focused_window(state).is_none() {
+        focus_first_in_workspace(state, output, idx);
+    }
+}
+
 /// Applies changed workspace settings to every connected output. When a
 /// fixed count shrinks, windows from removed slots are preserved by moving
 /// them into the new last workspace before the public workspace list is
@@ -252,7 +375,7 @@ pub(crate) fn unregister_floating(window: &WindowElement) {
 /// Returns whether any window was removed.
 pub fn cleanup_dead<B: Backend>(state: &AnvilState<B>) -> bool {
     let mut changed = false;
-    for output in state.space.outputs() {
+    for output in state.all_outputs() {
         let ws = WorkspaceState::get(output);
         for slot in ws.floating.borrow_mut().iter_mut() {
             let old_len = slot.len();
@@ -1159,11 +1282,7 @@ fn all_windows_on_output(output: &Output) -> Vec<WindowElement> {
 /// `state.space.elements()`, which only sees the *visible* (active-workspace)
 /// ones.
 pub(crate) fn all_windows<B: Backend>(state: &AnvilState<B>) -> Vec<WindowElement> {
-    state
-        .space
-        .outputs()
-        .flat_map(all_windows_on_output)
-        .collect()
+    state.all_outputs().flat_map(all_windows_on_output).collect()
 }
 
 /// The output+workspace `window` is currently homed to (tiled or floating),

@@ -241,16 +241,27 @@ impl AnvilState<UdevData> {
             let wl_mode = WlMode::from(drm_mode);
 
             let (phys_w, phys_h) = connector.size().unwrap_or((0, 0));
-            let output = Output::new(
-                output_name,
-                PhysicalProperties {
-                    size: (phys_w as i32, phys_h as i32).into(),
-                    subpixel: connector.subpixel().into(),
-                    make,
-                    model,
-                    serial_number,
-                },
-            );
+            // A monitor coming back on a connector whose output was parked
+            // (`workspaces.keep_disconnected`) reuses that `Output`, since it
+            // owns the workspaces/tiling state the windows are still homed to.
+            let parked = self
+                .parked_outputs
+                .iter()
+                .position(|o| o.name() == output_name)
+                .map(|pos| self.parked_outputs.remove(pos));
+            let reused = parked.is_some();
+            let output = parked.unwrap_or_else(|| {
+                Output::new(
+                    output_name,
+                    PhysicalProperties {
+                        size: (phys_w as i32, phys_h as i32).into(),
+                        subpixel: connector.subpixel().into(),
+                        make,
+                        model,
+                        serial_number,
+                    },
+                )
+            });
             for mode in connector.modes() {
                 output.add_mode(WlMode::from(*mode));
             }
@@ -273,12 +284,16 @@ impl AnvilState<UdevData> {
             output.set_preferred(wl_mode);
             output.change_current_state(Some(wl_mode), None, None, Some(position));
             self.space.map_output(&output, position);
-            crate::shell::workspace::init_output(&self.config, &self.space, &output);
+            if !reused {
+                crate::shell::workspace::init_output(&self.config, &self.space, &output);
+            }
 
-            output.user_data().insert_if_missing(|| UdevOutputId {
-                crtc,
-                device_id: node,
-            });
+            output
+                .user_data()
+                .insert_if_missing(|| UdevOutputId::new(node, crtc));
+            if let Some(id) = output.user_data().get::<UdevOutputId>() {
+                id.set(node, crtc);
+            }
 
             #[cfg(feature = "debug")]
             let fps_element = self.backend_data.fps_texture.clone().map(FpsElement::new);
@@ -287,6 +302,11 @@ impl AnvilState<UdevData> {
                 Ok(driver) => driver,
                 Err(err) => {
                     warn!("Failed to query drm driver: {}", err);
+                    if reused {
+                        self.space.unmap_output(&output);
+                        self.display_handle.remove_global::<AnvilState<UdevData>>(global);
+                        self.parked_outputs.push(output);
+                    }
                     return;
                 }
             };
@@ -295,6 +315,11 @@ impl AnvilState<UdevData> {
                 Ok(planes) => planes,
                 Err(err) => {
                     warn!("Failed to query crtc planes: {}", err);
+                    if reused {
+                        self.space.unmap_output(&output);
+                        self.display_handle.remove_global::<AnvilState<UdevData>>(global);
+                        self.parked_outputs.push(output);
+                    }
                     return;
                 }
             };
@@ -329,6 +354,11 @@ impl AnvilState<UdevData> {
                 Ok(drm_output) => drm_output,
                 Err(err) => {
                     warn!("Failed to initialize drm output: {}", err);
+                    if reused {
+                        self.space.unmap_output(&output);
+                        self.display_handle.remove_global::<AnvilState<UdevData>>(global);
+                        self.parked_outputs.push(output);
+                    }
                     return;
                 }
             };
@@ -347,6 +377,7 @@ impl AnvilState<UdevData> {
                 )
             });
 
+            let restore = reused.then(|| output.clone());
             let surface = SurfaceData {
                 dh: self.display_handle.clone(),
                 device_id: node,
@@ -374,6 +405,10 @@ impl AnvilState<UdevData> {
             device.surfaces.insert(crtc, surface);
 
             self.reorder_primary_output();
+
+            if let Some(output) = restore {
+                crate::shell::workspace::restore_output(self, &output);
+            }
 
             // kick-off rendering
             self.handle.insert_idle(move |state| {
@@ -435,6 +470,7 @@ impl AnvilState<UdevData> {
             return;
         };
 
+        let mut removed_output = None;
         if let Some(pos) = device
             .non_desktop_connectors
             .iter()
@@ -445,8 +481,7 @@ impl AnvilState<UdevData> {
                 leasing_state.withdraw_connector(connector.handle());
             }
         } else if let Some(surface) = device.surfaces.remove(&crtc) {
-            self.space.unmap_output(&surface.output);
-            self.space.refresh();
+            removed_output = Some(surface.output.clone());
         }
 
         let render_node = device.render_node.unwrap_or(self.backend_data.primary_gpu);
@@ -464,6 +499,14 @@ impl AnvilState<UdevData> {
             // Instead we just use black to "simulate" a modeset :)
             &DrmOutputRenderElements::default(),
         );
+
+        if let Some(output) = removed_output {
+            if self.config.workspaces.keep_disconnected {
+                crate::shell::workspace::park_output(self, &output);
+            }
+            self.space.unmap_output(&output);
+            self.space.refresh();
+        }
     }
 
     pub(super) fn device_changed(&mut self, node: DrmNode) {
@@ -509,6 +552,8 @@ impl AnvilState<UdevData> {
         // fixup window coordinates
         crate::shell::fixup_positions(&mut self.space, self.pointer.current_location());
         crate::ext_workspace::ext_workspace_sync(self);
+        crate::foreign_toplevel::sync(self);
+        crate::workspace_windows::sync(self);
     }
 
     pub(super) fn device_removed(&mut self, node: DrmNode) {
