@@ -359,7 +359,6 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                         return if let KeyState::Pressed = state {
                             if data.super_tap_pending.is_none() {
                                 data.super_tap_pending = Some(true);
-                                data.start_super_hold_timer();
                             }
                             FilterResult::Forward
                         } else {

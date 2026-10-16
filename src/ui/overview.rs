@@ -2,7 +2,7 @@
 //! of mini "virtual monitors" - one per workspace - with the windows living
 //! on each. Windows can be dragged from one workspace (or monitor) onto
 //! another; clicking a workspace or window switches to it. Opened by
-//! holding Super (or the `toggle_overview` action), closed with
+//! the `toggle_overview` action (`super+space` by default), closed with
 //! Escape, another Super tap, or after picking something.
 //!
 //! The overlay is software-rasterized into one `MemoryRenderBuffer` per
@@ -41,9 +41,6 @@ use crate::{
     },
     state::{AnvilState, Backend},
 };
-
-/// Holding Super alone for this long opens the overview.
-pub const LONG_PRESS_MS: u64 = 500;
 
 /// A press that travels farther than this (logical pixels) is a drag, not a click.
 const DRAG_THRESHOLD: f64 = 6.0;
@@ -420,22 +417,6 @@ where
 }
 
 impl<BackendData: Backend> AnvilState<BackendData> {
-    /// Arms the Super long-press timer: if Super is still held alone when it
-    /// fires, the overview opens and the press no longer counts as a tap.
-    pub(crate) fn start_super_hold_timer(&mut self) {
-        use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
-        self.super_hold_token = self.super_hold_token.wrapping_add(1);
-        let token = self.super_hold_token;
-        let timer = Timer::from_duration(std::time::Duration::from_millis(LONG_PRESS_MS));
-        let _ = self.handle.insert_source(timer, move |_, _, data| {
-            if data.super_hold_token == token && data.super_tap_pending == Some(true) {
-                data.super_tap_pending = Some(false);
-                data.open_overview();
-            }
-            TimeoutAction::Drop
-        });
-    }
-
     /// The overview's snapshot restricted to `output`: each display's overlay
     /// shows only its own workspaces.
     fn overview_snapshot_for(&self, output: &Output) -> Vec<OverviewOutput> {
