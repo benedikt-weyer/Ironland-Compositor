@@ -58,7 +58,11 @@
         treated as 6500 (neutral) and values below 1000 as 1000. Passing 0
         is a convenience for "no filter" and is equivalent to 6500.
 
-        Takes effect on the next frame. The change applies to every output,
+        The compositor fades to the new temperature over a few seconds
+        (linearly), so turning the filter on or off is gradual rather than a
+        jump; the client doesn't need to animate it itself.
+
+        The change applies to every output,
         including ones connected later. The compositor may implement it as a
         true per-channel color scaling (e.g. a display gamma ramp) or as an
         approximating overlay, so it need not appear in screenshots.

@@ -286,7 +286,7 @@ pub fn run_winit() {
             let overview_thumbs = state.overview_thumbnails(&output);
             let overview_visible = overview_buffer.is_some();
 
-            let tint_kelvin = state.display_filter_state.kelvin();
+            let tint_kelvin = state.display_filter_state.current_kelvin();
             let tint = state.space.output_geometry(&output).and_then(|geometry| {
                 state.display_tint.element(
                     &output.name(),

@@ -9,6 +9,8 @@
 //! exactly as long as the protocol object that requested it, so a crashed
 //! client can't leave the screen stuck orange.
 
+use std::time::{Duration, Instant};
+
 use smithay::reexports::wayland_server::{
     Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New,
     backend::{ClientId, GlobalId},
@@ -23,6 +25,8 @@ use crate::ironland_protocols::display_filter::ironland_display_filter_v1::{
 pub const NEUTRAL_KELVIN: u32 = 6500;
 /// Warmest temperature a client can request; lower values are clamped.
 pub const MIN_KELVIN: u32 = 1000;
+/// How long a change of the requested temperature takes to fade in or out.
+pub const TRANSITION: Duration = Duration::from_secs(3);
 
 /// Implemented by the compositor state so this module can store filter
 /// requests without depending on `AnvilState` directly.
@@ -51,6 +55,42 @@ pub struct DisplayFilterState {
     global: GlobalId,
     entries: Vec<FilterEntry>,
     next_serial: u64,
+    fade: Fade,
+}
+
+/// A linear fade between two color temperatures, interpolated in mired
+/// (10^6 / K) so equal steps look equally warm (see `crate::tint`).
+#[derive(Debug)]
+struct Fade {
+    from: f32,
+    to: f32,
+    start: Instant,
+}
+
+fn mired(kelvin: u32) -> f32 {
+    1.0e6 / kelvin as f32
+}
+
+impl Fade {
+    fn at(&self, now: Instant) -> f32 {
+        let t = now.saturating_duration_since(self.start).as_secs_f32() / TRANSITION.as_secs_f32();
+        self.from + (self.to - self.from) * t.clamp(0.0, 1.0)
+    }
+
+    /// Retargets the fade (starting from wherever it currently is) if
+    /// `target` changed, and returns the current temperature.
+    fn update(&mut self, target: Option<u32>, now: Instant) -> Option<u32> {
+        let to = mired(target.unwrap_or(NEUTRAL_KELVIN));
+        if to != self.to {
+            *self = Fade {
+                from: self.at(now),
+                to,
+                start: now,
+            };
+        }
+        let kelvin = (1.0e6 / self.at(now)).round() as u32;
+        (kelvin < NEUTRAL_KELVIN).then_some(kelvin)
+    }
 }
 
 impl DisplayFilterState {
@@ -63,6 +103,11 @@ impl DisplayFilterState {
             global,
             entries: Vec::new(),
             next_serial: 0,
+            fade: Fade {
+                from: mired(NEUTRAL_KELVIN),
+                to: mired(NEUTRAL_KELVIN),
+                start: Instant::now(),
+            },
         }
     }
 
@@ -71,9 +116,18 @@ impl DisplayFilterState {
         self.global.clone()
     }
 
-    /// The color temperature to render with, or `None` when no live client
-    /// wants a filter (nothing requested, or the latest request was neutral).
-    /// Destroying the object that made the latest request falls back to the
+    /// The color temperature to render with right now, or `None` for no
+    /// filter: [`Self::kelvin`] eased in over [`TRANSITION`], so enabling and
+    /// disabling night mode (or changing its temperature) fades linearly.
+    /// Call once per frame; it is cheap and safe to call per output.
+    pub fn current_kelvin(&mut self) -> Option<u32> {
+        let target = self.kelvin();
+        self.fade.update(target, Instant::now())
+    }
+
+    /// The color temperature the clients asked for, or `None` when no live
+    /// client wants a filter (nothing requested, or the latest request was
+    /// neutral). Destroying the object that made the latest request falls back to the
     /// latest request of the remaining live objects.
     pub fn kelvin(&self) -> Option<u32> {
         self.entries
@@ -157,6 +211,44 @@ impl<D: DisplayFilterHandler> Dispatch2<IronlandDisplayFilterV1, D> for GlobalDa
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fresh_fade(now: Instant) -> Fade {
+        Fade {
+            from: mired(NEUTRAL_KELVIN),
+            to: mired(NEUTRAL_KELVIN),
+            start: now,
+        }
+    }
+
+    #[test]
+    fn fade_is_linear_in_mired_and_reaches_the_target() {
+        let t0 = Instant::now();
+        let mut fade = fresh_fade(t0);
+        assert_eq!(fade.update(None, t0), None);
+        // Start of the fade is still neutral.
+        assert_eq!(fade.update(Some(3000), t0), None);
+        let half = fade.update(Some(3000), t0 + TRANSITION / 2).unwrap();
+        let expected = 1.0e6 / ((mired(NEUTRAL_KELVIN) + mired(3000)) / 2.0);
+        assert!(
+            (half as f32 - expected).abs() <= 1.0,
+            "{half} vs {expected}"
+        );
+        assert_eq!(fade.update(Some(3000), t0 + TRANSITION * 2), Some(3000));
+    }
+
+    #[test]
+    fn fade_out_ends_with_no_filter_and_retargets_from_current() {
+        let t0 = Instant::now();
+        let mut fade = fresh_fade(t0);
+        fade.update(Some(3000), t0);
+        let done = t0 + TRANSITION;
+        assert_eq!(fade.update(Some(3000), done), Some(3000));
+        // Turning off starts from 3000 K and warms back up gradually.
+        assert_eq!(fade.update(None, done), Some(3000));
+        let mid = fade.update(None, done + TRANSITION / 2).unwrap();
+        assert!(mid > 3000 && mid < NEUTRAL_KELVIN);
+        assert_eq!(fade.update(None, done + TRANSITION * 2), None);
+    }
 
     #[test]
     fn clamps_requests() {
