@@ -8,6 +8,17 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         let state = wl_pointer::ButtonState::from(evt.state());
 
         if self.lock.is_locked() {
+            // The only clickable thing on the lock screen is the password
+            // field's eye icon, which toggles showing the password.
+            if wl_pointer::ButtonState::Pressed == state && evt.button() == Some(MouseButton::Left) {
+                let location = self.pointer.current_location();
+                if let Some(output) = self.space.output_under(location).next().cloned()
+                    && let Some(geo) = self.space.output_geometry(&output)
+                {
+                    let local = (location - geo.loc.to_f64()).to_i32_round();
+                    self.lock.click(geo.size, local);
+                }
+            }
             return;
         }
 

@@ -27,11 +27,11 @@ use std::{
 use smithay::{
     backend::{allocator::Fourcc, renderer::element::memory::MemoryRenderBuffer},
     reexports::calloop::channel::Sender,
-    utils::{Logical, Size, Transform},
+    utils::{Logical, Point, Rectangle, Size, Transform},
 };
 use tracing::{debug, error, info};
 
-use crate::font::{Canvas, GLYPH_HEIGHT};
+use crate::font::{Canvas, GLYPH_HEIGHT, GLYPH_WIDTH, glyph_pixels};
 
 /// `/etc/pam.d/<this>` is the PAM stack used to check the password.
 pub const PAM_SERVICE: &str = "ironland-compositor";
@@ -41,6 +41,10 @@ const PANEL_HEIGHT: i32 = 190;
 const PANEL_PADDING: i32 = 24;
 const FONT_SCALE: i32 = 2;
 const MAX_PASSWORD_CHARS: usize = 256;
+/// The eye icon's size, and the gap between it and the field's right edge.
+const EYE_WIDTH: i32 = 28;
+const EYE_HEIGHT: i32 = 18;
+const EYE_INSET: i32 = 12;
 
 const COLOR_BACKGROUND: [u8; 4] = [40, 34, 30, 255];
 const COLOR_FIELD_BG: [u8; 4] = [70, 60, 52, 255];
@@ -53,6 +57,8 @@ const COLOR_ERROR_TEXT: [u8; 4] = [235, 110, 100, 255];
 pub struct LockState {
     locked: bool,
     password: String,
+    /// Show the typed password as text instead of circles.
+    reveal: bool,
     message: Option<String>,
     /// A PAM check is in flight; input is ignored until it reports back.
     authenticating: bool,
@@ -67,6 +73,7 @@ impl LockState {
         Self {
             locked: false,
             password: String::new(),
+            reveal: false,
             message: None,
             authenticating: false,
             username: current_username(),
@@ -82,6 +89,7 @@ impl LockState {
 
     pub fn lock(&mut self) {
         self.locked = true;
+        self.reveal = false;
         self.reset_input();
         self.message = None;
         self.authenticating = false;
@@ -90,6 +98,7 @@ impl LockState {
 
     pub fn unlock(&mut self) {
         self.locked = false;
+        self.reveal = false;
         self.reset_input();
         self.message = None;
         self.authenticating = false;
@@ -171,6 +180,50 @@ impl LockState {
         self.dirty = true;
     }
 
+    /// The password field's rectangle, in panel coordinates.
+    fn field_rect() -> Rectangle<i32, Logical> {
+        let line = GLYPH_HEIGHT as i32 * FONT_SCALE;
+        Rectangle::new(
+            Point::from((PANEL_PADDING, PANEL_HEIGHT / 2 + 4)),
+            Size::from((PANEL_WIDTH - PANEL_PADDING * 2, line + 16)),
+        )
+    }
+
+    /// The eye icon's rectangle, in panel coordinates.
+    fn eye_rect() -> Rectangle<i32, Logical> {
+        let field = Self::field_rect();
+        Rectangle::new(
+            Point::from((
+                field.loc.x + field.size.w - EYE_INSET - EYE_WIDTH,
+                field.loc.y + (field.size.h - EYE_HEIGHT) / 2,
+            )),
+            Size::from((EYE_WIDTH, EYE_HEIGHT)),
+        )
+    }
+
+    /// Handles a left click at `local` (output-local) on an output of size
+    /// `output_size`, where the panel is centered. Returns whether it hit
+    /// the eye icon, which toggles showing the password.
+    pub fn click(&mut self, output_size: Size<i32, Logical>, local: Point<i32, Logical>) -> bool {
+        if !self.locked {
+            return false;
+        }
+        let origin = Point::<i32, Logical>::from((
+            (output_size.w - PANEL_WIDTH) / 2,
+            (output_size.h - PANEL_HEIGHT) / 2,
+        ));
+        // A generous target: the icon plus a few pixels around it.
+        let mut target = Self::eye_rect();
+        target.loc -= Point::from((6, 6));
+        target.size += Size::from((12, 12));
+        if !target.contains(local - origin) {
+            return false;
+        }
+        self.reveal = !self.reveal;
+        self.dirty = true;
+        true
+    }
+
     pub fn logical_size(&self) -> Size<i32, Logical> {
         Size::from((PANEL_WIDTH, PANEL_HEIGHT))
     }
@@ -188,24 +241,49 @@ impl LockState {
             COLOR_MUTED_TEXT,
         );
 
-        let field_y = PANEL_HEIGHT / 2 + 4;
-        let field_h = line + 16;
-        canvas.fill_rect(PANEL_PADDING, field_y, PANEL_WIDTH - PANEL_PADDING * 2, field_h, COLOR_FIELD_BG);
-        let dot = line - 4;
-        let advance = dot + 8;
-        let inner_w = PANEL_WIDTH - PANEL_PADDING * 2 - 24;
-        let max_dots = ((inner_w + 8) / advance).max(1) as usize;
+        let field = Self::field_rect();
+        let (field_y, field_h) = (field.loc.y, field.size.h);
+        canvas.fill_rect(field.loc.x, field.loc.y, field.size.w, field.size.h, COLOR_FIELD_BG);
+        let eye = Self::eye_rect();
+        let text_x = PANEL_PADDING + 12;
+        let inner_w = eye.loc.x - 8 - text_x;
         let count = self.password.chars().count();
-        // Show only the tail so the field never overflows.
-        let shown = count.min(max_dots) as i32;
-        for i in 0..shown {
-            canvas.fill_circle(
-                PANEL_PADDING + 12 + i * advance,
-                field_y + (field_h - dot) / 2,
-                dot,
-                COLOR_TEXT,
-            );
+        if self.reveal {
+            let advance = (GLYPH_WIDTH as i32 + 1) * FONT_SCALE;
+            let max_chars = (inner_w / advance).max(1) as usize;
+            // Show only the tail so the field never overflows.
+            let tail: Vec<char> = self.password.chars().skip(count.saturating_sub(max_chars)).collect();
+            for (i, c) in tail.iter().enumerate() {
+                let x = text_x + i as i32 * advance;
+                let y = field_y + 8;
+                let known = glyph_pixels(*c).iter().flatten().any(|&on| on);
+                if known {
+                    canvas.draw_text(x, y, &c.to_string(), FONT_SCALE, COLOR_TEXT);
+                } else if *c != ' ' {
+                    // The bitmap font has no glyph for this character: show
+                    // a hollow box so it still counts as typed.
+                    let (w, h) = (GLYPH_WIDTH as i32 * FONT_SCALE, GLYPH_HEIGHT as i32 * FONT_SCALE);
+                    canvas.fill_rect(x, y, w, FONT_SCALE, COLOR_TEXT);
+                    canvas.fill_rect(x, y + h - FONT_SCALE, w, FONT_SCALE, COLOR_TEXT);
+                    canvas.fill_rect(x, y, FONT_SCALE, h, COLOR_TEXT);
+                    canvas.fill_rect(x + w - FONT_SCALE, y, FONT_SCALE, h, COLOR_TEXT);
+                }
+            }
+        } else {
+            let dot = line - 4;
+            let advance = dot + 8;
+            let max_dots = ((inner_w + 8) / advance).max(1) as usize;
+            // Show only the newest circles so the field never overflows.
+            for i in 0..count.min(max_dots) as i32 {
+                canvas.fill_circle(
+                    text_x + i * advance,
+                    field_y + (field_h - dot) / 2,
+                    dot,
+                    COLOR_TEXT,
+                );
+            }
         }
+        draw_eye(&mut canvas, eye, self.reveal, if self.reveal { COLOR_TEXT } else { COLOR_MUTED_TEXT });
 
         let (text, color) = match &self.message {
             Some(m) if self.authenticating => (m.as_str(), COLOR_MUTED_TEXT),
@@ -240,6 +318,36 @@ impl LockState {
 }
 
 /// The login name to authenticate as: whoever runs the compositor.
+/// Draws an eye in `rect`: an almond outline with a pupil, struck through
+/// while the password is being shown (click to hide it again).
+fn draw_eye(canvas: &mut Canvas, rect: Rectangle<i32, Logical>, struck: bool, color: [u8; 4]) {
+    let (w, h) = (rect.size.w as f32, rect.size.h as f32);
+    let (cx, cy) = (w / 2.0, h / 2.0);
+    // Half the almond's height at horizontal offset `dx` from the center.
+    let half = |dx: f32| (h / 2.0) * (1.0 - (dx / (w / 2.0)).powi(2)).max(0.0).sqrt();
+    for px in 0..rect.size.w {
+        let dx = px as f32 + 0.5 - cx;
+        let top = cy - half(dx);
+        let bottom = cy + half(dx);
+        for py in 0..rect.size.h {
+            let y = py as f32 + 0.5;
+            // Outline: within ~1.5px of the lens edge (steeper near the
+            // corners, so widen by the slope).
+            let near_edge = (y - top).abs() < 1.5 || (y - bottom).abs() < 1.5;
+            if near_edge && y >= top - 1.5 && y <= bottom + 1.5 {
+                canvas.put_pixel(rect.loc.x + px, rect.loc.y + py, color);
+            }
+        }
+    }
+    canvas.fill_circle(rect.loc.x + rect.size.w / 2 - 4, rect.loc.y + rect.size.h / 2 - 4, 8, color);
+    if struck {
+        for i in 0..rect.size.h + 4 {
+            let (x, y) = (rect.loc.x + 2 + i * (rect.size.w - 4) / (rect.size.h + 4), rect.loc.y + rect.size.h + 1 - i);
+            canvas.fill_rect(x, y, 2, 2, color);
+        }
+    }
+}
+
 fn current_username() -> String {
     let uid = rustix::process::getuid().as_raw();
     // The passwd entry is authoritative; `$USER` can be stale or spoofed.
@@ -424,6 +532,28 @@ mod tests {
 
         lock.unlock();
         assert!(!lock.is_locked());
+    }
+
+    #[test]
+    fn clicking_the_eye_toggles_showing_the_password() {
+        let mut lock = state();
+        let view = Size::from((1920, 1080));
+        let origin = Point::<i32, Logical>::from(((view.w - PANEL_WIDTH) / 2, (view.h - PANEL_HEIGHT) / 2));
+        let eye = origin + LockState::eye_rect().loc + Point::from((EYE_WIDTH / 2, EYE_HEIGHT / 2));
+
+        assert!(!lock.click(view, eye), "ignored while unlocked");
+        lock.lock();
+        assert!(!lock.click(view, origin), "a click elsewhere does nothing");
+        assert!(!lock.reveal);
+        assert!(lock.click(view, eye));
+        assert!(lock.reveal);
+        assert!(lock.click(view, eye));
+        assert!(!lock.reveal);
+        lock.unlock();
+        lock.lock();
+        assert!(lock.click(view, eye));
+        lock.unlock();
+        assert!(!lock.reveal, "unlocking hides the password again");
     }
 
     #[test]
