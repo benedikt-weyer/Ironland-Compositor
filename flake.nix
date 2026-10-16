@@ -120,6 +120,14 @@
             # wayland-utils on its PATH the same way ironland-compositor
             # itself needs Xwayland above.
             wrapProgram $out/bin/ironlandctl --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.wayland-utils ]}
+            # The portal backends are D-Bus-activated by xdg-desktop-portal
+            # and so never see the session's LD_LIBRARY_PATH; wayland-rs
+            # dlopen()s libwayland-client, which no RPATH covers, so without
+            # this they fail with "The wayland library could not be loaded".
+            for portal in global-shortcuts screenshot screencast; do
+              wrapProgram $out/bin/ironland-portal-$portal \
+                --prefix LD_LIBRARY_PATH : ${pkgs.lib.makeLibraryPath [ pkgs.wayland ]}
+            done
 
             install -Dm444 resources/ironland.portal \
               $out/share/xdg-desktop-portal/portals/ironland.portal
