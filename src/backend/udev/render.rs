@@ -343,7 +343,11 @@ impl AnvilState<UdevData> {
         let fps_overlay_cache = self.fps_overlay_cache.entry(output.name()).or_default();
         let border_cache = self.border_cache.entry(output.name()).or_default();
         let drop_indicator_cache = self.drop_indicator_cache.entry(output.name()).or_default();
-        let tint_kelvin = self.display_filter_state.kelvin();
+        let night_kelvin = self.display_filter_state.kelvin();
+        // Prefer the CRTC gamma LUT; the overlay is only the fallback.
+        let gamma_applied =
+            surface.sync_gamma(device.drm_output_manager.device(), crtc, night_kelvin);
+        let tint_kelvin = night_kelvin.filter(|_| !gamma_applied);
         let tint = self.space.output_geometry(&output).and_then(|geometry| {
             self.display_tint.element(
                 &output.name(),

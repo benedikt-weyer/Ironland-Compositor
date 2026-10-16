@@ -33,7 +33,14 @@
     The filter is tied to the lifetime of the object: when a client destroys
     it or disconnects (including by crashing), the filter it requested is
     removed, so a dead shell can never leave the screen tinted. If several
-    live objects have requested a filter, the most recent request wins.
+    live objects have requested a filter, the most recent
+    set_color_temperature request wins. Binding the global or creating an
+    object requests nothing by itself. When the object that made the most
+    recent request goes away, the most recent request of the remaining live
+    objects takes over (or no filter, if there are none).
+
+    The filter always applies to every output; there is no per-output
+    control in this version.
   </description>
 
   <interface name="ironland_display_filter_v1" version="1">
@@ -52,7 +59,9 @@
         is a convenience for "no filter" and is equivalent to 6500.
 
         Takes effect on the next frame. The change applies to every output,
-        including ones connected later.
+        including ones connected later. The compositor may implement it as a
+        true per-channel color scaling (e.g. a display gamma ramp) or as an
+        approximating overlay, so it need not appear in screenshots.
       </description>
       <arg name="kelvin" type="uint" summary="color temperature in kelvin, 6500 = neutral"/>
     </request>

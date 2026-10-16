@@ -4,7 +4,8 @@
 //!
 //! A client (the shell's night mode) asks for a color temperature; the
 //! renderer reads it back through [`DisplayFilterState::kelvin`] each frame
-//! and draws it as a screen-wide tint (see `crate::tint`). The filter lives
+//! and applies it as a CRTC gamma ramp on the udev backend or a screen-wide
+//! tint overlay otherwise (see `crate::tint`). The filter lives
 //! exactly as long as the protocol object that requested it, so a crashed
 //! client can't leave the screen stuck orange.
 
@@ -32,6 +33,13 @@ pub trait DisplayFilterHandler: 'static {
 #[derive(Debug)]
 struct FilterEntry {
     resource: IronlandDisplayFilterV1,
+    /// `None` until the object's first `set_color_temperature`, so merely
+    /// binding the global never overrides another client's filter.
+    request: Option<Request>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Request {
     kelvin: u32,
     /// Request order, so the most recent `set_color_temperature` wins when
     /// several live objects disagree.
@@ -65,11 +73,14 @@ impl DisplayFilterState {
 
     /// The color temperature to render with, or `None` when no live client
     /// wants a filter (nothing requested, or the latest request was neutral).
+    /// Destroying the object that made the latest request falls back to the
+    /// latest request of the remaining live objects.
     pub fn kelvin(&self) -> Option<u32> {
         self.entries
             .iter()
-            .max_by_key(|e| e.serial)
-            .map(|e| e.kelvin)
+            .filter_map(|e| e.request)
+            .max_by_key(|r| r.serial)
+            .map(|r| r.kelvin)
             .filter(|&k| k < NEUTRAL_KELVIN)
     }
 }
@@ -102,13 +113,9 @@ where
         data_init: &mut DataInit<'_, D>,
     ) {
         let resource = data_init.init(resource, GlobalData);
-        let filter = state.display_filter_state();
-        let serial = filter.next_serial;
-        filter.next_serial += 1;
-        filter.entries.push(FilterEntry {
+        state.display_filter_state().entries.push(FilterEntry {
             resource,
-            kelvin: NEUTRAL_KELVIN,
-            serial,
+            request: None,
         });
     }
 }
@@ -130,8 +137,10 @@ impl<D: DisplayFilterHandler> Dispatch2<IronlandDisplayFilterV1, D> for GlobalDa
                 let serial = filter.next_serial;
                 filter.next_serial += 1;
                 if let Some(entry) = filter.entries.iter_mut().find(|e| &e.resource == resource) {
-                    entry.kelvin = clamp_kelvin(kelvin);
-                    entry.serial = serial;
+                    entry.request = Some(Request {
+                        kelvin: clamp_kelvin(kelvin),
+                        serial,
+                    });
                 }
             }
         }

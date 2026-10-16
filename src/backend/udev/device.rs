@@ -366,6 +366,9 @@ impl AnvilState<UdevData> {
                 vblank_throttle_timer: None,
                 pending_vblank_at: None,
                 capture_frame_index: 0,
+                gamma_kelvin: None,
+                gamma_dirty: false,
+                gamma_unsupported: false,
             };
 
             device.surfaces.insert(crtc, surface);

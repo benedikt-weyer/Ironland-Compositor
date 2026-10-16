@@ -496,6 +496,9 @@ pub fn run_udev() {
                         .lock()
                         .activate(false)
                         .expect("failed to activate drm backend");
+                    for surface in backend.surfaces.values_mut() {
+                        surface.gamma_dirty = true;
+                    }
                     if let Some(lease_global) = backend.leasing_global.as_mut() {
                         lease_global.resume::<AnvilState<UdevData>>();
                     }
@@ -833,6 +836,51 @@ struct SurfaceData {
     /// history, which is keyed by output name instead and serves a
     /// different purpose (the FPS overlay's rolling average).
     capture_frame_index: u32,
+    /// Night-mode color temperature currently loaded into this CRTC's gamma
+    /// LUT (`None` = identity ramp).
+    gamma_kelvin: Option<u32>,
+    /// The LUT must be rewritten even if `gamma_kelvin` already matches (set
+    /// when the session is re-activated, which may have lost it).
+    gamma_dirty: bool,
+    /// Setting the LUT failed (no gamma support on this CRTC); night mode
+    /// falls back to the tint overlay for this output.
+    gamma_unsupported: bool,
+}
+
+impl SurfaceData {
+    /// Brings the CRTC's gamma LUT in line with the night-mode `kelvin` and
+    /// returns whether the LUT is applying it (so the overlay isn't needed).
+    fn sync_gamma(&mut self, drm: &DrmDevice, crtc: crtc::Handle, kelvin: Option<u32>) -> bool {
+        if self.gamma_unsupported {
+            return false;
+        }
+        if !self.gamma_dirty && self.gamma_kelvin == kelvin {
+            return kelvin.is_some();
+        }
+        let result = drm.get_crtc(crtc).and_then(|info| {
+            let len = info.gamma_length() as usize;
+            if len < 2 {
+                return Err(std::io::Error::other("CRTC has no gamma LUT"));
+            }
+            let [r, g, b] = crate::tint::gamma_ramp(kelvin, len);
+            drm.set_gamma(crtc, &r, &g, &b)
+        });
+        match result {
+            Ok(()) => {
+                self.gamma_kelvin = kelvin;
+                self.gamma_dirty = false;
+                kelvin.is_some()
+            }
+            Err(err) => {
+                warn!(
+                    "Failed to set gamma LUT on {}, using the tint overlay for night mode: {err}",
+                    self.output.name()
+                );
+                self.gamma_unsupported = true;
+                false
+            }
+        }
+    }
 }
 
 impl Drop for SurfaceData {

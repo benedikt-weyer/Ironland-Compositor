@@ -1,12 +1,16 @@
 //! Screen-wide warm tint for the `ironland-display-filter-v1` protocol
 //! (see `crate::display_filter`).
 //!
-//! Smithay's renderers only alpha-blend, so a true per-channel multiply
-//! (what a gamma-ramp night light does) isn't available; instead a
-//! translucent, warm-colored quad is drawn over the whole output. That
-//! lowers contrast slightly compared to a real color matrix but reads as
-//! the same orange shift, and works identically on the winit and udev
-//! backends.
+//! Two ways to apply it:
+//!
+//! - [`gamma_ramp`]: a per-channel CRTC gamma LUT, used by the udev backend.
+//!   A true multiply (blacks stay black), no render cost and no damage, and
+//!   it doesn't block direct scanout or show up in screenshots.
+//! - [`DisplayTint`]: Smithay's renderers only alpha-blend, so where there's
+//!   no gamma LUT (winit, or a CRTC without one) a translucent, warm-colored
+//!   quad is drawn over the whole output instead. That lifts blacks and
+//!   lowers contrast slightly compared to a real multiply but reads as the
+//!   same orange shift.
 
 use std::collections::HashMap;
 
@@ -23,9 +27,10 @@ use smithay::{
 
 use crate::display_filter::{MIN_KELVIN, NEUTRAL_KELVIN};
 
-/// Opacity of the tint at [`MIN_KELVIN`]; scales down linearly to nothing
-/// at [`NEUTRAL_KELVIN`]. Kept well below 1 so text stays readable.
-const MAX_ALPHA: f32 = 0.45;
+/// Opacity of the tint at [`MIN_KELVIN`]; scales down to nothing at
+/// [`NEUTRAL_KELVIN`] (linearly in mired, see [`warmth`]). Kept well below 1
+/// so text stays readable and blacks don't lift too far.
+const MAX_ALPHA: f32 = 0.35;
 
 /// Per-output solid-color buffers, kept across frames so an unchanged tint
 /// keeps its element id/commit counter and costs no extra damage.
@@ -67,11 +72,47 @@ impl DisplayTint {
 /// Premultiplied overlay color for a color temperature: the blackbody
 /// color at `kelvin`, more opaque the warmer it is.
 fn tint_color(kelvin: u32) -> Color32F {
-    let kelvin = kelvin.clamp(MIN_KELVIN, NEUTRAL_KELVIN);
-    let [r, g, b] = kelvin_to_rgb(kelvin);
-    let warmth = (NEUTRAL_KELVIN - kelvin) as f32 / (NEUTRAL_KELVIN - MIN_KELVIN) as f32;
-    let alpha = MAX_ALPHA * warmth;
+    let [r, g, b] = kelvin_to_rgb(kelvin.clamp(MIN_KELVIN, NEUTRAL_KELVIN));
+    let alpha = MAX_ALPHA * warmth(kelvin);
     Color32F::new(r * alpha, g * alpha, b * alpha, alpha)
+}
+
+/// How warm `kelvin` is, from 0 (neutral) to 1 ([`MIN_KELVIN`]). Linear in
+/// mired (10^6 / K), which tracks perceived warmth far better than linear
+/// kelvin (6500 -> 5000 K is about as noticeable as 2000 -> 1500 K).
+fn warmth(kelvin: u32) -> f32 {
+    let mired = |k: u32| 1.0e6 / k as f32;
+    let kelvin = kelvin.clamp(MIN_KELVIN, NEUTRAL_KELVIN);
+    (mired(kelvin) - mired(NEUTRAL_KELVIN)) / (mired(MIN_KELVIN) - mired(NEUTRAL_KELVIN))
+}
+
+/// Per-channel multiplier (0..=1) for `kelvin`: [`kelvin_to_rgb`] divided by
+/// the white point at [`NEUTRAL_KELVIN`], so neutral is exactly (1, 1, 1)
+/// rather than the curve fit's slightly off-white (255, 254, 250).
+fn channel_scale(kelvin: u32) -> [f32; 3] {
+    let white = kelvin_to_rgb(NEUTRAL_KELVIN);
+    let rgb = kelvin_to_rgb(kelvin.clamp(MIN_KELVIN, NEUTRAL_KELVIN));
+    [0, 1, 2].map(|i| (rgb[i] / white[i]).min(1.0))
+}
+
+/// Gamma ramps (red, green, blue; `len` entries each, as the CRTC reports
+/// via `gamma_length`) that multiply every channel by [`channel_scale`].
+/// `None` gives the identity ramp. Applied to encoded values, like every
+/// other night-light implementation.
+pub fn gamma_ramp(kelvin: Option<u32>, len: usize) -> [Vec<u16>; 3] {
+    let scale = channel_scale(kelvin.unwrap_or(NEUTRAL_KELVIN));
+    scale.map(|scale| {
+        (0..len)
+            .map(|i| {
+                let x = if len > 1 {
+                    i as f32 / (len - 1) as f32
+                } else {
+                    1.0
+                };
+                (x * scale * f32::from(u16::MAX)).round() as u16
+            })
+            .collect()
+    })
 }
 
 /// Approximate sRGB color (0..=1 per channel) of a blackbody at `kelvin`
@@ -106,6 +147,32 @@ mod tests {
     fn warm_is_orange() {
         let [r, g, b] = kelvin_to_rgb(3400);
         assert!(r > g && g > b, "{r} {g} {b}");
+    }
+
+    #[test]
+    fn neutral_ramp_is_identity() {
+        let [r, g, b] = gamma_ramp(None, 256);
+        for ramp in [&r, &g, &b] {
+            assert_eq!(ramp[0], 0);
+            assert_eq!(ramp[255], u16::MAX);
+            assert_eq!(ramp[128], (128.0f32 / 255.0 * 65535.0).round() as u16);
+        }
+        assert_eq!(gamma_ramp(Some(NEUTRAL_KELVIN), 256), [r, g, b]);
+    }
+
+    #[test]
+    fn warm_ramp_cuts_blue_most_and_keeps_black() {
+        let [r, g, b] = gamma_ramp(Some(3400), 256);
+        assert_eq!([r[0], g[0], b[0]], [0, 0, 0]);
+        assert!(r[255] > g[255] && g[255] > b[255]);
+    }
+
+    #[test]
+    fn warmth_is_linear_in_mired() {
+        assert_eq!(warmth(NEUTRAL_KELVIN), 0.0);
+        assert_eq!(warmth(MIN_KELVIN), 1.0);
+        // 2000 -> 1000 K is a much bigger step than 6500 -> 5500 K.
+        assert!(warmth(1000) - warmth(2000) > 5.0 * (warmth(5500) - warmth(6500)).abs());
     }
 
     #[test]
