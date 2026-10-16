@@ -257,9 +257,13 @@ impl<BackendData: Backend> AnvilState<BackendData> {
 
     pub(super) fn on_pointer_axis<B: InputBackend>(&mut self, evt: B::PointerAxisEvent) {
         if self.overview.is_visible() {
-            let amount = evt
-                .amount(input::Axis::Vertical)
-                .unwrap_or_else(|| evt.amount_v120(input::Axis::Vertical).unwrap_or(0.0) * 15.0 / 120.);
+            // The strip scrolls along one axis, so either wheel axis drives it.
+            let amount_on = |axis| {
+                evt.amount(axis)
+                    .unwrap_or_else(|| evt.amount_v120(axis).unwrap_or(0.0) * 15.0 / 120.)
+            };
+            let vertical = amount_on(input::Axis::Vertical);
+            let amount = if vertical != 0.0 { vertical } else { amount_on(input::Axis::Horizontal) };
             if amount != 0.0 {
                 self.overview_scroll(amount * 3.0);
             }

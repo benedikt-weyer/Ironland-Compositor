@@ -32,6 +32,7 @@ use smithay::{
 use smithay::backend::renderer::element::utils::{ConstrainAlign, ConstrainScaleBehavior};
 
 use crate::{
+    config::WorkspaceTransitionAxis,
     font::{Canvas, GLYPH_HEIGHT, GLYPH_WIDTH},
     rounded_corners::GlesCapable,
     render::CustomRenderElements,
@@ -92,7 +93,7 @@ struct Press {
 pub struct OverviewState {
     visible: bool,
     press: Option<Press>,
-    /// Pixels the workspace grid is scrolled down (clamped at layout time).
+    /// Pixels the workspace strip is scrolled along its axis (clamped at layout time).
     scroll: i32,
     /// Per output name: the hash of what the cached buffer shows, and the buffer.
     cache: HashMap<String, (u64, MemoryRenderBuffer)>,
@@ -129,7 +130,7 @@ struct Slot {
 #[derive(Debug, Default)]
 struct Layout {
     slots: Vec<Slot>,
-    /// How far (pixels) the grid is scrolled down, and the most it can be.
+    /// How far (pixels) the strip is scrolled along its axis, and the most it can be.
     scroll: i32,
     max_scroll: i32,
 }
@@ -142,13 +143,19 @@ struct Hit {
     window: Option<(OverviewWindow, Rectangle<i32, Logical>)>,
 }
 
-/// Arranges `outputs[0]`'s workspaces as a grid of thumbnails on a view of
-/// size `view`, as large as fit entirely - or, when even the smallest
-/// comfortable thumbnails don't, in as many columns as that allows, with the
-/// rest reachable by scrolling. `scroll` (pixels down) is clamped to the
+/// Arranges `outputs[0]`'s workspaces as a single strip of thumbnails along
+/// `axis` (the axis workspace switches slide on: a row for horizontal, a
+/// column for vertical), as large as fit entirely - or, when even the
+/// smallest comfortable thumbnails don't, at that size with the rest
+/// reachable by scrolling. `scroll` (pixels along the axis) is clamped to the
 /// content and returned in [`Layout::scroll`]. Thumbnails keep the output's
 /// aspect ratio.
-fn compute_layout(outputs: &[OverviewOutput], view: Size<i32, Logical>, scroll: i32) -> Layout {
+fn compute_layout(
+    outputs: &[OverviewOutput],
+    view: Size<i32, Logical>,
+    scroll: i32,
+    axis: WorkspaceTransitionAxis,
+) -> Layout {
     let mut layout = Layout::default();
     let Some(out) = outputs.first() else {
         return layout;
@@ -157,46 +164,59 @@ fn compute_layout(outputs: &[OverviewOutput], view: Size<i32, Logical>, scroll: 
     let aspect = out.size.w.max(1) as f64 / out.size.h.max(1) as f64;
     let avail_w = (view.w - 2 * MARGIN).max(MIN_SLOT_WIDTH);
     let avail_h = (view.h - TITLE_HEIGHT - MARGIN).max(1);
+    let horizontal = axis == WorkspaceTransitionAxis::Horizontal;
 
-    let size_for = |cols: i32| {
-        let w = ((avail_w - (cols - 1) * SLOT_GAP) / cols).max(MIN_SLOT_WIDTH);
-        (w, (w as f64 / aspect).round() as i32)
+    // Thumbnail width: the largest that fits every slot along the axis and
+    // the whole thumbnail across it, but never below the readable minimum
+    // (the strip scrolls instead).
+    let fit_along = if horizontal {
+        (avail_w - (n - 1) * SLOT_GAP) / n
+    } else {
+        (((avail_h - (n - 1) * SLOT_GAP) / n) as f64 * aspect).round() as i32
     };
-    let content_h = |cols: i32| {
-        let rows = (n + cols - 1) / cols;
-        let (_, h) = size_for(cols);
-        rows * h + (rows - 1) * SLOT_GAP
+    let fit_across = if horizontal {
+        (avail_h as f64 * aspect).round() as i32
+    } else {
+        avail_w
     };
-    // Fewest columns (biggest thumbnails) that show everything at once
-    // without going below the readable width; failing that, the most columns whose thumbnails stay readable.
-    let cols = (1..=n)
-        .find(|&c| content_h(c) <= avail_h && size_for(c).0 >= MIN_SCROLL_SLOT_WIDTH)
-        .unwrap_or_else(|| {
-            (1..=n)
-                .rev()
-                .find(|&c| size_for(c).0 >= MIN_SCROLL_SLOT_WIDTH)
-                .unwrap_or(1)
-        });
-    let (width, height) = size_for(cols);
-    let content = content_h(cols);
-    layout.max_scroll = (content - avail_h).max(0);
+    let width = fit_along
+        .min(fit_across)
+        .max(MIN_SCROLL_SLOT_WIDTH)
+        .min(avail_w)
+        .max(MIN_SLOT_WIDTH);
+    let height = (width as f64 / aspect).round() as i32;
+
+    let (step, avail) = if horizontal {
+        (width + SLOT_GAP, avail_w)
+    } else {
+        (height + SLOT_GAP, avail_h)
+    };
+    let content = n * step - SLOT_GAP;
+    layout.max_scroll = (content - avail).max(0);
     layout.scroll = scroll.clamp(0, layout.max_scroll);
 
-    let rows_cols = |count: i32| count.min(cols);
-    let first_row_w = rows_cols(n) * width + (rows_cols(n) - 1) * SLOT_GAP;
-    let x0 = (view.w - first_row_w) / 2;
+    // Centered along the axis when it all fits, and across it in the view.
+    let along0 = if horizontal {
+        MARGIN + (avail - content).max(0) / 2
+    } else {
+        TITLE_HEIGHT + (avail - content).max(0) / 2
+    } - layout.scroll;
+    let across0 = if horizontal {
+        TITLE_HEIGHT + ((avail_h - height) / 2).max(0)
+    } else {
+        (view.w - width) / 2
+    };
     for ws in 0..out.count as i32 {
-        let (row, col) = (ws / cols, ws % cols);
+        let along = along0 + ws * step;
+        let loc = if horizontal {
+            Point::from((along, across0))
+        } else {
+            Point::from((across0, along))
+        };
         layout.slots.push(Slot {
             output: 0,
             workspace: ws as usize,
-            rect: Rectangle::new(
-                Point::from((
-                    x0 + col * (width + SLOT_GAP),
-                    TITLE_HEIGHT + row * (height + SLOT_GAP) - layout.scroll,
-                )),
-                Size::from((width, height)),
-            ),
+            rect: Rectangle::new(loc, Size::from((width, height))),
         });
     }
     layout
@@ -425,20 +445,21 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         snapshot
     }
 
-    /// Scrolls the workspace grid by `pixels` (positive = down).
+    /// Scrolls the workspace strip by `pixels` (positive = toward later workspaces).
     pub(crate) fn overview_scroll(&mut self, pixels: f64) {
         self.overview.scroll = (self.overview.scroll + pixels.round() as i32).max(0);
         // Out-of-range values are clamped against the real content height the
         // next time the layout is computed; clamp here too so the stored
         // value never drifts past the end.
         let snapshot = workspace::overview_snapshot(self);
+        let axis = self.config.workspaces.transition_axis;
         let max = self
             .space
             .outputs()
             .filter_map(|o| {
                 let geo = self.space.output_geometry(o)?;
                 let snap: Vec<_> = snapshot.iter().filter(|s| &s.output == o).cloned().collect();
-                Some(compute_layout(&snap, geo.size, i32::MAX).scroll)
+                Some(compute_layout(&snap, geo.size, i32::MAX, axis).scroll)
             })
             .max()
             .unwrap_or(0);
@@ -488,7 +509,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         let geo = self.space.output_geometry(output)?;
         let view = geo.size;
         let snapshot = self.overview_snapshot_for(output);
-        let layout = compute_layout(&snapshot, view, self.overview.scroll);
+        let layout = compute_layout(&snapshot, view, self.overview.scroll, self.config.workspaces.transition_axis);
 
         let pointer_global = self.pointer.current_location();
         let local = (pointer_global - geo.loc.to_f64()).to_i32_round();
@@ -563,7 +584,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             return Vec::new();
         };
         let snapshot = self.overview_snapshot_for(output);
-        let layout = compute_layout(&snapshot, geo.size, self.overview.scroll);
+        let layout = compute_layout(&snapshot, geo.size, self.overview.scroll, self.config.workspaces.transition_axis);
 
         let pointer_global = self.pointer.current_location();
         let local = (pointer_global - geo.loc.to_f64()).to_i32_round();
@@ -618,7 +639,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         let geo = self.space.output_geometry(&output).unwrap_or_default();
         let local = (location - geo.loc.to_f64()).to_i32_round();
         let snapshot = self.overview_snapshot_for(&output);
-        let layout = compute_layout(&snapshot, geo.size, self.overview.scroll);
+        let layout = compute_layout(&snapshot, geo.size, self.overview.scroll, self.config.workspaces.transition_axis);
         let hit = layout.hit(&snapshot, local);
         let slot_id = hit
             .slot
@@ -706,14 +727,14 @@ mod tests {
     #[test]
     fn one_slot_per_workspace() {
         let outputs = [out(3, 1920, 1080)];
-        assert_eq!(compute_layout(&outputs, Size::from((1920, 1080)), 0).slots.len(), 3);
+        assert_eq!(compute_layout(&outputs, Size::from((1920, 1080)), 0, WorkspaceTransitionAxis::Horizontal).slots.len(), 3);
     }
 
     #[test]
     fn slots_keep_their_outputs_aspect_ratio_and_fit_the_view() {
-        let outputs = [out(8, 1920, 1080), out(2, 1080, 1920)];
+        let outputs = [out(3, 1920, 1080), out(2, 1080, 1920)];
         let view = Size::from((1280, 720));
-        let layout = compute_layout(&outputs, view, 0);
+        let layout = compute_layout(&outputs, view, 0, WorkspaceTransitionAxis::Horizontal);
         for slot in &layout.slots {
             assert!(slot.rect.loc.x >= 0 && slot.rect.loc.x + slot.rect.size.w <= view.w);
             let o = &outputs[slot.output];
@@ -726,7 +747,7 @@ mod tests {
     #[test]
     fn hit_finds_the_slot_under_a_point() {
         let outputs = [out(2, 1600, 900)];
-        let layout = compute_layout(&outputs, Size::from((1600, 900)), 0);
+        let layout = compute_layout(&outputs, Size::from((1600, 900)), 0, WorkspaceTransitionAxis::Horizontal);
         let second = layout.slots[1].rect;
         let hit = layout.hit(&outputs, second.loc + Point::from((2, 2)));
         assert_eq!(hit.slot, Some((0, 1)));
@@ -750,16 +771,39 @@ mod tests {
     }
 
     #[test]
-    fn many_workspaces_form_a_scrollable_grid() {
+    fn horizontal_axis_lays_workspaces_out_in_one_row() {
+        let outputs = [out(5, 1920, 1080)];
+        let layout = compute_layout(&outputs, Size::from((1920, 1080)), 0, WorkspaceTransitionAxis::Horizontal);
+        let y = layout.slots[0].rect.loc.y;
+        assert!(layout.slots.iter().all(|s| s.rect.loc.y == y));
+        assert!(layout.slots.windows(2).all(|w| w[0].rect.loc.x < w[1].rect.loc.x));
+    }
+
+    #[test]
+    fn vertical_axis_lays_workspaces_out_in_one_column() {
+        let outputs = [out(5, 1920, 1080)];
+        let layout = compute_layout(&outputs, Size::from((1920, 1080)), 0, WorkspaceTransitionAxis::Vertical);
+        let x = layout.slots[0].rect.loc.x;
+        assert!(layout.slots.iter().all(|s| s.rect.loc.x == x));
+        assert!(layout.slots.windows(2).all(|w| w[0].rect.loc.y < w[1].rect.loc.y));
+    }
+
+    #[test]
+    fn many_workspaces_scroll_along_the_axis() {
         let outputs = [out(30, 1920, 1080)];
         let view = Size::from((1280, 720));
-        let top = compute_layout(&outputs, view, 0);
-        assert!(top.max_scroll > 0);
-        assert!(top.slots.iter().all(|s| s.rect.size.w >= MIN_SCROLL_SLOT_WIDTH));
-        assert!(top.slots.iter().filter(|s| s.rect.loc.y == top.slots[0].rect.loc.y).count() > 1);
-        let end = compute_layout(&outputs, view, i32::MAX);
-        assert_eq!(end.scroll, end.max_scroll);
-        assert!(end.slots[0].rect.loc.y < top.slots[0].rect.loc.y);
+        for axis in [WorkspaceTransitionAxis::Horizontal, WorkspaceTransitionAxis::Vertical] {
+            let top = compute_layout(&outputs, view, 0, axis);
+            assert!(top.max_scroll > 0);
+            assert!(top.slots.iter().all(|s| s.rect.size.w >= MIN_SCROLL_SLOT_WIDTH));
+            let end = compute_layout(&outputs, view, i32::MAX, axis);
+            assert_eq!(end.scroll, end.max_scroll);
+            let (a, b) = (top.slots[0].rect.loc, end.slots[0].rect.loc);
+            match axis {
+                WorkspaceTransitionAxis::Horizontal => assert!(b.x < a.x && b.y == a.y),
+                WorkspaceTransitionAxis::Vertical => assert!(b.y < a.y && b.x == a.x),
+            }
+        }
     }
 
     #[test]
