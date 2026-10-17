@@ -735,7 +735,11 @@ impl BuffersKey {
 fn buffers_pod(width: u32, height: u32) -> Vec<u8> {
     let stride = (width * BYTES_PER_PIXEL) as i32;
     let size = stride * height as i32;
-    let data_types = (1i32 << spa::sys::SPA_DATA_MemFd) | (1i32 << spa::sys::SPA_DATA_MemPtr);
+    // A bitmask of `spa_data_type`s, offered as a flags choice with only a
+    // default (what other portal backends send). Offering extra types, or
+    // repeating the mask as a selectable flag, made PipeWire log `invalid
+    // memory type 6` (the mask itself) for every buffer and never stream.
+    let data_types = 1i32 << spa::sys::SPA_DATA_MemFd;
     let obj = spa::pod::object!(
         spa::utils::SpaTypes::ObjectParamBuffers,
         spa::param::ParamType::Buffers,
@@ -761,7 +765,7 @@ fn buffers_pod(width: u32, height: u32) -> Vec<u8> {
                 spa::utils::ChoiceFlags::empty(),
                 spa::utils::ChoiceEnum::Flags {
                     default: data_types,
-                    flags: vec![data_types],
+                    flags: Vec::new(),
                 },
             ))),
         },
