@@ -98,6 +98,10 @@ pub fn write(doc: &mut DocumentMut, full: &FullConfig) {
         WorkspaceTransitionAxis::Vertical => "vertical",
     });
 
+    let session = ensure_table(doc, "session");
+    session["start_shell"] = value(cfg.session.start_shell);
+    session["shell_unit"] = value(cfg.session.shell_unit.as_str());
+
     let window_animations = ensure_table(doc, "window_animations");
     window_animations["enabled"] = value(cfg.window_animations.enabled);
     window_animations["duration_ms"] = value(i64::from(cfg.window_animations.duration_ms));

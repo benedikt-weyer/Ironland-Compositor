@@ -100,6 +100,19 @@ type LockSettings struct {
 	LockOnLidClose bool `json:"lock_on_lid_close"`
 }
 
+// SessionSettings mirrors `ironland_config::SessionSettings`: whether the
+// compositor starts the desktop shell itself, and which systemd --user
+// service that is.
+type SessionSettings struct {
+	// StartShell makes the compositor run `systemctl --user start
+	// <ShellUnit>` once the session is ready (after DISPLAY and
+	// WAYLAND_DISPLAY have been exported).
+	StartShell bool `json:"start_shell"`
+	// ShellUnit is the systemd --user service that is the shell, e.g.
+	// "desktop-shell.service". Only used when StartShell is true.
+	ShellUnit string `json:"shell_unit"`
+}
+
 // FocusSettings mirrors `ironland_config::FocusSettings`: both default off,
 // matching the click-to-focus behavior from before either existed.
 type FocusSettings struct {
@@ -173,6 +186,7 @@ type Config struct {
 	Cursor      CursorSettings            `json:"cursor"`
 	Focus       FocusSettings             `json:"focus"`
 	Lock        LockSettings              `json:"lock"`
+	Session     SessionSettings           `json:"session"`
 	Performance PerformanceSettings       `json:"performance"`
 	KeyTracker  KeyTrackerSettings        `json:"key_tracker"`
 	Appearance  AppearanceSettings        `json:"appearance"`
@@ -356,6 +370,10 @@ func advertisedEventLabel(name string) string {
 // `ironland_config::default_shortcuts`.
 func defaultShortcuts() map[string][]string {
 	return defaultConfig().Shortcuts
+}
+
+func defaultSessionSettings() SessionSettings {
+	return defaultConfig().Session
 }
 
 func defaultWorkspaceSettings() WorkspaceSettings {

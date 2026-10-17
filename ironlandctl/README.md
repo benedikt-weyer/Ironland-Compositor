@@ -32,6 +32,11 @@ ironlandctl outputs set eDP-1 --primary
 ironlandctl outputs set HDMI-A-1 --right-of eDP-1 --refresh-hz 144
 ironlandctl outputs detect   # via wayland-info
 
+# Let the compositor start the shell once the session is ready.
+ironlandctl session units    # systemd --user services to pick from
+ironlandctl set session.shell_unit desktop-shell.service
+ironlandctl set session.start_shell true
+
 # Start over.
 ironlandctl reset
 ```

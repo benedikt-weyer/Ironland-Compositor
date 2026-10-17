@@ -63,7 +63,13 @@ in
       `mouse_follows_focus`, if true, warps the pointer to the center of a
       window whenever it's focused by something other than the pointer
       itself (switching workspaces, cycling windows, a newly opened window,
-      activating a window from the dock).
+      activating a window from the dock). Under `session`, `start_shell`
+      (default false), if true, makes the compositor run `systemctl --user
+      start <shell_unit>` (default `"desktop-shell.service"`) as the last step
+      of bringing up the session, after XWayland is ready and `DISPLAY`/
+      `WAYLAND_DISPLAY` are exported, so the shell and everything it launches
+      inherit a complete environment; the unit must exist but must not be
+      started by anything else.
     '';
     example = lib.literalExpression ''
       {

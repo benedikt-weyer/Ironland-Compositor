@@ -5,6 +5,7 @@
 mod full;
 mod outputs;
 mod paths;
+mod session;
 mod settings;
 mod shortcuts;
 
@@ -18,6 +19,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 use ironland_config::{Config, FullConfig};
 use outputs::OutputsCommand;
+use session::SessionCommand;
 use settings::SettingKey;
 use shortcuts::ShortcutsCommand;
 
@@ -84,6 +86,11 @@ enum Command {
         #[command(subcommand)]
         command: OutputsCommand,
     },
+    /// Session bring-up (the `[session]` table): which unit is the shell.
+    Session {
+        #[command(subcommand)]
+        command: SessionCommand,
+    },
     /// Read a full config as JSON from stdin and write it out, replacing
     /// the current file. Intended for the settings GUI's Save button, and
     /// for scripted bulk imports.
@@ -121,6 +128,7 @@ fn main() -> Result<()> {
         Command::Reset { yes } => reset(&cli.config, *yes),
         Command::Shortcuts { command } => shortcuts_command(&cli.config, command),
         Command::Outputs { command } => outputs_command(&cli.config, command),
+        Command::Session { command } => session::run(command),
         Command::Apply { no_apply_live } => apply(&cli.config, *no_apply_live),
         Command::Completions { shell } => {
             clap_complete::generate(

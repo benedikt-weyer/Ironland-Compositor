@@ -320,6 +320,31 @@ impl Default for LockSettings {
     }
 }
 
+/// Session bring-up: whether the compositor itself starts the desktop shell
+/// once the session is ready (see `src/backend/session.rs`).
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct SessionSettings {
+    /// If true, the compositor runs `systemctl --user start <shell_unit>` as
+    /// the last step of announcing the session - i.e. after `DISPLAY` and
+    /// `WAYLAND_DISPLAY` have been exported, so the shell (and everything it
+    /// launches) inherits a complete environment. Off by default: the shell
+    /// is then expected to be started by whatever launched the compositor.
+    pub start_shell: bool,
+    /// The `systemd --user` service that is the desktop shell, e.g.
+    /// `desktop-shell.service`. Only used when `start_shell` is true.
+    pub shell_unit: String,
+}
+
+impl Default for SessionSettings {
+    fn default() -> Self {
+        Self {
+            start_shell: false,
+            shell_unit: "desktop-shell.service".to_string(),
+        }
+    }
+}
+
 /// Where the FPS/frame-time overlay is anchored on screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -430,6 +455,7 @@ struct RawConfig {
     cursor: CursorSettings,
     focus: FocusSettings,
     lock: LockSettings,
+    session: SessionSettings,
     performance: PerformanceSettings,
     key_tracker: KeyTrackerSettings,
     shortcuts: HashMap<String, Vec<String>>,
@@ -472,6 +498,8 @@ pub struct Config {
     pub focus: FocusSettings,
     /// Screen lock behaviour (see [`LockSettings`]).
     pub lock: LockSettings,
+    /// Session bring-up, e.g. starting the shell (see [`SessionSettings`]).
+    pub session: SessionSettings,
     /// FPS overlay and frame stutter analytics (see [`PerformanceSettings`]).
     pub performance: PerformanceSettings,
     /// Key-state overlay for finding stuck keys (see [`KeyTrackerSettings`]).
@@ -514,6 +542,7 @@ impl Default for Config {
             cursor: CursorSettings::default(),
             focus: FocusSettings::default(),
             lock: LockSettings::default(),
+            session: SessionSettings::default(),
             performance: PerformanceSettings::default(),
             key_tracker: KeyTrackerSettings::default(),
             shortcuts: default_shortcuts(),
@@ -881,6 +910,7 @@ impl Config {
                     cursor: raw.cursor,
                     focus: raw.focus,
                     lock: raw.lock,
+                    session: raw.session,
                     performance: raw.performance,
                     key_tracker: raw.key_tracker,
                     shortcuts,
@@ -967,6 +997,7 @@ mod tests {
             cursor: CursorSettings::default(),
             focus: FocusSettings::default(),
             lock: LockSettings::default(),
+            session: SessionSettings::default(),
             performance: PerformanceSettings::default(),
             key_tracker: KeyTrackerSettings::default(),
             shortcuts,
@@ -1160,6 +1191,26 @@ mod tests {
         assert_eq!(raw.workspaces.count, 6);
         assert!(raw.workspaces.dynamic);
         assert!(!raw.workspaces.overlay);
+    }
+
+    #[test]
+    fn session_defaults_leave_the_shell_to_the_launcher() {
+        let raw: RawConfig = toml::from_str("").unwrap();
+        assert_eq!(raw.session, SessionSettings::default());
+        assert!(!raw.session.start_shell);
+        assert_eq!(raw.session.shell_unit, "desktop-shell.service");
+    }
+
+    #[test]
+    fn session_shell_can_be_enabled_with_a_custom_unit() {
+        let raw: RawConfig =
+            toml::from_str("[session]\nstart_shell = true\nshell_unit = \"my-shell.service\"\n")
+                .unwrap();
+        assert!(raw.session.start_shell);
+        assert_eq!(raw.session.shell_unit, "my-shell.service");
+
+        let raw: RawConfig = toml::from_str("[session]\nstart_shell = true\n").unwrap();
+        assert_eq!(raw.session.shell_unit, "desktop-shell.service");
     }
 
     #[test]

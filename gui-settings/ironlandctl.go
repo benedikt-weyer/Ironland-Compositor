@@ -98,3 +98,17 @@ func ironlandctlActivePath() (string, error) {
 	}
 	return *result.Active, nil
 }
+
+// ironlandctlSessionUnits lists the systemd --user services a shell could be
+// started from (`ironlandctl session units --json`), sorted.
+func ironlandctlSessionUnits() ([]string, error) {
+	out, err := runIronlandctl(nil, "session", "units", "--json")
+	if err != nil {
+		return nil, err
+	}
+	var units []string
+	if err := json.Unmarshal(out, &units); err != nil {
+		return nil, fmt.Errorf("parsing ironlandctl's unit list: %w", err)
+	}
+	return units, nil
+}

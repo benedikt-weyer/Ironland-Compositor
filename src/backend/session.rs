@@ -15,7 +15,14 @@ const DESKTOP_NAME: &str = "ironland-compositor";
 /// Exports the session environment to `systemd --user` and D-Bus, then
 /// starts `graphical-session.target`. Call this once the Wayland socket
 /// is up and ready to accept clients.
-pub fn announce_session_start(socket_name: Option<&str>) {
+///
+/// `shell_unit`, if set (`session.start_shell` in the config), is started as
+/// the very last step, once everything above - including `DISPLAY`, when
+/// XWayland is in use - is already in `systemd --user`'s environment. That
+/// ordering is the point: a shell unit started any earlier is forked without
+/// `DISPLAY` and never sees the later update, so everything it launches
+/// (e.g. Steam) can't reach XWayland.
+pub fn announce_session_start(socket_name: Option<&str>, shell_unit: Option<&str>) {
     if let Some(socket_name) = socket_name {
         // Safety: single-threaded at this point in startup, before any
         // other thread could be reading the environment.
@@ -57,6 +64,17 @@ pub fn announce_session_start(socket_name: Option<&str>) {
             .arg("start")
             .arg("nixos-fake-graphical-session.target");
     });
+
+    if let Some(unit) = shell_unit {
+        // `--no-block`: the shell is itself a client of this compositor, so
+        // waiting for a `Type=notify` shell to report ready would deadlock
+        // against this (single-threaded) event loop, which can't serve its
+        // Wayland connection until this call returns.
+        tracing::info!(unit, "starting desktop shell");
+        run("systemctl", |cmd| {
+            cmd.arg("--user").arg("--no-block").arg("start").arg(unit);
+        });
+    }
 }
 
 /// Exports `DISPLAY` to `systemd --user` and D-Bus once XWayland is up.

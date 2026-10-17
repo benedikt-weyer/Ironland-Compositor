@@ -34,6 +34,7 @@ func main() {
 	outputsTab := buildOutputsTab(&cfg, w)
 	workspacesTab := buildWorkspacesTab(&cfg)
 	focusTab := buildFocusTab(&cfg)
+	sessionTab := buildSessionTab(&cfg)
 	appearanceTab := buildAppearanceTab(&cfg, w)
 
 	status := widget.NewLabel(statusText(loadedFrom))
@@ -55,6 +56,7 @@ func main() {
 		container.NewTabItem("Monitors", outputsTab),
 		container.NewTabItem("Workspaces", workspacesTab),
 		container.NewTabItem("Focus", focusTab),
+		container.NewTabItem("Session", sessionTab),
 		container.NewTabItem("Appearance", appearanceTab),
 	)
 

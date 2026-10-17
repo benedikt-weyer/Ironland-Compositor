@@ -91,6 +91,10 @@ pub enum SettingKey {
     WorkspacesOverlay,
     #[value(name = "workspaces.keep_disconnected")]
     WorkspacesKeepDisconnected,
+    #[value(name = "session.start_shell")]
+    SessionStartShell,
+    #[value(name = "session.shell_unit")]
+    SessionShellUnit,
     #[value(name = "window_animations.enabled")]
     WindowAnimationsEnabled,
     #[value(name = "window_animations.duration_ms")]
@@ -143,6 +147,8 @@ impl SettingKey {
             WorkspacesDynamic,
             WorkspacesOverlay,
             WorkspacesKeepDisconnected,
+            SessionStartShell,
+            SessionShellUnit,
             WindowAnimationsEnabled,
             WindowAnimationsDurationMs,
         ]
@@ -191,6 +197,8 @@ impl SettingKey {
             WorkspacesDynamic => "workspaces.dynamic",
             WorkspacesOverlay => "workspaces.overlay",
             WorkspacesKeepDisconnected => "workspaces.keep_disconnected",
+            SessionStartShell => "session.start_shell",
+            SessionShellUnit => "session.shell_unit",
             WindowAnimationsEnabled => "window_animations.enabled",
             WindowAnimationsDurationMs => "window_animations.duration_ms",
         }
@@ -246,6 +254,8 @@ pub fn get(full: &FullConfig, key: SettingKey) -> String {
         WorkspacesDynamic => cfg.workspaces.dynamic.to_string(),
         WorkspacesOverlay => cfg.workspaces.overlay.to_string(),
         WorkspacesKeepDisconnected => cfg.workspaces.keep_disconnected.to_string(),
+        SessionStartShell => cfg.session.start_shell.to_string(),
+        SessionShellUnit => cfg.session.shell_unit.clone(),
         WindowAnimationsEnabled => cfg.window_animations.enabled.to_string(),
         WindowAnimationsDurationMs => cfg.window_animations.duration_ms.to_string(),
     }
@@ -345,6 +355,8 @@ fn table_and_leaf(key: SettingKey) -> (&'static [&'static str], &'static str) {
         WorkspacesDynamic => (&["workspaces"], "dynamic"),
         WorkspacesOverlay => (&["workspaces"], "overlay"),
         WorkspacesKeepDisconnected => (&["workspaces"], "keep_disconnected"),
+        SessionStartShell => (&["session"], "start_shell"),
+        SessionShellUnit => (&["session"], "shell_unit"),
         WindowAnimationsEnabled => (&["window_animations"], "enabled"),
         WindowAnimationsDurationMs => (&["window_animations"], "duration_ms"),
     }
@@ -374,6 +386,13 @@ pub fn set(doc: &mut DocumentMut, key: SettingKey, raw: &str) -> Result<()> {
         | KeyboardLayout | KeyboardVariant | KeyboardOptions | CursorTheme => {
             table[leaf] = value(raw);
         }
+        SessionShellUnit => {
+            let unit = raw.trim();
+            if unit.is_empty() || unit.chars().any(char::is_whitespace) {
+                bail!("expected a systemd unit name such as desktop-shell.service, got {raw:?}");
+            }
+            table[leaf] = value(unit);
+        }
         BorderColor | BorderGradientColor => {
             table[leaf] = value(parse_hex_color(raw)?);
         }
@@ -389,6 +408,7 @@ pub fn set(doc: &mut DocumentMut, key: SettingKey, raw: &str) -> Result<()> {
         | WorkspacesDynamic
         | WorkspacesOverlay
         | WorkspacesKeepDisconnected
+        | SessionStartShell
         | WindowAnimationsEnabled
         | AppearanceDarkMode => {
             table[leaf] = value(parse_bool(raw)?);

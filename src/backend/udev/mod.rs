@@ -695,16 +695,23 @@ pub fn run_udev() {
      * launch any XWayland-dependent app (e.g. Steam) for the rest of that
      * session.
      */
+    let shell_unit = state
+        .config
+        .session
+        .start_shell
+        .then(|| state.config.session.shell_unit.clone());
     #[cfg(feature = "xwayland")]
     let socket_name = state.socket_name.clone();
     #[cfg(feature = "xwayland")]
-    state.start_xwayland(move |_| crate::session::announce_session_start(socket_name.as_deref()));
+    state.start_xwayland(move |_| {
+        crate::session::announce_session_start(socket_name.as_deref(), shell_unit.as_deref())
+    });
 
     #[cfg(feature = "libei")]
     crate::libei::listen_eis(&event_loop.handle());
 
     #[cfg(not(feature = "xwayland"))]
-    crate::session::announce_session_start(state.socket_name.as_deref());
+    crate::session::announce_session_start(state.socket_name.as_deref(), shell_unit.as_deref());
 
     /*
      * And run our loop
