@@ -165,6 +165,15 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                 .element_under(location)
                 .map(|(w, p)| (w.clone(), p))
             {
+                // Override-redirect X11 windows (menus, tooltips, combo
+                // popups) never take focus. Moving it to them makes the
+                // parent lose focus, which toolkits like Java/Swing/JavaFX
+                // treat as "dismiss the menu" - so it would close as soon as
+                // the pointer entered it.
+                #[cfg(feature = "xwayland")]
+                if window.0.x11_surface().is_some_and(|s| s.is_override_redirect()) {
+                    return;
+                }
                 self.space.raise_element(&window, true);
                 #[cfg(feature = "xwayland")]
                 if let Some(surface) = window.0.x11_surface() {
