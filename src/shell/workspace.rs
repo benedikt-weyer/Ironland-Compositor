@@ -1302,6 +1302,23 @@ pub(crate) fn is_floating(window: &WindowElement) -> bool {
     WorkspaceState::get(&output).floating_at(idx).contains(window)
 }
 
+/// Raises `window` to the top of the stack, then keeps every floating window
+/// of the same workspace above it when `window` is tiled - floating windows
+/// stay on top of tiled ones even when unfocused.
+pub(crate) fn raise_window(space: &mut Space<WindowElement>, window: &WindowElement) {
+    space.raise_element(window, true);
+    let Some((output, idx)) = window_home(window) else {
+        return;
+    };
+    let floating = WorkspaceState::get(&output).floating_at(idx);
+    if floating.contains(window) {
+        return;
+    }
+    for float in floating {
+        space.raise_element(&float, false);
+    }
+}
+
 /// Switches to whichever workspace `window` is homed to (if it isn't
 /// already the active one on its output) and focuses it. Backs the
 /// `zwlr_foreign_toplevel_handle_v1.activate` request - see

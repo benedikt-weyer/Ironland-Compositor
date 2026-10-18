@@ -692,7 +692,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             }
         }
 
-        self.space.raise_element(&window, true);
+        crate::shell::workspace::raise_window(&mut self.space, &window);
         #[cfg(feature = "xwayland")]
         if let Some(surface) = window.0.x11_surface() {
             self.xwm.as_mut().unwrap().raise_window(surface).unwrap();

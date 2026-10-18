@@ -346,7 +346,7 @@ impl<BackendData: Backend> XdgActivationHandler for AnvilState<BackendData> {
                 .find(|window| window.wl_surface().map(|s| *s == surface).unwrap_or(false))
                 .cloned();
             if let Some(window) = w {
-                self.space.raise_element(&window, true);
+                crate::shell::workspace::raise_window(&mut self.space, &window);
             }
         }
     }

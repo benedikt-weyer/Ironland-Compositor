@@ -800,7 +800,7 @@ pub(crate) fn raise_and_focus_no_warp<BackendData: Backend>(state: &mut AnvilSta
 }
 
 fn raise_and_focus_impl<BackendData: Backend>(state: &mut AnvilState<BackendData>, window: &WindowElement) {
-    state.space.raise_element(window, true);
+    crate::shell::workspace::raise_window(&mut state.space, window);
     if let Some(keyboard) = state.seat.get_keyboard() {
         let serial = SERIAL_COUNTER.next_serial();
         keyboard.set_focus(state, Some(window.clone().into()), serial);
