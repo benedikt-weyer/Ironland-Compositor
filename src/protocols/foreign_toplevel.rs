@@ -161,7 +161,14 @@ pub(crate) fn title_and_app_id(window: &Window) -> (String, String) {
             (attrs.title.clone().unwrap_or_default(), attrs.app_id.clone().unwrap_or_default())
         }),
         #[cfg(feature = "xwayland")]
-        WindowSurface::X11(surface) => (surface.title(), surface.class()),
+        // Some clients (e.g. Bitwig) set WM_CLASS to a single string, which
+        // leaves the class half empty; fall back to the instance name so the
+        // window still gets an app id.
+        WindowSurface::X11(surface) => {
+            let class = surface.class();
+            let app_id = if class.is_empty() { surface.instance() } else { class };
+            (surface.title(), app_id)
+        }
     }
 }
 
