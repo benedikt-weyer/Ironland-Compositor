@@ -546,25 +546,23 @@ impl AnvilState<UdevData> {
         // off by a tiny epsilon so the pointer stays inside the last output.
         const EDGE_EPSILON: f64 = 0.01;
 
-        let (pos_x, pos_y) = pos.into();
-        let max_x = self.space.outputs().fold(0, |acc, o| {
-            acc + self.space.output_geometry(o).unwrap().size.w
-        });
-        let clamped_x = pos_x.clamp(0.0, max_x as f64 - EDGE_EPSILON);
-        let max_y = self
-            .space
-            .outputs()
-            .find(|o| {
-                let geo = self.space.output_geometry(o).unwrap();
-                geo.contains((clamped_x as i32, 0))
-            })
-            .map(|o| self.space.output_geometry(o).unwrap().size.h);
-
-        if let Some(max_y) = max_y {
-            let clamped_y = pos_y.clamp(0.0, max_y as f64 - EDGE_EPSILON);
-            (clamped_x, clamped_y).into()
-        } else {
-            (clamped_x, pos_y).into()
+        // Clamp to the nearest point inside any output's real geometry rather
+        // than assuming outputs are tiled left-to-right from x = 0: outputs
+        // can be positioned freely (relative placement, offsets, stacking),
+        // and a width-sum bound then stops the pointer short of the actual
+        // rightmost edge.
+        let mut best: Option<(f64, Point<f64, Logical>)> = None;
+        for output in self.space.outputs() {
+            let Some(geo) = self.space.output_geometry(output) else {
+                continue;
+            };
+            let x = pos.x.clamp(geo.loc.x as f64, (geo.loc.x + geo.size.w) as f64 - EDGE_EPSILON);
+            let y = pos.y.clamp(geo.loc.y as f64, (geo.loc.y + geo.size.h) as f64 - EDGE_EPSILON);
+            let dist = (pos.x - x).powi(2) + (pos.y - y).powi(2);
+            if best.is_none_or(|(d, _)| dist < d) {
+                best = Some((dist, (x, y).into()));
+            }
         }
+        best.map_or(pos, |(_, p)| p)
     }
 }
