@@ -29,6 +29,17 @@
 //!    no window shows up within `startup_timeout_secs`, the whole VM is torn
 //!    down: both processes killed, the socket removed.
 //!
+//! Two flavours, chosen per launch:
+//!
+//! * **throw-away** (launcher Left key): as above, nothing survives the VM;
+//! * **persistent** (launcher Right key): the VM runs on a per-application
+//!   disk overlay and, when its program exits cleanly, its disk *and memory*
+//!   are saved (QMP `savevm`, see [`super::vm_state`]). The next persistent
+//!   launch of that application restores them with `-loadvm`: no boot, and
+//!   everything the last session wrote is still there. If the saved state
+//!   can't be loaded (different machine settings, QEMU upgrade) the guest
+//!   cold-boots from the overlay's disk instead.
+//!
 //! Processes are spawned from the main thread only (and with a parent-death
 //! signal) so they can't outlive the compositor: `PR_SET_PDEATHSIG` fires
 //! when the *thread* that spawned the child exits, not the process.
@@ -58,6 +69,7 @@ use smithay::{
 };
 use tracing::{debug, error, info, warn};
 
+use super::vm_state::{self, PersistMeta};
 use crate::{
     ClientState,
     config::VmSettings,
@@ -81,6 +93,8 @@ const LOG_TAIL_LINES: usize = 12;
 pub enum VmEvent {
     /// The guest's SSH server answered; time to start `waypipe`.
     GuestReady(VmId),
+    /// Saving a persistent VM's state failed; the VM should be dropped.
+    SaveFailed(VmId, String),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -93,6 +107,10 @@ pub enum VmError {
     TooManyInstances(u32),
     #[error("this entry has no command to run")]
     NoCommand,
+    #[error("a persistent VM for {0} is already running")]
+    AlreadyRunning(String),
+    #[error("preparing the persistent VM state: {0}")]
+    State(String),
     #[error("{context}: {source}")]
     Io {
         context: &'static str,
@@ -110,6 +128,8 @@ impl VmError {
             VmError::ImageMissing(_) => "VM image file not found".into(),
             VmError::TooManyInstances(max) => format!("Too many VMs running (max {max})"),
             VmError::NoCommand => "Nothing to run for this entry".into(),
+            VmError::AlreadyRunning(_) => "Persistent VM already running".into(),
+            VmError::State(_) => "Could not prepare VM state (see log)".into(),
             VmError::Io { .. } => "Could not start the VM (see log)".into(),
         }
     }
@@ -129,6 +149,14 @@ enum EndReason {
     /// No window appeared in time (guest never booted, ssh refused us, or
     /// the program never opened a window).
     TimedOut,
+    /// A persistent VM's state was saved and QEMU quit.
+    Saved,
+    SaveFailed(String),
+    /// Saving took longer than [`vm_state::SAVE_TIMEOUT`].
+    SaveTimedOut,
+    /// QEMU exited right after starting from a saved state: the state could
+    /// not be loaded. Not an end: the guest is cold-booted instead.
+    RestoreFailed(ExitStatus),
 }
 
 impl std::fmt::Display for EndReason {
@@ -138,14 +166,38 @@ impl std::fmt::Display for EndReason {
             EndReason::QemuExited(status) => write!(f, "qemu exited ({status})"),
             EndReason::WaypipeFailed(status) => write!(f, "waypipe failed ({status})"),
             EndReason::TimedOut => write!(f, "no window appeared in time"),
+            EndReason::Saved => write!(f, "state saved"),
+            EndReason::SaveFailed(why) => write!(f, "saving the state failed: {why}"),
+            EndReason::SaveTimedOut => write!(f, "saving the state took too long"),
+            EndReason::RestoreFailed(status) => write!(f, "restoring the state failed ({status})"),
         }
     }
 }
 
 impl EndReason {
     fn is_failure(&self) -> bool {
-        !matches!(self, EndReason::Closed)
+        !matches!(self, EndReason::Closed | EndReason::Saved)
     }
+}
+
+/// What a persistent VM needs beyond a throw-away one.
+#[derive(Debug)]
+struct PersistState {
+    /// [`vm_state::persist_key`] of the application; at most one running VM
+    /// per key (two QEMUs can't share one overlay).
+    key: String,
+    meta_path: PathBuf,
+    meta: PersistMeta,
+    /// Monitor socket, for saving the state.
+    qmp: PathBuf,
+    /// Set once the program exited and the state is being saved: the deadline
+    /// for that to finish.
+    saving_until: Option<Instant>,
+    /// QEMU arguments for a cold boot, for falling back when the saved state
+    /// can't be loaded.
+    cold_args: Vec<String>,
+    /// Whether the running QEMU was started with `-loadvm`.
+    loaded_state: bool,
 }
 
 #[derive(Debug)]
@@ -170,6 +222,10 @@ struct VmInstance {
     client_connected: bool,
     /// Past this, a VM with no connected client is considered stuck.
     deadline: Instant,
+    /// Whether the guest has answered on SSH yet.
+    ready_seen: bool,
+    /// `Some` for persistent VMs.
+    persist: Option<PersistState>,
 }
 
 /// All running VMs, plus the plumbing they share.
@@ -210,6 +266,13 @@ impl VmManager {
         self.instances.contains_key(&id)
     }
 
+    /// Whether `id` is a persistent VM.
+    fn is_persistent(&self, id: VmId) -> bool {
+        self.instances
+            .get(&id)
+            .is_some_and(|vm| vm.persist.is_some())
+    }
+
     /// Records that a Wayland client connected through `id`'s socket.
     fn mark_client_connected(&mut self, id: VmId) {
         if let Some(vm) = self.instances.get_mut(&id) {
@@ -222,8 +285,29 @@ impl VmManager {
     fn find_finished(&mut self, now: Instant) -> Vec<(VmId, EndReason)> {
         let mut finished = Vec::new();
         for (&id, vm) in &mut self.instances {
+            // Saving state: the only thing to wait for is QEMU quitting, which
+            // it does by itself right after a successful save (so exiting
+            // cleanly *is* the success signal).
+            if let Some(until) = vm.persist.as_ref().and_then(|p| p.saving_until) {
+                match vm.qemu.try_wait() {
+                    Ok(Some(status)) if status.success() => finished.push((id, EndReason::Saved)),
+                    Ok(Some(status)) => finished.push((id, EndReason::QemuExited(status))),
+                    _ if now >= until => finished.push((id, EndReason::SaveTimedOut)),
+                    _ => {}
+                }
+                continue;
+            }
             if let Ok(Some(status)) = vm.qemu.try_wait() {
-                finished.push((id, EndReason::QemuExited(status)));
+                let restore_failed =
+                    !vm.ready_seen && vm.persist.as_ref().is_some_and(|p| p.loaded_state);
+                finished.push((
+                    id,
+                    if restore_failed {
+                        EndReason::RestoreFailed(status)
+                    } else {
+                        EndReason::QemuExited(status)
+                    },
+                ));
                 continue;
             }
             if let Some(waypipe) = vm.waypipe.as_mut()
@@ -293,13 +377,34 @@ pub fn expand_tilde(path: &str) -> PathBuf {
     }
 }
 
-/// Arguments for `qemu-system-x86_64`: a headless guest booted from a
-/// throw-away snapshot of `image`, with guest port 22 reachable on
-/// `127.0.0.1:ssh_port` and its serial console written to `serial_log`.
+/// What a VM boots from.
+pub enum DiskMode<'a> {
+    /// A throw-away snapshot of the base image.
+    Snapshot { image: &'a Path },
+    /// A persistent per-application overlay (see [`vm_state`]).
+    Persistent {
+        overlay: &'a Path,
+        /// Monitor socket QEMU listens on, for saving the state.
+        qmp: &'a Path,
+        /// Guest-agent socket QEMU listens on, for setting the clock.
+        qga: &'a Path,
+        /// Restore the saved state instead of booting.
+        load_state: bool,
+    },
+}
+
+/// Arguments for `qemu-system-x86_64`: a headless guest with guest port 22
+/// reachable on `127.0.0.1:ssh_port` and its serial console written to
+/// `serial_log`.
+///
+/// The machine definition is the same for both [`DiskMode`]s apart from the
+/// extra devices persistent VMs carry; and for one application it must stay the
+/// same from save to restore (a saved state can only be loaded into an
+/// identical machine - see [`vm_state::machine_fingerprint`]).
 pub fn qemu_args(
     settings: &VmSettings,
     id: VmId,
-    image: &Path,
+    disk: DiskMode<'_>,
     ssh_port: u16,
     serial_log: &Path,
 ) -> Vec<String> {
@@ -314,13 +419,41 @@ pub fn qemu_args(
     }
     push(&["-m", &settings.memory_mb.to_string()]);
     push(&["-smp", &settings.cpus.max(1).to_string()]);
-    // `snapshot=on` keeps every guest write in a temporary overlay that is
-    // thrown away on exit: the image stays pristine and any number of VMs
-    // can boot from it at once.
-    push(&[
-        "-drive",
-        &format!("file={},if=virtio,snapshot=on", image.display()),
-    ]);
+    match &disk {
+        // `snapshot=on` keeps every guest write in a temporary overlay that
+        // is thrown away on exit: the image stays pristine and any number of
+        // VMs can boot from it at once.
+        DiskMode::Snapshot { image } => push(&[
+            "-drive",
+            &format!("file={},if=virtio,snapshot=on", image.display()),
+        ]),
+        DiskMode::Persistent {
+            overlay,
+            qmp,
+            qga,
+            load_state,
+        } => {
+            push(&[
+                "-drive",
+                &format!("file={},if=virtio,format=qcow2", overlay.display()),
+            ]);
+            push(&[
+                "-qmp",
+                &format!("unix:{},server=on,wait=off", qmp.display()),
+            ]);
+            push(&[
+                "-chardev",
+                &format!("socket,id=qga,path={},server=on,wait=off", qga.display()),
+                "-device",
+                "virtio-serial-pci",
+                "-device",
+                "virtserialport,chardev=qga,name=org.qemu.guest_agent.0",
+            ]);
+            if *load_state {
+                push(&["-loadvm", vm_state::STATE_TAG]);
+            }
+        }
+    }
     push(&[
         "-nic",
         &format!("user,model=virtio-net-pci,hostfwd=tcp:127.0.0.1:{ssh_port}-:22"),
@@ -467,18 +600,28 @@ fn ssh_ready(port: u16) -> bool {
 
 /// Polls for the guest's SSH server until it answers, `cancel` is set, or
 /// `deadline` passes.
+///
+/// `sync_clock` is the guest-agent socket to set the guest's clock through
+/// once it answers (for a VM restored from saved state, whose clock is stale);
+/// failing to is only logged, since an image without the agent still works.
 fn spawn_probe(
     id: VmId,
     port: u16,
     cancel: Arc<AtomicBool>,
     deadline: Instant,
     events: Sender<VmEvent>,
+    sync_clock: Option<PathBuf>,
 ) {
     let spawned = std::thread::Builder::new()
         .name(format!("vm-probe-{id}"))
         .spawn(move || {
             while !cancel.load(Ordering::SeqCst) && Instant::now() < deadline {
                 if ssh_ready(port) {
+                    if let Some(qga) = sync_clock
+                        && let Err(err) = vm_state::guest_set_time(&qga)
+                    {
+                        warn!(id, %err, "Could not set the restored guest's clock (is qemu-guest-agent running in it?)");
+                    }
                     let _ = events.send(VmEvent::GuestReady(id));
                     return;
                 }
@@ -500,6 +643,19 @@ fn log_tail(path: &Path) -> String {
     lines[lines.len().saturating_sub(LOG_TAIL_LINES)..].join("\n")
 }
 
+/// Starts QEMU with `args`, logging its output to `qemu.log` in `dir`.
+fn spawn_qemu(args: &[String], dir: &Path) -> Result<Child, VmError> {
+    let (stdout, stderr) = log_stdio(&dir.join("qemu.log"))?;
+    let mut cmd = Command::new(QEMU_BINARY);
+    cmd.args(args)
+        .stdin(Stdio::null())
+        .stdout(stdout)
+        .stderr(stderr);
+    die_with_parent(&mut cmd);
+    cmd.spawn()
+        .map_err(VmError::io("starting qemu-system-x86_64"))
+}
+
 // ---------------------------------------------------------------------------
 // Compositor glue.
 // ---------------------------------------------------------------------------
@@ -508,7 +664,15 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
     /// Boots a new VM and runs `entry` inside it, returning once QEMU has been
     /// *started* - the window appears later, when the guest is up and the
     /// program has opened it.
-    pub fn launch_in_vm(&mut self, entry: &DesktopEntry) -> Result<VmId, VmError> {
+    ///
+    /// With `persistent`, the VM runs on the application's own overlay and
+    /// restores the state saved when it last exited cleanly (if any); see the
+    /// module doc.
+    pub fn launch_in_vm(
+        &mut self,
+        entry: &DesktopEntry,
+        persistent: bool,
+    ) -> Result<VmId, VmError> {
         let settings = self.config.vm.clone();
         let image = match settings.image.as_deref().filter(|i| !i.trim().is_empty()) {
             Some(image) => expand_tilde(image),
@@ -525,6 +689,24 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             .as_deref()
             .unwrap_or(&self.config.terminal);
         let command = launcher::guest_command(entry, terminal).ok_or(VmError::NoCommand)?;
+
+        // Two QEMUs can't share an overlay, so one persistent VM per app.
+        let key = vm_state::persist_key(&entry.id);
+        if persistent
+            && self
+                .vm
+                .instances
+                .values()
+                .any(|vm| vm.persist.as_ref().is_some_and(|p| p.key == key))
+        {
+            return Err(VmError::AlreadyRunning(entry.name.clone()));
+        }
+        let prepared = if persistent {
+            let dir = vm_state::state_root(&settings).join(&key);
+            Some(vm_state::prepare(&dir, &image, &settings).map_err(VmError::State)?)
+        } else {
+            None
+        };
 
         let id = self.vm.next_id;
         self.vm.next_id += 1;
@@ -556,7 +738,32 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
                 source: io::Error::other(err.to_string()),
             })?;
 
-        let qemu = match self.spawn_qemu(&settings, id, &image, ssh_port, &dir) {
+        let serial_log = dir.join("serial.log");
+        let (qmp, qga) = (dir.join("qmp.sock"), dir.join("qga.sock"));
+        let args_for = |load_state: bool| match &prepared {
+            Some(p) => qemu_args(
+                &settings,
+                id,
+                DiskMode::Persistent {
+                    overlay: &p.overlay,
+                    qmp: &qmp,
+                    qga: &qga,
+                    load_state,
+                },
+                ssh_port,
+                &serial_log,
+            ),
+            None => qemu_args(
+                &settings,
+                id,
+                DiskMode::Snapshot { image: &image },
+                ssh_port,
+                &serial_log,
+            ),
+        };
+        let load_state = prepared.as_ref().is_some_and(|p| p.load_state);
+        let (args, cold_args) = (args_for(load_state), args_for(false));
+        let qemu = match spawn_qemu(&args, &dir) {
             Ok(child) => child,
             Err(err) => {
                 self.handle.remove(socket_token);
@@ -574,9 +781,27 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             cancel.clone(),
             deadline,
             self.vm.events.clone(),
+            load_state.then(|| qga.clone()),
         );
 
-        info!(id, app = entry.name, ssh_port, ?image, "Started VM");
+        info!(
+            id,
+            app = entry.name,
+            ssh_port,
+            ?image,
+            persistent,
+            restoring = load_state,
+            "Started VM"
+        );
+        let persist = prepared.map(|p| PersistState {
+            key,
+            meta_path: p.meta_path,
+            meta: p.meta,
+            qmp,
+            saving_until: None,
+            cold_args,
+            loaded_state: load_state,
+        });
         self.vm.instances.insert(
             id,
             VmInstance {
@@ -591,6 +816,8 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
                 cancel,
                 client_connected: false,
                 deadline,
+                ready_seen: false,
+                persist,
             },
         );
         self.ensure_vm_reaper();
@@ -600,11 +827,11 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
     /// Launcher action: runs the highlighted entry in a new VM. Closes the
     /// launcher on success; on failure it stays open with the reason in its
     /// footer, so the user can see what's wrong without digging through logs.
-    pub fn launch_selected_in_vm(&mut self) {
+    pub fn launch_selected_in_vm(&mut self, persistent: bool) {
         let Some(entry) = self.launcher.selected_entry() else {
             return;
         };
-        match self.launch_in_vm(&entry) {
+        match self.launch_in_vm(&entry, persistent) {
             Ok(_) => self.launcher.close(),
             Err(err) => {
                 warn!(app = entry.name, %err, "Could not launch in a VM");
@@ -613,32 +840,13 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
         }
     }
 
-    fn spawn_qemu(
-        &self,
-        settings: &VmSettings,
-        id: VmId,
-        image: &Path,
-        ssh_port: u16,
-        dir: &Path,
-    ) -> Result<Child, VmError> {
-        let args = qemu_args(settings, id, image, ssh_port, &dir.join("serial.log"));
-        let (stdout, stderr) = log_stdio(&dir.join("qemu.log"))?;
-        let mut cmd = Command::new(QEMU_BINARY);
-        cmd.args(&args)
-            .stdin(Stdio::null())
-            .stdout(stdout)
-            .stderr(stderr);
-        die_with_parent(&mut cmd);
-        cmd.spawn()
-            .map_err(VmError::io("starting qemu-system-x86_64"))
-    }
-
     /// Starts `waypipe` for a VM whose guest just answered on SSH.
     pub fn vm_guest_ready(&mut self, id: VmId) {
         let settings = self.config.vm.clone();
         let Some(vm) = self.vm.instances.get_mut(&id) else {
             return;
         };
+        vm.ready_seen = true;
         if vm.waypipe.is_some() {
             return;
         }
@@ -667,11 +875,95 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
         }
     }
 
+    /// A persistent VM's state could not be saved: drop the VM. (The previous
+    /// saved state, if any, is untouched, so the next launch still restores it.)
+    pub fn vm_save_failed(&mut self, id: VmId, why: String) {
+        self.end_vm(id, EndReason::SaveFailed(why));
+    }
+
     /// Reaps VMs that finished or got stuck. Run from a timer that exists only
     /// while VMs do (see [`ensure_vm_reaper`](Self::ensure_vm_reaper)).
     fn reap_vms(&mut self) {
         for (id, reason) in self.vm.find_finished(Instant::now()) {
-            self.end_vm(id, reason);
+            match reason {
+                // A persistent VM isn't over when its program is: its state
+                // gets saved first.
+                EndReason::Closed if self.vm.is_persistent(id) => self.begin_save(id),
+                EndReason::RestoreFailed(status) => self.restart_cold(id, status),
+                EndReason::Saved => {
+                    self.record_saved(id);
+                    self.end_vm(id, EndReason::Saved);
+                }
+                other => self.end_vm(id, other),
+            }
+        }
+    }
+
+    /// The program of a persistent VM exited: ask QEMU to save the guest state
+    /// and quit, on a helper thread (writing all of the guest's RAM takes a
+    /// while). Success is noticed by QEMU exiting cleanly (see `find_finished`).
+    fn begin_save(&mut self, id: VmId) {
+        let events = self.vm.events.clone();
+        let Some(vm) = self.vm.instances.get_mut(&id) else {
+            return;
+        };
+        let Some(persist) = vm.persist.as_mut() else {
+            return;
+        };
+        // waypipe is done; reap it so it isn't reported again.
+        if let Some(mut waypipe) = vm.waypipe.take() {
+            let _ = waypipe.wait();
+        }
+        persist.saving_until = Some(Instant::now() + vm_state::SAVE_TIMEOUT);
+        let qmp = persist.qmp.clone();
+        info!(id, app = vm.name, "Saving the VM's state");
+        let spawned = std::thread::Builder::new()
+            .name(format!("vm-save-{id}"))
+            .spawn(move || {
+                if let Err(why) = vm_state::save_state_over_socket(&qmp) {
+                    let _ = events.send(VmEvent::SaveFailed(id, why));
+                }
+            });
+        if let Err(err) = spawned {
+            self.end_vm(id, EndReason::SaveFailed(err.to_string()));
+        }
+    }
+
+    /// Writes down that the overlay now holds a state to restore.
+    fn record_saved(&mut self, id: VmId) {
+        let settings = self.config.vm.clone();
+        let Some(persist) = self
+            .vm
+            .instances
+            .get(&id)
+            .and_then(|vm| vm.persist.as_ref())
+        else {
+            return;
+        };
+        if let Err(err) = vm_state::mark_saved(&persist.meta, &persist.meta_path, &settings) {
+            warn!(id, %err, "Saved the VM state but could not record it; the next launch will cold-boot");
+        }
+    }
+
+    /// QEMU died while loading a saved state: boot from the overlay's disk
+    /// instead. The probe thread is still waiting on the same SSH port.
+    fn restart_cold(&mut self, id: VmId, status: ExitStatus) {
+        let Some(vm) = self.vm.instances.get_mut(&id) else {
+            return;
+        };
+        let Some(persist) = vm.persist.as_mut() else {
+            return;
+        };
+        warn!(id, app = vm.name, %status, logs = %vm.dir.display(), "Could not restore the saved VM state; cold-booting");
+        match spawn_qemu(&persist.cold_args, &vm.dir) {
+            Ok(child) => {
+                vm.qemu = child;
+                persist.loaded_state = false;
+            }
+            Err(err) => {
+                error!(id, %err, "Failed to restart qemu");
+                self.end_vm(id, EndReason::QemuExited(status));
+            }
         }
     }
 
@@ -693,7 +985,7 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
                 }
             }
         } else {
-            info!(id, app = name, "VM closed");
+            info!(id, app = name, %reason, "VM closed");
         }
         vm.kill();
 
@@ -736,6 +1028,12 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn snapshot() -> DiskMode<'static> {
+        DiskMode::Snapshot {
+            image: Path::new("/i"),
+        }
+    }
 
     fn settings() -> VmSettings {
         VmSettings {
@@ -794,7 +1092,9 @@ mod tests {
         let args = qemu_args(
             &settings(),
             7,
-            Path::new("/img/guest.qcow2"),
+            DiskMode::Snapshot {
+                image: Path::new("/img/guest.qcow2"),
+            },
             2222,
             Path::new("/run/s.log"),
         );
@@ -820,7 +1120,7 @@ mod tests {
         let mut s = settings();
         s.kvm = false;
         s.extra_qemu_args = vec!["-bios".into(), "/fw/OVMF.fd".into()];
-        let args = qemu_args(&s, 1, Path::new("/i"), 1, Path::new("/l"));
+        let args = qemu_args(&s, 1, snapshot(), 1, Path::new("/l"));
         assert!(!args.contains(&"-enable-kvm".to_string()));
         assert_eq!(&args[args.len() - 2..], ["-bios", "/fw/OVMF.fd"]);
     }
@@ -829,7 +1129,7 @@ mod tests {
     fn qemu_args_never_ask_for_zero_cpus() {
         let mut s = settings();
         s.cpus = 0;
-        let args = qemu_args(&s, 1, Path::new("/i"), 1, Path::new("/l"));
+        let args = qemu_args(&s, 1, snapshot(), 1, Path::new("/l"));
         let at = args.iter().position(|a| a == "-smp").unwrap();
         assert_eq!(args[at + 1], "1");
     }
@@ -942,6 +1242,8 @@ mod tests {
             cancel: Arc::new(AtomicBool::new(false)),
             client_connected: connected,
             deadline,
+            ready_seen: true,
+            persist: None,
         }
     }
 
@@ -1064,5 +1366,443 @@ mod tests {
         assert!(manager.contains(1));
         assert!(!manager.contains(2));
         assert_eq!(manager.len(), 1);
+    }
+
+    // --- persistence -----------------------------------------------------
+
+    fn persistent_args(load_state: bool) -> Vec<String> {
+        qemu_args(
+            &settings(),
+            3,
+            DiskMode::Persistent {
+                overlay: Path::new("/state/app/disk.qcow2"),
+                qmp: Path::new("/run/vm/qmp.sock"),
+                qga: Path::new("/run/vm/qga.sock"),
+                load_state,
+            },
+            2222,
+            Path::new("/run/vm/serial.log"),
+        )
+    }
+
+    #[test]
+    fn persistent_vms_boot_the_overlay_directly_without_snapshot_mode() {
+        let joined = persistent_args(false).join(" ");
+        assert!(
+            joined.contains("file=/state/app/disk.qcow2,if=virtio,format=qcow2"),
+            "{joined}"
+        );
+        assert!(!joined.contains("snapshot=on"), "{joined}");
+        assert!(
+            joined.contains("-qmp unix:/run/vm/qmp.sock,server=on,wait=off"),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("path=/run/vm/qga.sock,server=on,wait=off"),
+            "{joined}"
+        );
+        assert!(joined.contains("name=org.qemu.guest_agent.0"), "{joined}");
+        assert!(!joined.contains("-loadvm"), "{joined}");
+    }
+
+    #[test]
+    fn restoring_adds_loadvm_and_keeps_the_machine_identical() {
+        let (cold, warm) = (persistent_args(false), persistent_args(true));
+        assert!(warm.join(" ").contains("-loadvm ironland"));
+        // The saved state only loads into the same machine, so the two
+        // command lines may differ by nothing but the -loadvm pair.
+        let stripped: Vec<_> = warm
+            .iter()
+            .filter(|a| *a != "-loadvm" && *a != "ironland")
+            .cloned()
+            .collect();
+        assert_eq!(stripped, cold);
+    }
+
+    fn persist_state(saving_until: Option<Instant>, loaded_state: bool) -> PersistState {
+        PersistState {
+            key: "app".into(),
+            meta_path: PathBuf::from("/nonexistent/meta.json"),
+            meta: PersistMeta {
+                image: "/i".into(),
+                image_len: 1,
+                image_mtime: 1,
+                machine: String::new(),
+                has_state: false,
+            },
+            qmp: PathBuf::from("/nonexistent/qmp.sock"),
+            saving_until,
+            cold_args: Vec::new(),
+            loaded_state,
+        }
+    }
+
+    fn persistent(
+        qemu: Child,
+        waypipe: Option<Child>,
+        persist: PersistState,
+        ready: bool,
+    ) -> VmInstance {
+        let mut vm = instance(qemu, waypipe, far_future(), true);
+        vm.persist = Some(persist);
+        vm.ready_seen = ready;
+        vm
+    }
+
+    #[test]
+    fn a_persistent_vm_is_reported_as_persistent() {
+        let manager = manager_with(persistent(
+            sleeper(),
+            None,
+            persist_state(None, false),
+            true,
+        ));
+        assert!(manager.is_persistent(1));
+        let plain = manager_with(instance(sleeper(), None, far_future(), false));
+        assert!(!plain.is_persistent(1));
+    }
+
+    #[test]
+    fn qemu_quitting_cleanly_while_saving_means_the_state_was_saved() {
+        let saving = Some(far_future());
+        let mut manager = manager_with(persistent(
+            spawn("true", &[]),
+            None,
+            persist_state(saving, false),
+            true,
+        ));
+        let finished = finished_within_2s(&mut manager);
+        assert!(
+            matches!(finished.as_slice(), [(1, EndReason::Saved)]),
+            "{finished:?}"
+        );
+        assert!(!finished[0].1.is_failure());
+    }
+
+    #[test]
+    fn qemu_crashing_while_saving_is_a_failure() {
+        let saving = Some(far_future());
+        let mut manager = manager_with(persistent(
+            spawn("false", &[]),
+            None,
+            persist_state(saving, false),
+            true,
+        ));
+        let finished = finished_within_2s(&mut manager);
+        assert!(
+            matches!(finished.as_slice(), [(1, EndReason::QemuExited(_))]),
+            "{finished:?}"
+        );
+    }
+
+    #[test]
+    fn a_save_that_never_finishes_times_out() {
+        let past = Some(Instant::now() - Duration::from_secs(1));
+        let mut manager = manager_with(persistent(
+            sleeper(),
+            None,
+            persist_state(past, false),
+            true,
+        ));
+        let finished = manager.find_finished(Instant::now());
+        assert!(
+            matches!(finished.as_slice(), [(1, EndReason::SaveTimedOut)]),
+            "{finished:?}"
+        );
+    }
+
+    #[test]
+    fn a_vm_that_is_saving_ignores_the_startup_deadline_and_waypipe() {
+        // Past the startup deadline with no client, waypipe long gone: none of
+        // that matters while the state is being written.
+        let mut vm = persistent(
+            sleeper(),
+            None,
+            persist_state(Some(far_future()), false),
+            true,
+        );
+        vm.client_connected = false;
+        vm.deadline = Instant::now() - Duration::from_secs(1);
+        let mut manager = manager_with(vm);
+        assert!(manager.find_finished(Instant::now()).is_empty());
+    }
+
+    #[test]
+    fn qemu_dying_before_the_guest_answers_after_a_restore_means_the_restore_failed() {
+        let mut manager = manager_with(persistent(
+            spawn("false", &[]),
+            None,
+            persist_state(None, true),
+            false,
+        ));
+        let finished = finished_within_2s(&mut manager);
+        assert!(
+            matches!(finished.as_slice(), [(1, EndReason::RestoreFailed(_))]),
+            "{finished:?}"
+        );
+        assert!(finished[0].1.is_failure());
+    }
+
+    #[test]
+    fn qemu_dying_after_the_guest_was_up_is_an_ordinary_exit_even_if_restored() {
+        let mut manager = manager_with(persistent(
+            spawn("false", &[]),
+            None,
+            persist_state(None, true),
+            true,
+        ));
+        let finished = finished_within_2s(&mut manager);
+        assert!(
+            matches!(finished.as_slice(), [(1, EndReason::QemuExited(_))]),
+            "{finished:?}"
+        );
+    }
+
+    #[test]
+    fn a_cold_booted_persistent_vm_dying_early_is_not_a_restore_failure() {
+        let mut manager = manager_with(persistent(
+            spawn("false", &[]),
+            None,
+            persist_state(None, false),
+            false,
+        ));
+        let finished = finished_within_2s(&mut manager);
+        assert!(
+            matches!(finished.as_slice(), [(1, EndReason::QemuExited(_))]),
+            "{finished:?}"
+        );
+    }
+
+    #[test]
+    fn persistence_errors_fit_the_launcher_footer() {
+        for err in [
+            VmError::AlreadyRunning("A Very Long Application Name Indeed".into()),
+            VmError::State("x".into()),
+        ] {
+            assert!(err.short().chars().count() <= 38, "{:?}", err.short());
+        }
+    }
+
+    // --- live (needs a real guest image) ---------------------------------
+
+    /// Runs `command` in the guest over ssh and returns its stdout.
+    fn guest_run(port: u16, key: &str, command: &str) -> String {
+        let out = Command::new("ssh")
+            .args([
+                "-o",
+                "StrictHostKeyChecking=no",
+                "-o",
+                "UserKnownHostsFile=/dev/null",
+            ])
+            .args([
+                "-o",
+                "LogLevel=ERROR",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "IdentitiesOnly=yes",
+            ])
+            .args([
+                "-i",
+                key,
+                "-p",
+                &port.to_string(),
+                "user@127.0.0.1",
+                command,
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "ssh failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn wait_for_ssh(port: u16) {
+        for _ in 0..180 {
+            if ssh_ready(port) {
+                return;
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        panic!("guest never answered on ssh");
+    }
+
+    /// End to end against a real QEMU and guest image: cold boot, leave a file
+    /// and a running process behind, save the state, restore it, and check the
+    /// file, the process (i.e. the memory) and the clock.
+    ///
+    /// Run with
+    /// `IRONLAND_TEST_VM_IMAGE=... IRONLAND_TEST_VM_KEY=... cargo test --lib live_ -- --ignored --nocapture`
+    /// (the image from `scripts/build-vm-guest`; needs /dev/kvm).
+    #[test]
+    #[ignore = "boots a real VM"]
+    fn live_persistent_vm_saves_and_restores_disk_memory_and_clock() {
+        let image = std::env::var("IRONLAND_TEST_VM_IMAGE").expect("IRONLAND_TEST_VM_IMAGE");
+        let key = std::env::var("IRONLAND_TEST_VM_KEY").expect("IRONLAND_TEST_VM_KEY");
+        let image = Path::new(&image);
+        // Unix socket paths are limited to ~108 bytes: keep this short.
+        let root = std::env::temp_dir().join(format!("ivt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut settings = VmSettings {
+            image: Some(image.display().to_string()),
+            memory_mb: 1024,
+            ..VmSettings::default()
+        };
+        settings.ssh_key = Some(key.clone());
+
+        let boot = |load_state_expected: bool| {
+            let prepared = vm_state::prepare(&root.join("state"), image, &settings).unwrap();
+            assert_eq!(prepared.load_state, load_state_expected);
+            let port = free_loopback_port().unwrap();
+            let (qmp, qga) = (root.join("qmp.sock"), root.join("qga.sock"));
+            let args = qemu_args(
+                &settings,
+                1,
+                DiskMode::Persistent {
+                    overlay: &prepared.overlay,
+                    qmp: &qmp,
+                    qga: &qga,
+                    load_state: prepared.load_state,
+                },
+                port,
+                &root.join("serial.log"),
+            );
+            let started = Instant::now();
+            let qemu = spawn_qemu(&args, &root).unwrap();
+            wait_for_ssh(port);
+            println!(
+                "ssh up after {:?} (restoring: {})",
+                started.elapsed(),
+                prepared.load_state
+            );
+            (prepared, qemu, port, qmp, qga)
+        };
+
+        // 1. Cold boot; leave a file and a long-running process behind.
+        let (prepared, mut qemu, port, qmp, _qga) = boot(false);
+        guest_run(port, &key, "echo persisted > ~/marker");
+        let pid = guest_run(
+            port,
+            &key,
+            "setsid sleep 100000 </dev/null >/dev/null 2>&1 & echo $!",
+        );
+        let guest_time_at_save: i64 = guest_run(port, &key, "date +%s").parse().unwrap();
+
+        // 2. Save and quit, exactly as the compositor does.
+        vm_state::save_state_over_socket(&qmp).unwrap();
+        let status = qemu.wait().unwrap();
+        assert!(
+            status.success(),
+            "qemu should exit cleanly after saving: {status}"
+        );
+        vm_state::mark_saved(&prepared.meta, &prepared.meta_path, &settings).unwrap();
+
+        // 3. Let the host clock move on, so a stale guest clock would show.
+        std::thread::sleep(Duration::from_secs(25));
+
+        // 4. Restore.
+        let (_prepared, mut qemu, port, _qmp, qga) = boot(true);
+        let guest_time_before_sync: i64 = guest_run(port, &key, "date +%s").parse().unwrap();
+        println!(
+            "guest clock just restored: {} s behind the host",
+            host_epoch() - guest_time_before_sync
+        );
+        vm_state::guest_set_time(&qga).expect("guest agent should set the time");
+        let guest_time: i64 = guest_run(port, &key, "date +%s").parse().unwrap();
+
+        assert_eq!(
+            guest_run(port, &key, "cat ~/marker"),
+            "persisted",
+            "disk state"
+        );
+        assert_eq!(
+            guest_run(port, &key, &format!("kill -0 {pid} && echo alive")),
+            "alive",
+            "memory state: the process started before the save must still be running"
+        );
+        assert!(
+            guest_time > guest_time_at_save + 20,
+            "the guest clock must have moved on"
+        );
+        assert!(
+            (host_epoch() - guest_time).abs() <= 3,
+            "clock should match the host after syncing"
+        );
+
+        let _ = qemu.kill();
+        let _ = qemu.wait();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The cold-boot fallback (`EndReason::RestoreFailed`) relies on QEMU
+    /// *exiting* when asked to load a state into a differently-configured
+    /// machine, rather than starting a broken guest. Check that it does.
+    #[test]
+    #[ignore = "boots a real VM"]
+    fn live_loading_a_state_into_a_different_machine_makes_qemu_exit() {
+        let image = std::env::var("IRONLAND_TEST_VM_IMAGE").expect("IRONLAND_TEST_VM_IMAGE");
+        let key = std::env::var("IRONLAND_TEST_VM_KEY").expect("IRONLAND_TEST_VM_KEY");
+        let image = Path::new(&image);
+        let root = std::env::temp_dir().join(format!("ivt2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let settings = VmSettings {
+            image: Some(image.display().to_string()),
+            memory_mb: 1024,
+            ssh_key: Some(key),
+            ..VmSettings::default()
+        };
+        let prepared = vm_state::prepare(&root.join("state"), image, &settings).unwrap();
+        let (qmp, qga) = (root.join("qmp.sock"), root.join("qga.sock"));
+        let args = |settings: &VmSettings, load_state: bool| {
+            qemu_args(
+                settings,
+                1,
+                DiskMode::Persistent {
+                    overlay: &prepared.overlay,
+                    qmp: &qmp,
+                    qga: &qga,
+                    load_state,
+                },
+                free_loopback_port().unwrap(),
+                &root.join("serial.log"),
+            )
+        };
+
+        let mut qemu = spawn_qemu(&args(&settings, false), &root).unwrap();
+        // The monitor socket exists as soon as QEMU is up; no need to boot far.
+        vm_state::save_state_over_socket(&qmp).unwrap();
+        assert!(qemu.wait().unwrap().success());
+
+        let bigger = VmSettings {
+            memory_mb: 2048,
+            ..settings.clone()
+        };
+        let mut qemu = spawn_qemu(&args(&bigger, true), &root).unwrap();
+        let mut status = None;
+        for _ in 0..60 {
+            if let Some(st) = qemu.try_wait().unwrap() {
+                status = Some(st);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        let _ = qemu.kill();
+        let _ = qemu.wait();
+        let status = status.expect("qemu should refuse to load the state, not keep running");
+        assert!(!status.success(), "{status}");
+        println!("qemu log: {}", log_tail(&root.join("qemu.log")));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn host_epoch() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
     }
 }

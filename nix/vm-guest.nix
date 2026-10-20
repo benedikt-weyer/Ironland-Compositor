@@ -59,6 +59,10 @@ in
       };
     };
 
+    # Lets the compositor set the clock of a guest restored from saved state
+    # (persistent VMs): it would otherwise resume on the time it was saved at.
+    services.qemuGuest.enable = true;
+
     environment.systemPackages = [ pkgs.waypipe pkgs.foot ] ++ cfg.extraPackages;
     fonts.packages = [ pkgs.dejavu_fonts ];
     # Mesa's software rasterizer, for programs that want GL.

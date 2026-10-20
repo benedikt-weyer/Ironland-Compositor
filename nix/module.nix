@@ -71,7 +71,12 @@ in
       inherit a complete environment; the unit must exist but must not be
       started by anything else. Under `vm`, launcher entries can be started
       inside a throw-away QEMU VM (press Left instead of Enter in the
-      launcher) with their windows shown on the desktop like any other:
+      launcher) with their windows shown on the desktop like any other (Right
+      starts a *persistent* VM instead: its disk and memory are saved when the
+      program exits and restored on the next persistent launch of that
+      application, keeping its files and starting in about a second; they live
+      under `state_dir`, default
+      `~/.local/share/ironland-compositor/vm/persistent`):
       `image` is the bootable guest disk (qcow2/raw; VMs boot a snapshot of
       it, so it's never modified and one image serves any number of VMs),
       which must run an SSH server accepting `ssh_key` for `user` (default

@@ -136,6 +136,8 @@ type VMSettings struct {
 	// Terminal is the guest-side terminal for Terminal=true entries.
 	Terminal      *string  `json:"terminal"`
 	ExtraQemuArgs []string `json:"extra_qemu_args"`
+	// StateDir is where persistent VMs keep their disk and saved state.
+	StateDir *string `json:"state_dir"`
 }
 
 // FocusSettings mirrors `ironland_config::FocusSettings`: both default off,

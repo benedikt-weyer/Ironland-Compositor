@@ -386,6 +386,10 @@ pub struct VmSettings {
     /// Extra arguments appended to the `qemu-system-x86_64` command line,
     /// e.g. `["-cpu", "host"]` or `["-device", "virtio-rng-pci"]`.
     pub extra_qemu_args: Vec<String>,
+    /// Where persistent VMs (launched with the launcher's Right key rather
+    /// than Left) keep their disk overlay and saved state, one directory per
+    /// application. `None` uses `$XDG_DATA_HOME/ironland-compositor/vm/persistent`.
+    pub state_dir: Option<String>,
 }
 
 impl Default for VmSettings {
@@ -401,6 +405,7 @@ impl Default for VmSettings {
             startup_timeout_secs: 180,
             terminal: None,
             extra_qemu_args: Vec::new(),
+            state_dir: None,
         }
     }
 }

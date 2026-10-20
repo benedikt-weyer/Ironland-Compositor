@@ -52,6 +52,9 @@ pub(crate) enum KeyAction {
     /// Launch the currently selected application inside a fresh VM (see
     /// `crate::shell::vm`); the launcher stays open if that fails.
     LauncherActivateVm,
+    /// Like [`KeyAction::LauncherActivateVm`], but in a persistent VM whose
+    /// disk and memory are saved on exit and restored next time.
+    LauncherActivateVmPersistent,
     LauncherClose,
     /// Fires `ironland_shortcut_v1.pressed` for the named shortcut (see
     /// `config::action_for_name`'s `"shortcut:<name>"` convention and
@@ -87,6 +90,7 @@ pub(super) fn launcher_key_action(keysym: Keysym) -> KeyAction {
         Keysym::Up => KeyAction::LauncherUp,
         Keysym::Down => KeyAction::LauncherDown,
         Keysym::Left => KeyAction::LauncherActivateVm,
+        Keysym::Right => KeyAction::LauncherActivateVmPersistent,
         _ => match xkb_utf8::keysym_to_utf8(keysym).chars().next() {
             Some(c) if !c.is_control() => KeyAction::LauncherType(c),
             _ => KeyAction::None,

@@ -518,6 +518,7 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
                 if let smithay::reexports::calloop::channel::Event::Msg(event) = event {
                     match event {
                         crate::shell::vm::VmEvent::GuestReady(id) => data.vm_guest_ready(id),
+                        crate::shell::vm::VmEvent::SaveFailed(id, why) => data.vm_save_failed(id, why),
                     }
                 }
             })

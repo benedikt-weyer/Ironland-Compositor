@@ -124,7 +124,8 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                 }
             }
 
-            KeyAction::LauncherActivateVm => self.launch_selected_in_vm(),
+            KeyAction::LauncherActivateVm => self.launch_selected_in_vm(false),
+            KeyAction::LauncherActivateVmPersistent => self.launch_selected_in_vm(true),
 
             KeyAction::ToggleDecorations => {
                 for element in self.space.elements() {

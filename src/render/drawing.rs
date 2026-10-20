@@ -267,7 +267,8 @@ const LAUNCHER_WIDTH: i32 = 480;
 const LAUNCHER_ROW_HEIGHT: i32 = 26;
 const LAUNCHER_HEADER_HEIGHT: i32 = 36;
 const LAUNCHER_PADDING: i32 = 10;
-const LAUNCHER_FOOTER_HEIGHT: i32 = 26;
+const LAUNCHER_FOOTER_LINE_HEIGHT: i32 = 22;
+const LAUNCHER_FOOTER_PADDING: i32 = 6;
 const LAUNCHER_MAX_ROWS: usize = 8;
 const LAUNCHER_FONT_SCALE: i32 = 2;
 
@@ -278,24 +279,28 @@ const COLOR_TEXT: [u8; 4] = [235, 230, 225, 255];
 const COLOR_MUTED_TEXT: [u8; 4] = [150, 140, 130, 255];
 const COLOR_ERROR_TEXT: [u8; 4] = [235, 120, 110, 255];
 
-/// What the launcher's bottom line says, and in which style.
+/// One line of the launcher's footer, and in which style.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum FooterLine {
     /// Key hints (normal colour).
     Hint(&'static str),
-    /// Key hints with the VM key unavailable (muted).
+    /// Key hints with the VM keys unavailable (muted).
     HintNoVm(&'static str),
     /// Why the last launch attempt failed (error colour).
     Error(String),
 }
 
-/// Picks the launcher's bottom line: a pending error beats the key hints,
-/// and the hints say plainly when the VM key can't work yet.
-fn footer_line(vm_available: bool, status: Option<&str>) -> FooterLine {
+/// The launcher's bottom lines: a pending error beats the key hints, and the
+/// hints say plainly when the VM keys can't work yet. Each line must fit the
+/// overlay (about 38 characters).
+fn footer_lines(vm_available: bool, status: Option<&str>) -> Vec<FooterLine> {
     match status {
-        Some(message) => FooterLine::Error(message.to_string()),
-        None if vm_available => FooterLine::Hint("Enter: launch   Left: launch in VM"),
-        None => FooterLine::HintNoVm("Enter: launch   Left: VM (not set up)"),
+        Some(message) => vec![FooterLine::Error(message.to_string())],
+        None if vm_available => vec![
+            FooterLine::Hint("Enter: launch   Left: throw-away VM"),
+            FooterLine::Hint("Right: persistent VM (keeps state)"),
+        ],
+        None => vec![FooterLine::HintNoVm("Enter: launch   VM keys: not set up")],
     }
 }
 
@@ -419,10 +424,21 @@ impl LauncherState {
         self.dirty = true;
     }
 
+    fn footer_lines(&self) -> Vec<FooterLine> {
+        footer_lines(self.vm_available, self.status.as_deref())
+    }
+
+    fn footer_height(&self) -> i32 {
+        self.footer_lines().len() as i32 * LAUNCHER_FOOTER_LINE_HEIGHT + LAUNCHER_FOOTER_PADDING
+    }
+
     /// The logical size of the overlay, so callers can center it on the output.
     pub fn logical_size(&self) -> Size<i32, Logical> {
         let rows = self.filtered.len().clamp(1, LAUNCHER_MAX_ROWS);
-        let height = LAUNCHER_HEADER_HEIGHT + rows as i32 * LAUNCHER_ROW_HEIGHT + LAUNCHER_PADDING + LAUNCHER_FOOTER_HEIGHT;
+        let height = LAUNCHER_HEADER_HEIGHT
+            + rows as i32 * LAUNCHER_ROW_HEIGHT
+            + LAUNCHER_PADDING
+            + self.footer_height();
         Size::from((LAUNCHER_WIDTH, height))
     }
 
@@ -469,22 +485,28 @@ impl LauncherState {
             }
         }
 
-        let footer_y = size.h - LAUNCHER_FOOTER_HEIGHT;
-        canvas.fill_rect(0, footer_y, size.w, LAUNCHER_FOOTER_HEIGHT, COLOR_HEADER_BG);
-        let (text, color) = match footer_line(self.vm_available, self.status.as_deref()) {
-            FooterLine::Hint(text) => (text.to_string(), COLOR_TEXT),
-            FooterLine::HintNoVm(text) => (text.to_string(), COLOR_MUTED_TEXT),
-            FooterLine::Error(message) => (message, COLOR_ERROR_TEXT),
-        };
+        let footer_height = self.footer_height();
+        let footer_y = size.h - footer_height;
+        canvas.fill_rect(0, footer_y, size.w, footer_height, COLOR_HEADER_BG);
         let max_chars = ((size.w - LAUNCHER_PADDING * 2)
             / ((crate::font::GLYPH_WIDTH as i32 + 1) * LAUNCHER_FONT_SCALE)) as usize;
-        canvas.draw_text(
-            LAUNCHER_PADDING,
-            footer_y + (LAUNCHER_FOOTER_HEIGHT - GLYPH_LINE_HEIGHT * LAUNCHER_FONT_SCALE) / 2,
-            &truncate(&text, max_chars),
-            LAUNCHER_FONT_SCALE,
-            color,
-        );
+        for (i, line) in self.footer_lines().into_iter().enumerate() {
+            let (text, color) = match line {
+                FooterLine::Hint(text) => (text.to_string(), COLOR_TEXT),
+                FooterLine::HintNoVm(text) => (text.to_string(), COLOR_MUTED_TEXT),
+                FooterLine::Error(message) => (message, COLOR_ERROR_TEXT),
+            };
+            canvas.draw_text(
+                LAUNCHER_PADDING,
+                footer_y
+                    + LAUNCHER_FOOTER_PADDING / 2
+                    + i as i32 * LAUNCHER_FOOTER_LINE_HEIGHT
+                    + (LAUNCHER_FOOTER_LINE_HEIGHT - GLYPH_LINE_HEIGHT * LAUNCHER_FONT_SCALE) / 2,
+                &truncate(&text, max_chars),
+                LAUNCHER_FONT_SCALE,
+                color,
+            );
+        }
 
         canvas
     }
@@ -562,38 +584,56 @@ fn truncate(s: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn footer_hints_name_both_launch_keys() {
-        match footer_line(true, None) {
-            FooterLine::Hint(text) => {
-                assert!(text.contains("Enter"));
-                assert!(text.contains("Left"));
-                assert!(text.to_lowercase().contains("vm"));
-            }
-            other => panic!("unexpected footer {other:?}"),
+    fn hint_text(line: &FooterLine) -> &str {
+        match line {
+            FooterLine::Hint(t) | FooterLine::HintNoVm(t) => t,
+            FooterLine::Error(t) => t,
         }
+    }
+
+    #[test]
+    fn footer_hints_name_all_three_launch_modes() {
+        let lines = footer_lines(true, None);
+        let all = lines.iter().map(hint_text).collect::<Vec<_>>().join(" ");
+        assert!(all.contains("Enter"));
+        assert!(all.contains("Left") && all.to_lowercase().contains("throw-away"));
+        assert!(all.contains("Right") && all.to_lowercase().contains("persistent"));
+        assert!(lines.iter().all(|l| matches!(l, FooterLine::Hint(_))));
     }
 
     #[test]
     fn footer_says_when_vms_are_not_set_up() {
-        assert!(matches!(footer_line(false, None), FooterLine::HintNoVm(_)));
+        let lines = footer_lines(false, None);
+        assert!(matches!(lines.as_slice(), [FooterLine::HintNoVm(_)]));
     }
 
     #[test]
     fn a_launch_error_replaces_the_hints() {
-        assert_eq!(footer_line(true, Some("boom")), FooterLine::Error("boom".into()));
+        assert_eq!(
+            footer_lines(true, Some("boom")),
+            vec![FooterLine::Error("boom".into())]
+        );
     }
 
     #[test]
-    fn footer_hints_fit_the_launcher_width() {
+    fn footer_lines_fit_the_launcher_width() {
         let per_char = (crate::font::GLYPH_WIDTH as i32 + 1) * LAUNCHER_FONT_SCALE;
         let max_chars = ((LAUNCHER_WIDTH - LAUNCHER_PADDING * 2) / per_char) as usize;
-        for line in [footer_line(true, None), footer_line(false, None)] {
-            let (FooterLine::Hint(text) | FooterLine::HintNoVm(text)) = line else {
-                unreachable!()
-            };
-            assert!(text.chars().count() <= max_chars, "{text:?} is too wide");
+        for lines in [footer_lines(true, None), footer_lines(false, None)] {
+            for line in &lines {
+                assert!(hint_text(line).chars().count() <= max_chars, "{line:?} is too wide");
+            }
         }
+    }
+
+    #[test]
+    fn the_overlay_grows_with_the_footer() {
+        let with_vms = LauncherState {
+            vm_available: true,
+            ..LauncherState::default()
+        };
+        let without_vms = LauncherState::default();
+        assert!(without_vms.logical_size().h < with_vms.logical_size().h);
     }
 
     #[test]
