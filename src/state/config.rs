@@ -55,7 +55,13 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
         }
 
         let top_bar_changed = new_config.top_bar != old_config.top_bar;
+        let vm_configured_changed = new_config.vm.is_configured() != old_config.vm.is_configured();
         self.config = new_config;
+
+        if vm_configured_changed {
+            self.vm_launch_state
+                .broadcast_availability(self.config.vm.is_configured());
+        }
 
         if top_bar_changed {
             use xdg_decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode;

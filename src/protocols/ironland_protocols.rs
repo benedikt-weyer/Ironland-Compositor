@@ -1,9 +1,10 @@
 //! Server-side generated bindings for ironland-compositor's own small
 //! Wayland protocol extensions (XML under `protocols/`): named shortcuts,
 //! single-surface focus grabs, per-window workspace membership, an
-//! in-memory clipboard history, and a screen-wide color filter (see
-//! `crate::shortcuts`, `crate::focus_grab`, `crate::display_filter`,
-//! `crate::workspace_windows`, and `crate::clipboard`).
+//! in-memory clipboard history, a screen-wide color filter, and launching
+//! applications inside VMs (see `crate::shortcuts`, `crate::focus_grab`,
+//! `crate::display_filter`, `crate::workspace_windows`, `crate::clipboard`
+//! and `crate::vm_launch`).
 //!
 //! These aren't in the `wayland-protocols`/`wayland-protocols-wlr` crates
 //! (nothing standard covers either need, and Hyprland's own equivalents -
@@ -104,6 +105,19 @@ pub mod clipboard_history {
     use self::__interfaces::*;
 
     wayland_scanner::generate_server_code!("./protocols/ironland-clipboard-history-v1.xml");
+}
+
+pub mod vm_launch {
+    use wayland_server;
+    use wayland_server::protocol::*;
+
+    pub mod __interfaces {
+        use wayland_server::protocol::__interfaces::*;
+        wayland_scanner::generate_interfaces!("./protocols/ironland-vm-launch-v1.xml");
+    }
+    use self::__interfaces::*;
+
+    wayland_scanner::generate_server_code!("./protocols/ironland-vm-launch-v1.xml");
 }
 
 pub mod display_filter {

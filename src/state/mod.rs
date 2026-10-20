@@ -212,6 +212,7 @@ pub struct AnvilState<BackendData: Backend + 'static> {
     pub frame_capture_manager_state: crate::frame_capture::FrameCaptureManagerState,
     pub workspace_windows_state: crate::workspace_windows::WorkspaceWindowsState,
     pub display_filter_state: crate::display_filter::DisplayFilterState,
+    pub vm_launch_state: crate::vm_launch::VmLaunchState,
     /// Per-output buffers for the night-mode tint overlay (see `crate::tint`).
     pub display_tint: crate::tint::DisplayTint,
     pub output_manager_state: OutputManagerState,
@@ -536,6 +537,7 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
         let frame_capture_manager_state = crate::frame_capture::FrameCaptureManagerState::new::<Self>(&dh);
         let workspace_windows_state = crate::workspace_windows::WorkspaceWindowsState::new::<Self>(&dh);
         let display_filter_state = crate::display_filter::DisplayFilterState::new::<Self>(&dh);
+        let vm_launch_state = crate::vm_launch::VmLaunchState::new::<Self>(&dh);
         let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(&dh);
         let primary_selection_state = PrimarySelectionState::new::<Self>(&dh);
         let data_control_state =
@@ -636,6 +638,7 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             frame_capture_manager_state,
             workspace_windows_state,
             display_filter_state,
+            vm_launch_state,
             display_tint: Default::default(),
             output_manager_state,
             primary_selection_state,

@@ -97,6 +97,12 @@
           src = craneLib.path ./.;
           inherit cargoArtifacts;
           nativeBuildInputs = nativeBuildInputs ++ [ pkgs.makeWrapper ];
+          # The protocol tests (`vm_launch::wire_tests`) run a real Wayland
+          # server and client in-process, and wayland-rs `dlopen`s
+          # libwayland - which, like at run time, isn't found without this.
+          preCheck = ''
+            export LD_LIBRARY_PATH=${pkgs.lib.makeLibraryPath [ pkgs.wayland ]}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+          '';
           # `smithay::xwayland::XWayland::spawn` shells out to `Xwayland` by
           # bare name (`Command::new("Xwayland")`, resolved via `PATH`) -
           # there's no Cargo-level way to point it at a store path, so the

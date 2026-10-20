@@ -80,6 +80,33 @@ impl<BackendData: Backend> crate::display_filter::DisplayFilterHandler for Anvil
     }
 }
 
+impl<BackendData: Backend + 'static> crate::vm_launch::VmLaunchHandler for AnvilState<BackendData> {
+    fn vm_launch_state(&mut self) -> &mut crate::vm_launch::VmLaunchState {
+        &mut self.vm_launch_state
+    }
+
+    fn vm_launch_configured(&self) -> bool {
+        self.config.vm.is_configured()
+    }
+
+    fn vm_launch_entry(
+        &mut self,
+        entry_id: &str,
+        persistent: bool,
+    ) -> Result<crate::shell::vm::VmId, crate::vm_launch::Refusal> {
+        let entry = crate::launcher::find_entry(entry_id)
+            .ok_or_else(|| crate::vm_launch::Refusal::unknown_entry(entry_id))?;
+        self.launch_in_vm(&entry, persistent).map_err(|err| {
+            tracing::warn!(app = entry.name, %err, "VM launch requested over the protocol was refused");
+            crate::vm_launch::Refusal::from(&err)
+        })
+    }
+
+    fn vm_watch(&mut self, vm: crate::shell::vm::VmId, watcher: crate::vm_launch::Watcher) {
+        self.vm.add_watcher(vm, watcher);
+    }
+}
+
 impl<BackendData: Backend> crate::workspace_windows::WorkspaceWindowsHandler for AnvilState<BackendData> {
     fn workspace_windows_state(&mut self) -> &mut crate::workspace_windows::WorkspaceWindowsState {
         &mut self.workspace_windows_state

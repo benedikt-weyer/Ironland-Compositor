@@ -10,4 +10,5 @@ pub mod frame_capture;
 pub mod ironland_protocols;
 pub mod screencopy;
 pub mod shortcuts;
+pub mod vm_launch;
 pub mod workspace_windows;

@@ -75,6 +75,7 @@ use crate::{
     config::VmSettings,
     launcher::{self, DesktopEntry},
     state::{AnvilState, Backend, insert_client_with_identity},
+    vm_launch::{Finish, Watcher},
 };
 
 /// Identifies one running VM for as long as it exists. Never reused within a
@@ -175,6 +176,19 @@ impl std::fmt::Display for EndReason {
 }
 
 impl EndReason {
+    /// How this ending is reported to protocol clients.
+    fn finish(&self) -> Finish {
+        match self {
+            EndReason::Closed => Finish::Closed,
+            EndReason::Saved => Finish::Saved,
+            EndReason::TimedOut | EndReason::SaveTimedOut => Finish::TimedOut,
+            EndReason::QemuExited(_)
+            | EndReason::WaypipeFailed(_)
+            | EndReason::SaveFailed(_)
+            | EndReason::RestoreFailed(_) => Finish::Failed,
+        }
+    }
+
     fn is_failure(&self) -> bool {
         !matches!(self, EndReason::Closed | EndReason::Saved)
     }
@@ -226,6 +240,8 @@ struct VmInstance {
     ready_seen: bool,
     /// `Some` for persistent VMs.
     persist: Option<PersistState>,
+    /// Protocol clients following this VM (see `crate::vm_launch`).
+    watchers: Vec<Watcher>,
 }
 
 /// All running VMs, plus the plumbing they share.
@@ -275,8 +291,17 @@ impl VmManager {
 
     /// Records that a Wayland client connected through `id`'s socket.
     fn mark_client_connected(&mut self, id: VmId) {
+        if let Some(vm) = self.instances.get_mut(&id)
+            && !std::mem::replace(&mut vm.client_connected, true)
+        {
+            vm.watchers.iter().for_each(Watcher::running);
+        }
+    }
+
+    /// Lets `watcher` follow the VM `id`'s progress.
+    pub fn add_watcher(&mut self, id: VmId, watcher: Watcher) {
         if let Some(vm) = self.instances.get_mut(&id) {
-            vm.client_connected = true;
+            vm.watchers.push(watcher);
         }
     }
 
@@ -818,6 +843,7 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
                 deadline,
                 ready_seen: false,
                 persist,
+                watchers: Vec::new(),
             },
         );
         self.ensure_vm_reaper();
@@ -915,6 +941,7 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             let _ = waypipe.wait();
         }
         persist.saving_until = Some(Instant::now() + vm_state::SAVE_TIMEOUT);
+        vm.watchers.iter().for_each(Watcher::saving);
         let qmp = persist.qmp.clone();
         info!(id, app = vm.name, "Saving the VM's state");
         let spawned = std::thread::Builder::new()
@@ -987,6 +1014,8 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
         } else {
             info!(id, app = name, %reason, "VM closed");
         }
+        let finish = reason.finish();
+        vm.watchers.iter().for_each(|w| w.finished(finish));
         vm.kill();
 
         // Logs of a failed VM are kept for debugging; everything else goes.
@@ -1244,6 +1273,7 @@ mod tests {
             deadline,
             ready_seen: true,
             persist: None,
+            watchers: Vec::new(),
         }
     }
 

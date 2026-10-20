@@ -70,6 +70,22 @@ pub fn scan_desktop_entries() -> Vec<DesktopEntry> {
     entries
 }
 
+/// Whether the desktop entry id `entry_id` (as stored, `foo.desktop`) is the one
+/// a client asked for as `wanted`, which may or may not carry the `.desktop`
+/// suffix (the shell's desktop-entry type omits it).
+fn entry_id_matches(entry_id: &str, wanted: &str) -> bool {
+    let strip = |id: &str| id.strip_suffix(".desktop").map(str::to_string).unwrap_or_else(|| id.to_string());
+    !wanted.is_empty() && strip(entry_id) == strip(wanted)
+}
+
+/// Finds the installed, visible application whose desktop entry id is `id`
+/// (with or without `.desktop`).
+pub fn find_entry(id: &str) -> Option<DesktopEntry> {
+    scan_desktop_entries()
+        .into_iter()
+        .find(|entry| entry_id_matches(&entry.id, id))
+}
+
 fn parse_desktop_file(path: &Path, id: String) -> Option<DesktopEntry> {
     let contents = fs::read_to_string(path).ok()?;
 
@@ -332,6 +348,16 @@ mod tests {
         assert_eq!(parsed.exec, "visible %F");
         assert!(parsed.terminal);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn entry_ids_match_with_or_without_the_desktop_suffix() {
+        assert!(entry_id_matches("org.mozilla.firefox.desktop", "org.mozilla.firefox"));
+        assert!(entry_id_matches("org.mozilla.firefox.desktop", "org.mozilla.firefox.desktop"));
+        assert!(entry_id_matches("foot", "foot.desktop"));
+        assert!(!entry_id_matches("foot.desktop", "foot-server"));
+        assert!(!entry_id_matches("foot.desktop", ""));
+        assert!(!entry_id_matches(".desktop", ""));
     }
 
     #[test]

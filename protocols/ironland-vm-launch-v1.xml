@@ -1,0 +1,186 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="ironland_vm_launch_v1">
+  <copyright>
+    Copyright © 2026 the ironland-compositor contributors
+
+    Permission is hereby granted, free of charge, to any person obtaining a
+    copy of this software and associated documentation files (the
+    "Software"), to deal in the Software without restriction, including
+    without limitation the rights to use, copy, modify, merge, publish,
+    distribute, sublicense, and/or sell copies of the Software, and to
+    permit persons to whom the Software is furnished to do so, subject to
+    the following conditions:
+
+    The above copyright notice and this permission notice shall be included
+    in all copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+    OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+    MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+    IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+    CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+    TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+    SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+  </copyright>
+
+  <description summary="launch desktop applications inside virtual machines">
+    Lets a client (the shell's app launcher) start an installed application
+    inside a virtual machine instead of on the host. The compositor boots
+    the VM, runs the program in it and shows its windows as ordinary windows
+    on this desktop, marked with a badge (see the compositor's `[vm]`
+    configuration for how VMs are set up).
+
+    A client names the application by its desktop entry id, never by a
+    command line: the compositor resolves the id against the desktop entries
+    installed on the host and runs that entry's `Exec` in the guest. A
+    client can therefore only start things the user has installed as
+    applications, not run arbitrary commands.
+
+    The global is not advertised to clients that run inside a VM
+    themselves (so a guest cannot start further VMs on the host) nor to
+    clients connected through a sandbox (security-context) socket.
+
+    Each launch is a separate object that reports the VM's progress:
+    `starting`, then `running`, then (for a persistent VM) `saving`, and
+    finally `finished`; or just `failed` if the launch is refused. Events
+    are only informational: the VM does not depend on the client afterwards,
+    and destroying the object (or disconnecting) leaves it running.
+  </description>
+
+  <interface name="ironland_vm_launcher_v1" version="1">
+    <description summary="starts applications in virtual machines">
+      The manager global. On binding it immediately sends `availability`.
+    </description>
+
+    <enum name="mode">
+      <description summary="what kind of VM to start">
+        Both kinds boot a VM from the configured guest image and show the
+        program's windows on the host.
+      </description>
+      <entry name="throwaway" value="0" summary="nothing survives the VM">
+        The VM runs on a temporary snapshot of the image that is thrown away
+        when the program exits. Every launch boots from scratch and any
+        number of VMs can run at once.
+      </entry>
+      <entry name="persistent" value="1" summary="the app's disk and memory are kept">
+        The application keeps its own disk and, when its program exits
+        cleanly, its memory state: the next persistent launch of the same
+        application resumes where it left off, with all its files, in about
+        a second instead of a full boot. At most one persistent VM per
+        application runs at a time.
+      </entry>
+    </enum>
+
+    <request name="destroy" type="destructor">
+      <description summary="destroy the manager">
+        Destroys the manager. Launch objects created from it stay valid.
+      </description>
+    </request>
+
+    <request name="launch">
+      <description summary="start an application in a new VM">
+        Starts the application with the given desktop entry id in a VM and
+        returns an object reporting how that goes. The compositor replies
+        with `starting` once the VM process has been started (the window
+        only appears later, when the guest has booted and the program has
+        opened it), or with `failed` if the launch is refused.
+      </description>
+      <arg name="id" type="new_id" interface="ironland_vm_launch_v1"/>
+      <arg name="entry" type="string"
+           summary="desktop entry id, with or without the .desktop suffix"/>
+      <arg name="mode" type="uint" enum="mode"/>
+    </request>
+
+    <event name="availability">
+      <description summary="whether VM launches can work">
+        Sent when the manager is bound and again whenever it changes.
+        `configured` is 1 when the compositor has a guest image configured
+        and launches can be attempted, 0 when it has none (every launch
+        would fail with `not_configured`). A client should only offer VM
+        launching while this is 1.
+      </description>
+      <arg name="configured" type="uint"/>
+    </event>
+  </interface>
+
+  <interface name="ironland_vm_launch_v1" version="1">
+    <description summary="progress of one VM launch">
+      Reports the life of one launched VM. Created by
+      `ironland_vm_launcher_v1.launch`. After `failed` or `finished` no
+      further events are sent.
+    </description>
+
+    <enum name="error">
+      <description summary="why a launch was refused"/>
+      <entry name="unknown_entry" value="0"
+             summary="no installed application has that desktop entry id"/>
+      <entry name="not_configured" value="1" summary="no guest image is configured"/>
+      <entry name="image_missing" value="2" summary="the configured guest image does not exist"/>
+      <entry name="too_many" value="3" summary="the limit on concurrent VMs is reached"/>
+      <entry name="already_running" value="4"
+             summary="a persistent VM for this application is already running"/>
+      <entry name="no_command" value="5" summary="the entry has no command to run"/>
+      <entry name="state" value="6"
+             summary="the persistent VM's saved state could not be prepared"/>
+      <entry name="other" value="7" summary="the VM could not be started"/>
+    </enum>
+
+    <enum name="finish_reason">
+      <description summary="how a VM ended"/>
+      <entry name="closed" value="0" summary="the program exited and the VM was shut down"/>
+      <entry name="saved" value="1"
+             summary="the program exited and a persistent VM's state was saved"/>
+      <entry name="failed" value="2" summary="the VM or its window forwarding died unexpectedly"/>
+      <entry name="timed_out" value="3"
+             summary="no window appeared in time, or saving the state took too long"/>
+    </enum>
+
+    <request name="destroy" type="destructor">
+      <description summary="stop tracking this launch">
+        Stops receiving events for this launch. Does not stop the VM.
+      </description>
+    </request>
+
+    <event name="failed">
+      <description summary="the launch was refused">
+        The launch could not be started. `message` is a short human-readable
+        explanation suitable for showing to the user. The object is inert
+        afterwards and should be destroyed.
+      </description>
+      <arg name="error" type="uint" enum="error"/>
+      <arg name="message" type="string"/>
+    </event>
+
+    <event name="starting">
+      <description summary="the VM has been started">
+        The VM process is up and the guest is booting (or, for a persistent
+        VM with saved state, being restored). `vm` is an identifier for this
+        VM, unique for the lifetime of the compositor.
+      </description>
+      <arg name="vm" type="uint"/>
+    </event>
+
+    <event name="running">
+      <description summary="the program's first window connected">
+        The guest is up and the program has connected to the desktop, so its
+        window is (about to be) on screen.
+      </description>
+    </event>
+
+    <event name="saving">
+      <description summary="a persistent VM's state is being saved">
+        The program exited and the compositor is saving the persistent VM's
+        disk and memory state, which can take a few seconds. The next
+        persistent launch of the same application is refused with
+        `already_running` until `finished` arrives.
+      </description>
+    </event>
+
+    <event name="finished">
+      <description summary="the VM is gone">
+        The VM has been shut down.
+      </description>
+      <arg name="reason" type="uint" enum="finish_reason"/>
+    </event>
+  </interface>
+</protocol>
