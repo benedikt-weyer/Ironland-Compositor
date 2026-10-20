@@ -113,6 +113,31 @@ type SessionSettings struct {
 	ShellUnit string `json:"shell_unit"`
 }
 
+// VMSettings mirrors `ironland_config::VmSettings`: launching programs
+// inside QEMU VMs whose windows appear on the host desktop. There is no GUI
+// tab for these yet - this struct exists so a `Config` round-tripped through
+// this GUI (load, edit something else, apply) doesn't silently reset a [vm]
+// section set via the config file.
+type VMSettings struct {
+	// Image is the bootable guest disk image; empty/null disables VM launches.
+	Image *string `json:"image"`
+	// MemoryMB is the guest RAM in MiB.
+	MemoryMB uint32 `json:"memory_mb"`
+	CPUs     uint32 `json:"cpus"`
+	// User is the guest account waypipe logs in as over ssh.
+	User string `json:"user"`
+	// SSHKey is the private key authorized for User in the guest.
+	SSHKey *string `json:"ssh_key"`
+	KVM    bool    `json:"kvm"`
+	// MaxInstances caps how many VMs may run at once.
+	MaxInstances uint32 `json:"max_instances"`
+	// StartupTimeoutSecs is how long a VM may take to show its first window.
+	StartupTimeoutSecs uint32 `json:"startup_timeout_secs"`
+	// Terminal is the guest-side terminal for Terminal=true entries.
+	Terminal      *string  `json:"terminal"`
+	ExtraQemuArgs []string `json:"extra_qemu_args"`
+}
+
 // FocusSettings mirrors `ironland_config::FocusSettings`: both default off,
 // matching the click-to-focus behavior from before either existed.
 type FocusSettings struct {
@@ -187,6 +212,7 @@ type Config struct {
 	Focus       FocusSettings             `json:"focus"`
 	Lock        LockSettings              `json:"lock"`
 	Session     SessionSettings           `json:"session"`
+	VM          VMSettings                `json:"vm"` // no GUI tab yet; carried through so saving doesn't reset it
 	Performance PerformanceSettings       `json:"performance"`
 	KeyTracker  KeyTrackerSettings        `json:"key_tracker"`
 	Appearance  AppearanceSettings        `json:"appearance"`

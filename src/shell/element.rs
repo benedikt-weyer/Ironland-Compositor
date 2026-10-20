@@ -6,8 +6,8 @@ use smithay::{
         renderer::{
             ImportAll, ImportMem, Renderer, Texture,
             element::{
-                AsRenderElements, Element, Id, solid::SolidColorRenderElement,
-                surface::WaylandSurfaceRenderElement,
+                AsRenderElements, Element, Id, Kind, memory::MemoryRenderBufferRenderElement,
+                solid::SolidColorRenderElement, surface::WaylandSurfaceRenderElement,
             },
         },
     },
@@ -29,7 +29,7 @@ use smithay::{
     output::Output,
     reexports::{
         wayland_protocols::wp::presentation_time::server::wp_presentation_feedback,
-        wayland_server::protocol::wl_surface::WlSurface,
+        wayland_server::{Resource, protocol::wl_surface::WlSurface},
     },
     render_elements,
     utils::{IsAlive, Logical, Physical, Point, Rectangle, Scale, Serial, user_data::UserDataMap},
@@ -38,9 +38,9 @@ use smithay::{
     },
 };
 
-use super::ssd::HEADER_BAR_HEIGHT;
+use super::{ssd::HEADER_BAR_HEIGHT, vm::VmId};
 use crate::{
-    AnvilState,
+    AnvilState, ClientState,
     focus::PointerFocusTarget,
     rounded_corners::{self, GlesCapable, RoundedWindowRenderElement},
     state::Backend,
@@ -524,6 +524,7 @@ render_elements!(
     Window=WaylandSurfaceRenderElement<R>,
     Decoration=SolidColorRenderElement,
     Rounded=RoundedWindowRenderElement<R>,
+    VmBadge=MemoryRenderBufferRenderElement<R>,
 );
 
 impl<R: Renderer> std::fmt::Debug for WindowRenderElement<R> {
@@ -532,6 +533,7 @@ impl<R: Renderer> std::fmt::Debug for WindowRenderElement<R> {
             Self::Window(arg0) => f.debug_tuple("Window").field(arg0).finish(),
             Self::Decoration(arg0) => f.debug_tuple("Decoration").field(arg0).finish(),
             Self::Rounded(_) => f.debug_tuple("Rounded").finish(),
+            Self::VmBadge(_) => f.debug_tuple("VmBadge").finish(),
             Self::_GenericCatcher(arg0) => f.debug_tuple("_GenericCatcher").field(arg0).finish(),
         }
     }
@@ -540,7 +542,7 @@ impl<R: Renderer> std::fmt::Debug for WindowRenderElement<R> {
 impl<R> AsRenderElements<R> for WindowElement
 where
     R: Renderer + ImportAll + ImportMem + GlesCapable,
-    R::TextureId: Clone + Texture + 'static,
+    R::TextureId: Clone + Send + Texture + 'static,
 {
     type RenderElement = WindowRenderElement<R>;
 
@@ -570,17 +572,67 @@ where
             location.y += (scale.y * HEADER_BAR_HEIGHT as f64) as i32;
 
             vec.extend(self.render_surface_elements(renderer, location, scale, alpha));
-            vec.into_iter().map(C::from).collect()
+            // Drawn last-to-first, so the badge goes first to end up on top.
+            let mut elements = self.vm_badge_elements(renderer, location, scale, alpha);
+            elements.extend(vec);
+            elements.into_iter().map(C::from).collect()
         } else {
-            self.render_surface_elements(renderer, location, scale, alpha)
-                .into_iter()
-                .map(C::from)
-                .collect()
+            let mut elements = self.vm_badge_elements(renderer, location, scale, alpha);
+            elements.extend(self.render_surface_elements(renderer, location, scale, alpha));
+            elements.into_iter().map(C::from).collect()
         }
     }
 }
 
 impl WindowElement {
+    /// The VM this window's program runs in, if it was started "as virtual"
+    /// (see `crate::shell::vm`): the VM whose private socket its client
+    /// connected through.
+    pub fn vm_id(&self) -> Option<VmId> {
+        let surface = self.wl_surface()?;
+        surface.client()?.get_data::<ClientState>()?.vm
+    }
+
+    /// The corner badge marking a VM window (see [`crate::vm_badge`]): empty
+    /// for ordinary host windows. Sits in the top-right corner of the window
+    /// content, below the server-side header bar when there is one.
+    fn vm_badge_elements<R>(
+        &self,
+        renderer: &mut R,
+        location: Point<i32, Physical>,
+        scale: Scale<f64>,
+        alpha: f32,
+    ) -> Vec<WindowRenderElement<R>>
+    where
+        R: Renderer + ImportAll + ImportMem + GlesCapable,
+        R::TextureId: Clone + Send + Texture + 'static,
+    {
+        use crate::vm_badge::{BADGE_MARGIN, BADGE_SIZE, badge_buffer};
+
+        if self.vm_id().is_none() {
+            return Vec::new();
+        }
+        let geometry = SpaceElement::geometry(&self.0);
+        let header = if self.decoration_state().is_ssd { HEADER_BAR_HEIGHT } else { 0 };
+        let offset: Point<i32, Logical> = Point::from((
+            geometry.loc.x + geometry.size.w - BADGE_SIZE - BADGE_MARGIN,
+            geometry.loc.y + header + BADGE_MARGIN,
+        ));
+        let position = location.to_f64() + offset.to_f64().to_physical(scale);
+
+        MemoryRenderBufferRenderElement::from_buffer(
+            renderer,
+            position,
+            &badge_buffer(),
+            Some(alpha),
+            None,
+            None,
+            Kind::Unspecified,
+        )
+        .map(|element| vec![WindowRenderElement::VmBadge(element)])
+        .unwrap_or_default()
+    }
+
     /// Renders this window's own surface tree (root toplevel surface, its
     /// subsurfaces, and any popups) - everything `AsRenderElements`
     /// produces except the SSD header bar, which the caller adds
@@ -597,7 +649,7 @@ impl WindowElement {
     ) -> Vec<WindowRenderElement<R>>
     where
         R: Renderer + ImportAll + ImportMem + GlesCapable,
-        R::TextureId: Clone + Texture + 'static,
+        R::TextureId: Clone + Send + Texture + 'static,
     {
         let elements: Vec<WaylandSurfaceRenderElement<R>> =
             AsRenderElements::render_elements(&self.0, renderer, location, scale, alpha);

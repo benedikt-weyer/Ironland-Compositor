@@ -345,6 +345,73 @@ impl Default for SessionSettings {
     }
 }
 
+/// Running programs inside throw-away QEMU virtual machines whose windows
+/// are forwarded to the host desktop (see `shell::vm` in the compositor
+/// crate). Each launch boots its own VM from `image`, in `-snapshot` mode so
+/// nothing the guest writes ever reaches the image and any number of VMs can
+/// share one image. The guest must run an SSH server (key authentication,
+/// reachable as `user` with `ssh_key`) and have `waypipe` installed; the
+/// compositor then runs `waypipe ssh` against it, which turns the guest
+/// application's Wayland windows into ordinary host windows.
+///
+/// Off until `image` is set: with no image the launcher's "launch in VM" key
+/// just reports that VMs aren't configured.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct VmSettings {
+    /// Bootable guest disk image (qcow2 or raw). `None` disables VM launches.
+    pub image: Option<String>,
+    /// Guest RAM, in MiB.
+    pub memory_mb: u32,
+    /// Guest virtual CPU count.
+    pub cpus: u32,
+    /// Guest account `waypipe ssh` logs in as.
+    pub user: String,
+    /// Private key authorized for `user` inside the guest. `None` lets ssh
+    /// pick from the usual places (ssh-agent, `~/.ssh/id_*`).
+    pub ssh_key: Option<String>,
+    /// Use KVM acceleration. Turn off only where /dev/kvm isn't available
+    /// (the guest then runs under plain emulation, far slower).
+    pub kvm: bool,
+    /// Most VMs allowed to run at once; further launches are refused until
+    /// one exits. Every VM costs `memory_mb` of host RAM.
+    pub max_instances: u32,
+    /// How long a VM may take, from being started, to get its application's
+    /// first window on screen (guest boot, SSH login and program start-up
+    /// together) before it's given up on and shut down, in seconds.
+    pub startup_timeout_secs: u32,
+    /// Terminal emulator (inside the guest) used for desktop entries marked
+    /// `Terminal=true`. `None` falls back to the top-level `terminal` setting.
+    pub terminal: Option<String>,
+    /// Extra arguments appended to the `qemu-system-x86_64` command line,
+    /// e.g. `["-cpu", "host"]` or `["-device", "virtio-rng-pci"]`.
+    pub extra_qemu_args: Vec<String>,
+}
+
+impl Default for VmSettings {
+    fn default() -> Self {
+        Self {
+            image: None,
+            memory_mb: 2048,
+            cpus: 2,
+            user: "user".to_string(),
+            ssh_key: None,
+            kvm: true,
+            max_instances: 8,
+            startup_timeout_secs: 180,
+            terminal: None,
+            extra_qemu_args: Vec::new(),
+        }
+    }
+}
+
+impl VmSettings {
+    /// Whether a guest image is configured, i.e. VM launches are possible.
+    pub fn is_configured(&self) -> bool {
+        self.image.as_deref().is_some_and(|image| !image.trim().is_empty())
+    }
+}
+
 /// Where the FPS/frame-time overlay is anchored on screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -456,6 +523,7 @@ struct RawConfig {
     focus: FocusSettings,
     lock: LockSettings,
     session: SessionSettings,
+    vm: VmSettings,
     performance: PerformanceSettings,
     key_tracker: KeyTrackerSettings,
     shortcuts: HashMap<String, Vec<String>>,
@@ -500,6 +568,9 @@ pub struct Config {
     pub lock: LockSettings,
     /// Session bring-up, e.g. starting the shell (see [`SessionSettings`]).
     pub session: SessionSettings,
+    /// Launching programs inside QEMU VMs with host-integrated windows (see
+    /// [`VmSettings`]).
+    pub vm: VmSettings,
     /// FPS overlay and frame stutter analytics (see [`PerformanceSettings`]).
     pub performance: PerformanceSettings,
     /// Key-state overlay for finding stuck keys (see [`KeyTrackerSettings`]).
@@ -543,6 +614,7 @@ impl Default for Config {
             focus: FocusSettings::default(),
             lock: LockSettings::default(),
             session: SessionSettings::default(),
+            vm: VmSettings::default(),
             performance: PerformanceSettings::default(),
             key_tracker: KeyTrackerSettings::default(),
             shortcuts: default_shortcuts(),
@@ -911,6 +983,7 @@ impl Config {
                     focus: raw.focus,
                     lock: raw.lock,
                     session: raw.session,
+                    vm: raw.vm,
                     performance: raw.performance,
                     key_tracker: raw.key_tracker,
                     shortcuts,
@@ -998,6 +1071,7 @@ mod tests {
             focus: FocusSettings::default(),
             lock: LockSettings::default(),
             session: SessionSettings::default(),
+            vm: VmSettings::default(),
             performance: PerformanceSettings::default(),
             key_tracker: KeyTrackerSettings::default(),
             shortcuts,
@@ -1211,6 +1285,34 @@ mod tests {
 
         let raw: RawConfig = toml::from_str("[session]\nstart_shell = true\n").unwrap();
         assert_eq!(raw.session.shell_unit, "desktop-shell.service");
+    }
+
+    #[test]
+    fn vm_is_unconfigured_by_default() {
+        let raw: RawConfig = toml::from_str("").unwrap();
+        assert_eq!(raw.vm, VmSettings::default());
+        assert!(!raw.vm.is_configured());
+        assert_eq!(raw.vm.memory_mb, 2048);
+        assert_eq!(raw.vm.max_instances, 8);
+    }
+
+    #[test]
+    fn vm_settings_parse_and_keep_unset_fields_at_their_defaults() {
+        let raw: RawConfig = toml::from_str(
+            "[vm]\nimage = \"/var/lib/vm/guest.qcow2\"\nmemory_mb = 4096\nextra_qemu_args = [\"-cpu\", \"host\"]\n",
+        )
+        .unwrap();
+        assert!(raw.vm.is_configured());
+        assert_eq!(raw.vm.memory_mb, 4096);
+        assert_eq!(raw.vm.cpus, 2);
+        assert_eq!(raw.vm.user, "user");
+        assert_eq!(raw.vm.extra_qemu_args, vec!["-cpu", "host"]);
+    }
+
+    #[test]
+    fn a_blank_vm_image_counts_as_unconfigured() {
+        let raw: RawConfig = toml::from_str("[vm]\nimage = \"  \"\n").unwrap();
+        assert!(!raw.vm.is_configured());
     }
 
     #[test]

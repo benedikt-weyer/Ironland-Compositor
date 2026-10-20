@@ -267,6 +267,7 @@ const LAUNCHER_WIDTH: i32 = 480;
 const LAUNCHER_ROW_HEIGHT: i32 = 26;
 const LAUNCHER_HEADER_HEIGHT: i32 = 36;
 const LAUNCHER_PADDING: i32 = 10;
+const LAUNCHER_FOOTER_HEIGHT: i32 = 26;
 const LAUNCHER_MAX_ROWS: usize = 8;
 const LAUNCHER_FONT_SCALE: i32 = 2;
 
@@ -275,6 +276,28 @@ const COLOR_HEADER_BG: [u8; 4] = [70, 60, 52, 255];
 const COLOR_SELECTED_BG: [u8; 4] = [120, 90, 40, 255];
 const COLOR_TEXT: [u8; 4] = [235, 230, 225, 255];
 const COLOR_MUTED_TEXT: [u8; 4] = [150, 140, 130, 255];
+const COLOR_ERROR_TEXT: [u8; 4] = [235, 120, 110, 255];
+
+/// What the launcher's bottom line says, and in which style.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FooterLine {
+    /// Key hints (normal colour).
+    Hint(&'static str),
+    /// Key hints with the VM key unavailable (muted).
+    HintNoVm(&'static str),
+    /// Why the last launch attempt failed (error colour).
+    Error(String),
+}
+
+/// Picks the launcher's bottom line: a pending error beats the key hints,
+/// and the hints say plainly when the VM key can't work yet.
+fn footer_line(vm_available: bool, status: Option<&str>) -> FooterLine {
+    match status {
+        Some(message) => FooterLine::Error(message.to_string()),
+        None if vm_available => FooterLine::Hint("Enter: launch   Left: launch in VM"),
+        None => FooterLine::HintNoVm("Enter: launch   Left: VM (not set up)"),
+    }
+}
 
 /// State for the built-in application launcher: a search query over the
 /// user's XDG desktop entries, rendered as an on-screen overlay.
@@ -285,6 +308,12 @@ pub struct LauncherState {
     entries: Vec<DesktopEntry>,
     filtered: Vec<usize>,
     selected: usize,
+    /// Whether launching in a VM can work (an image is configured); only
+    /// changes how the key hint reads. Set by the caller when opening.
+    pub vm_available: bool,
+    /// Error from the last launch attempt, shown instead of the key hints
+    /// until the next keystroke.
+    status: Option<String>,
     buffer: Option<MemoryRenderBuffer>,
     dirty: bool,
 }
@@ -297,6 +326,8 @@ impl Default for LauncherState {
             entries: Vec::new(),
             filtered: Vec::new(),
             selected: 0,
+            vm_available: false,
+            status: None,
             buffer: None,
             dirty: true,
         }
@@ -313,6 +344,7 @@ impl LauncherState {
     pub fn open(&mut self) {
         self.entries = crate::launcher::scan_desktop_entries();
         self.query.clear();
+        self.status = None;
         self.selected = 0;
         self.filtered = crate::launcher::filter_entries(&self.entries, &self.query);
         self.visible = true;
@@ -346,6 +378,7 @@ impl LauncherState {
     fn refresh_filter(&mut self) {
         self.filtered = crate::launcher::filter_entries(&self.entries, &self.query);
         self.selected = 0;
+        self.status = None;
         self.dirty = true;
     }
 
@@ -353,6 +386,7 @@ impl LauncherState {
         if self.filtered.is_empty() {
             return;
         }
+        self.status = None;
         let len = self.filtered.len() as i32;
         let next = (self.selected as i32 + delta).rem_euclid(len);
         self.selected = next as usize;
@@ -370,10 +404,25 @@ impl LauncherState {
         entry
     }
 
+    /// The currently highlighted entry, leaving the launcher open.
+    pub fn selected_entry(&self) -> Option<DesktopEntry> {
+        self.filtered
+            .get(self.selected)
+            .and_then(|&i| self.entries.get(i))
+            .cloned()
+    }
+
+    /// Shows `message` in place of the key hints (until the next keystroke),
+    /// e.g. why a launch failed.
+    pub fn set_status(&mut self, message: impl Into<String>) {
+        self.status = Some(message.into());
+        self.dirty = true;
+    }
+
     /// The logical size of the overlay, so callers can center it on the output.
     pub fn logical_size(&self) -> Size<i32, Logical> {
         let rows = self.filtered.len().clamp(1, LAUNCHER_MAX_ROWS);
-        let height = LAUNCHER_HEADER_HEIGHT + rows as i32 * LAUNCHER_ROW_HEIGHT + LAUNCHER_PADDING * 2;
+        let height = LAUNCHER_HEADER_HEIGHT + rows as i32 * LAUNCHER_ROW_HEIGHT + LAUNCHER_PADDING + LAUNCHER_FOOTER_HEIGHT;
         Size::from((LAUNCHER_WIDTH, height))
     }
 
@@ -419,6 +468,23 @@ impl LauncherState {
                 );
             }
         }
+
+        let footer_y = size.h - LAUNCHER_FOOTER_HEIGHT;
+        canvas.fill_rect(0, footer_y, size.w, LAUNCHER_FOOTER_HEIGHT, COLOR_HEADER_BG);
+        let (text, color) = match footer_line(self.vm_available, self.status.as_deref()) {
+            FooterLine::Hint(text) => (text.to_string(), COLOR_TEXT),
+            FooterLine::HintNoVm(text) => (text.to_string(), COLOR_MUTED_TEXT),
+            FooterLine::Error(message) => (message, COLOR_ERROR_TEXT),
+        };
+        let max_chars = ((size.w - LAUNCHER_PADDING * 2)
+            / ((crate::font::GLYPH_WIDTH as i32 + 1) * LAUNCHER_FONT_SCALE)) as usize;
+        canvas.draw_text(
+            LAUNCHER_PADDING,
+            footer_y + (LAUNCHER_FOOTER_HEIGHT - GLYPH_LINE_HEIGHT * LAUNCHER_FONT_SCALE) / 2,
+            &truncate(&text, max_chars),
+            LAUNCHER_FONT_SCALE,
+            color,
+        );
 
         canvas
     }
@@ -490,4 +556,61 @@ fn truncate(s: &str, max_chars: usize) -> String {
     let mut out: String = s.chars().take(keep).collect();
     out.push_str("..");
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn footer_hints_name_both_launch_keys() {
+        match footer_line(true, None) {
+            FooterLine::Hint(text) => {
+                assert!(text.contains("Enter"));
+                assert!(text.contains("Left"));
+                assert!(text.to_lowercase().contains("vm"));
+            }
+            other => panic!("unexpected footer {other:?}"),
+        }
+    }
+
+    #[test]
+    fn footer_says_when_vms_are_not_set_up() {
+        assert!(matches!(footer_line(false, None), FooterLine::HintNoVm(_)));
+    }
+
+    #[test]
+    fn a_launch_error_replaces_the_hints() {
+        assert_eq!(footer_line(true, Some("boom")), FooterLine::Error("boom".into()));
+    }
+
+    #[test]
+    fn footer_hints_fit_the_launcher_width() {
+        let per_char = (crate::font::GLYPH_WIDTH as i32 + 1) * LAUNCHER_FONT_SCALE;
+        let max_chars = ((LAUNCHER_WIDTH - LAUNCHER_PADDING * 2) / per_char) as usize;
+        for line in [footer_line(true, None), footer_line(false, None)] {
+            let (FooterLine::Hint(text) | FooterLine::HintNoVm(text)) = line else {
+                unreachable!()
+            };
+            assert!(text.chars().count() <= max_chars, "{text:?} is too wide");
+        }
+    }
+
+    #[test]
+    fn status_is_cleared_by_typing_and_navigation() {
+        let mut launcher = LauncherState::default();
+        launcher.set_status("nope");
+        launcher.push_char('a');
+        assert!(launcher.status.is_none());
+
+        launcher.entries = vec![
+            DesktopEntry { id: "a".into(), name: "A".into(), exec: "a".into(), terminal: false },
+            DesktopEntry { id: "b".into(), name: "B".into(), exec: "b".into(), terminal: false },
+        ];
+        launcher.filtered = vec![0, 1];
+        launcher.set_status("nope");
+        launcher.move_selection(1);
+        assert!(launcher.status.is_none());
+        assert_eq!(launcher.selected_entry().unwrap().name, "B");
+    }
 }

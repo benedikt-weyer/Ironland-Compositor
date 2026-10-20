@@ -335,6 +335,7 @@ impl AnvilState<UdevData> {
                     | KeyAction::LauncherUp
                     | KeyAction::LauncherDown
                     | KeyAction::LauncherActivate
+                    | KeyAction::LauncherActivateVm
                     | KeyAction::LauncherClose
                     | KeyAction::ToggleFloating
                     | KeyAction::KillWindow

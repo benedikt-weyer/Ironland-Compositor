@@ -102,6 +102,11 @@
           # there's no Cargo-level way to point it at a store path, so the
           # binary itself needs Xwayland on its PATH instead.
           #
+          # Programs launched "as virtual" (see `src/shell/vm.rs`) shell out
+          # to `qemu-system-x86_64`, `waypipe` and `ssh` by bare name too.
+          # Those are *suffixed* rather than prefixed so a copy the user
+          # already has on PATH wins.
+          #
           # Also installs the `org.freedesktop.impl.portal.GlobalShortcuts`,
           # `org.freedesktop.impl.portal.Screenshot` and
           # `org.freedesktop.impl.portal.ScreenCast` backends' D-Bus
@@ -114,7 +119,8 @@
           # `Exec=` needs this derivation's own `$out`, so they're
           # generated here instead of checked in statically.
           postFixup = ''
-            wrapProgram $out/bin/ironland-compositor --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.xwayland ]}
+            wrapProgram $out/bin/ironland-compositor --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.xwayland ]} \
+              --suffix PATH : ${pkgs.lib.makeBinPath [ pkgs.qemu_kvm pkgs.waypipe pkgs.openssh ]}
             # `ironlandctl outputs detect` shells out to `wayland-info` by
             # bare name to enumerate connected monitors, so it needs
             # wayland-utils on its PATH the same way ironland-compositor
@@ -202,6 +208,11 @@
             rust-analyzer
             rustfmt
             clippy
+            # Running the compositor from the dev shell and launching
+            # programs "as virtual" (`src/shell/vm.rs`).
+            qemu_kvm
+            waypipe
+            openssh
           ] ++ nativeBuildInputs ++ buildInputs;
 
           RUST_SRC_PATH = "${pkgs.rust.packages.stable.rustPlatform.rustLibSrc}";
@@ -240,6 +251,24 @@
         };
       })) // {
       nixosModules.default = import ./nix/module.nix;
+
+      # The guest OS for programs launched "as virtual" (`src/shell/vm.rs`).
+      # Build its disk image with `scripts/build-vm-guest`, which supplies the
+      # ssh public key via `IRONLAND_VM_SSH_PUBKEY` (hence `--impure`); the key
+      # can equally be set through `ironland.vmGuest.authorizedKeys` in a NixOS
+      # config that imports `nixosModules.vm-guest`.
+      nixosModules.vm-guest = import ./nix/vm-guest.nix;
+      nixosConfigurations.vm-guest = nixpkgs.lib.nixosSystem {
+        system = "x86_64-linux";
+        modules = [
+          self.nixosModules.vm-guest
+          ({ lib, ... }: {
+            ironland.vmGuest.authorizedKeys =
+              let key = builtins.getEnv "IRONLAND_VM_SSH_PUBKEY";
+              in lib.optional (key != "") key;
+          })
+        ];
+      };
 
       # A throwaway NixOS VM for exercising the `--tty-udev` backend: it owns
       # its (virtual) DRM/input devices directly, the way real hardware does,

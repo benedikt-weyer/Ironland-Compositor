@@ -4,6 +4,7 @@ cat <<'EOF'
 ironland-compositor scripts
 
   run   Build and run the project (cargo run)
+  build-vm-guest  Build the guest disk image for "launch in VM" (see src/shell/vm.rs)
   help  Show this help message
 
 Scripts live in scripts/ and are on PATH via .envrc (direnv).

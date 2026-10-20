@@ -69,7 +69,18 @@ in
       of bringing up the session, after XWayland is ready and `DISPLAY`/
       `WAYLAND_DISPLAY` are exported, so the shell and everything it launches
       inherit a complete environment; the unit must exist but must not be
-      started by anything else.
+      started by anything else. Under `vm`, launcher entries can be started
+      inside a throw-away QEMU VM (press Left instead of Enter in the
+      launcher) with their windows shown on the desktop like any other:
+      `image` is the bootable guest disk (qcow2/raw; VMs boot a snapshot of
+      it, so it's never modified and one image serves any number of VMs),
+      which must run an SSH server accepting `ssh_key` for `user` (default
+      `"user"`) and have `waypipe` installed; `memory_mb` (default 2048),
+      `cpus` (default 2), `kvm` (default true), `max_instances` (default 8),
+      `startup_timeout_secs` (default 180), `terminal` (the guest's terminal
+      for `Terminal=true` entries, default the top-level `terminal`) and
+      `extra_qemu_args` tune the rest. Nothing happens until `image` is set.
+      `scripts/build-vm-guest` builds a suitable guest image.
     '';
     example = lib.literalExpression ''
       {

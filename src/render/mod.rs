@@ -9,6 +9,7 @@ pub mod key_tracker;
 pub mod perf_overlay;
 pub mod rounded_corners;
 pub mod tint;
+pub mod vm_badge;
 pub mod wallpaper;
 
 use smithay::{

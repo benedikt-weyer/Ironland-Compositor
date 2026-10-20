@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Builds the guest disk image used by "launch in VM" (see src/shell/vm.rs) and
+# prints the config.toml section that points the compositor at it.
+#
+# The image is a minimal NixOS (nix/vm-guest.nix) with sshd and waypipe. It is
+# built for key login only, using a dedicated key pair created on first run.
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+
+dir="${IRONLAND_VM_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/ironland-compositor/vm}"
+key="$dir/id_ed25519"
+image="$dir/guest.qcow2"
+mkdir -p "$dir"
+
+if [ ! -f "$key" ]; then
+  ssh-keygen -q -t ed25519 -N '' -C ironland-vm-guest -f "$key"
+  echo "Created ssh key $key"
+fi
+
+export IRONLAND_VM_SSH_PUBKEY
+IRONLAND_VM_SSH_PUBKEY="$(cat "$key.pub")"
+
+out="$(mktemp -d)/guest"
+nix build --impure .#nixosConfigurations.vm-guest.config.system.build.images.qemu -o "$out"
+
+built=("$out"/*.qcow2)
+install -m 644 "${built[0]}" "$image"
+
+cat <<TOML
+
+Guest image written to $image. Add this to the compositor's config.toml:
+
+[vm]
+image = "$image"
+ssh_key = "$key"
+TOML

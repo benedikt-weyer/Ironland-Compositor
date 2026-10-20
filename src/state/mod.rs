@@ -157,6 +157,10 @@ pub struct ClientState {
     /// the original process could have exited and that pid been recycled -
     /// keeps that race window effectively zero.
     pub capture_identity: std::sync::OnceLock<String>,
+    /// The VM this client belongs to, if it connected through that VM's
+    /// private socket (see `crate::shell::vm`): its windows are the
+    /// "virtual" ones, drawn with a badge.
+    pub vm: Option<crate::shell::vm::VmId>,
 }
 impl ClientData for ClientState {
     /// Notification that a client was initialized
@@ -170,7 +174,7 @@ impl ClientData for ClientState {
 /// "immediately" - right after `insert_client`, not lazily - matters). The
 /// one place every client-accepting socket source in this module should
 /// call through, instead of `display_handle.insert_client` directly.
-fn insert_client_with_identity(
+pub(crate) fn insert_client_with_identity(
     dh: &mut DisplayHandle,
     stream: std::os::unix::net::UnixStream,
     client_state: ClientState,
@@ -273,6 +277,8 @@ pub struct AnvilState<BackendData: Backend + 'static> {
     pub launcher: crate::drawing::LauncherState,
     /// Screen lock (see `crate::lock`).
     pub lock: crate::lock::LockState,
+    /// QEMU VMs hosting programs started "as virtual" (see `crate::shell::vm`).
+    pub vm: crate::shell::vm::VmManager,
     /// Workspace overview overlay (see `crate::overview`).
     pub overview: crate::overview::OverviewState,
     /// Keyboard focus held before the screen was locked, restored on unlock.
@@ -505,6 +511,18 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             })
             .expect("Failed to init lock screen channel");
 
+        // Events from running VMs' readiness probes (see `crate::shell::vm`).
+        let (vm, vm_events) = crate::shell::vm::VmManager::new();
+        handle
+            .insert_source(vm_events, |event, _, data| {
+                if let smithay::reexports::calloop::channel::Event::Msg(event) = event {
+                    match event {
+                        crate::shell::vm::VmEvent::GuestReady(id) => data.vm_guest_ready(id),
+                    }
+                }
+            })
+            .expect("Failed to init VM event channel");
+
         // init globals
         let compositor_state = CompositorState::new::<Self>(&dh);
         let data_device_state = DataDeviceState::new::<Self>(&dh);
@@ -662,6 +680,7 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             show_window_preview: false,
             launcher: crate::drawing::LauncherState::default(),
             lock: crate::lock::LockState::new(lock_result_tx),
+            vm,
             overview: Default::default(),
             focus_before_lock: None,
             wallpaper: crate::wallpaper::Wallpaper::load(config.wallpaper.as_deref()),

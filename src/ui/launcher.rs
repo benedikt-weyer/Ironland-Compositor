@@ -202,6 +202,27 @@ pub fn launch<'a>(
     }
 }
 
+/// The command line to run inside a VM guest for `entry`: its `Exec=`
+/// program and arguments (field codes stripped, see [`parse_exec`]), wrapped
+/// in `<terminal> -e ...` for `Terminal=true` entries just like [`launch`] does
+/// on the host. `terminal` is the guest's terminal emulator command and may
+/// carry its own arguments (`"foot --app-id vm"`). The command is resolved by
+/// the guest, so the program must be installed there.
+pub fn guest_command(entry: &DesktopEntry, terminal: &str) -> Option<Vec<String>> {
+    let (program, args) = parse_exec(&entry.exec, &entry.name)?;
+    let mut command = Vec::new();
+    if entry.terminal {
+        command.extend(terminal.split_whitespace().map(String::from));
+        if command.is_empty() {
+            return None;
+        }
+        command.push("-e".to_string());
+    }
+    command.push(program);
+    command.extend(args);
+    Some(command)
+}
+
 pub fn launch_and_log<'a>(entry: &DesktopEntry, envs: impl IntoIterator<Item = &'a (&'static str, Option<String>)>) {
     if let Err(e) = launch(entry, envs) {
         error!(id = entry.id, err = %e, "Failed to launch application");
@@ -311,6 +332,33 @@ mod tests {
         assert_eq!(parsed.exec, "visible %F");
         assert!(parsed.terminal);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn guest_command_is_the_exec_line_split_into_words() {
+        let mut e = entry("Firefox");
+        e.exec = "firefox %u --new-window".into();
+        assert_eq!(
+            guest_command(&e, "foot").unwrap(),
+            vec!["firefox", "--new-window"]
+        );
+    }
+
+    #[test]
+    fn guest_command_wraps_terminal_apps_in_the_guest_terminal() {
+        let mut e = entry("htop");
+        e.exec = "htop".into();
+        e.terminal = true;
+        assert_eq!(
+            guest_command(&e, "foot --app-id vm").unwrap(),
+            vec!["foot", "--app-id", "vm", "-e", "htop"]
+        );
+        assert!(guest_command(&e, "  ").is_none());
+    }
+
+    #[test]
+    fn guest_command_rejects_an_empty_exec() {
+        assert!(guest_command(&entry("Empty"), "foot").is_none());
     }
 
     #[test]

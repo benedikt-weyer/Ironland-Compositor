@@ -89,6 +89,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             }
 
             KeyAction::ToggleLauncher => {
+                self.launcher.vm_available = self.config.vm.is_configured();
                 self.launcher.toggle();
             }
 
@@ -122,6 +123,8 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                     crate::launcher::launch_and_log(&entry, &envs);
                 }
             }
+
+            KeyAction::LauncherActivateVm => self.launch_selected_in_vm(),
 
             KeyAction::ToggleDecorations => {
                 for element in self.space.elements() {
