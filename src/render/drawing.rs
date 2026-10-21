@@ -284,14 +284,14 @@ const COLOR_ERROR_TEXT: [u8; 4] = [235, 120, 110, 255];
 enum FooterLine {
     /// Key hints (normal colour).
     Hint(&'static str),
-    /// Key hints with the VM keys unavailable (muted).
+    /// Key hints with VM launching unavailable (no guest image; muted).
     HintNoVm(&'static str),
     /// Why the last launch attempt failed (error colour).
     Error(String),
 }
 
 /// The launcher's bottom lines: a pending error beats the key hints, and the
-/// hints say plainly when the VM keys can't work yet. Each line must fit the
+/// hints say plainly when VM launching can't work yet. Each line must fit the
 /// overlay (about 38 characters).
 fn footer_lines(vm_available: bool, status: Option<&str>) -> Vec<FooterLine> {
     match status {
@@ -300,7 +300,7 @@ fn footer_lines(vm_available: bool, status: Option<&str>) -> Vec<FooterLine> {
             FooterLine::Hint("Enter: launch   Left: throw-away VM"),
             FooterLine::Hint("Right: persistent VM (keeps state)"),
         ],
-        None => vec![FooterLine::HintNoVm("Enter: launch   VM keys: not set up")],
+        None => vec![FooterLine::HintNoVm("Enter: launch   VM: no guest image set")],
     }
 }
 
