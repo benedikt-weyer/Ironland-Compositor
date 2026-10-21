@@ -62,8 +62,19 @@ in
       # `src/shell/vm.rs`), taken from the user's ssh-agent or ~/.ssh, so the
       # image carries no key and one build serves every user. Root-only file,
       # hence the root-run command; `authorizedKeys` above still works too.
-      authorizedKeysCommand = "${pkgs.coreutils}/bin/cat /run/credentials/@system/ironland.authorized_keys";
+      # sshd refuses a command whose path has a group-writable parent, which
+      # rules out anything under /nix/store (mode 1775) and any symlink into
+      # it, hence the plain root-owned script in /etc below.
+      authorizedKeysCommand = "/etc/ssh/ironland-authorized-keys";
       authorizedKeysCommandUser = "root";
+    };
+    # A non-symlink `mode` makes NixOS install a real copy rather than a link.
+    environment.etc."ssh/ironland-authorized-keys" = {
+      mode = "0755";
+      text = ''
+        #!/bin/sh
+        exec ${pkgs.coreutils}/bin/cat /run/credentials/@system/ironland.authorized_keys
+      '';
     };
 
     # Lets the compositor set the clock of a guest restored from saved state
