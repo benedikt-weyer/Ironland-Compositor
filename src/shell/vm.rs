@@ -402,6 +402,134 @@ pub fn expand_tilde(path: &str) -> PathBuf {
     }
 }
 
+/// The guest-side name of the credential carrying the authorized keys; the
+/// guest's sshd reads `/run/credentials/@system/<name>` (see `nix/vm-guest.nix`).
+const KEYS_CREDENTIAL: &str = "ironland.authorized_keys";
+
+/// The lines of `text` that look like public keys (`ssh-ed25519 AAAA...`),
+/// which skips comments, blank lines and the ssh-agent's "no identities".
+fn parse_public_keys(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| {
+            let kind = line.split_whitespace().next().unwrap_or("");
+            kind.starts_with("ssh-") || kind.starts_with("ecdsa-") || kind.starts_with("sk-")
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+/// Public keys currently held by the ssh-agent (`$SSH_AUTH_SOCK`), empty if
+/// there is none. Bounded: a stuck agent must not stall the compositor.
+fn agent_public_keys() -> Vec<String> {
+    if std::env::var_os("SSH_AUTH_SOCK").is_none() {
+        return Vec::new();
+    }
+    let Ok(mut child) = Command::new("ssh-add")
+        .arg("-L")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return Vec::new();
+    };
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Vec::new();
+            }
+        }
+    }
+    let mut text = String::new();
+    if let Some(mut out) = child.stdout.take() {
+        let _ = out.read_to_string(&mut text);
+    }
+    parse_public_keys(&text)
+}
+
+/// Public keys the guest should accept for `settings.user`, in order of
+/// preference: the explicit `public_key`/`public_key_file`; else the
+/// `<ssh_key>.pub` next to the configured private key; else
+/// `~/.ssh/id_ed25519.pub` plus every key the ssh-agent holds (`agent` is only
+/// called then). Empty means the guest has to have a key baked in.
+pub fn authorized_keys(
+    settings: &VmSettings,
+    agent: impl FnOnce() -> Vec<String>,
+) -> Vec<String> {
+    let set = |value: &Option<String>| value.clone().filter(|v| !v.trim().is_empty());
+    let read = |path: &Path| match std::fs::read_to_string(path) {
+        Ok(text) => parse_public_keys(&text),
+        Err(err) => {
+            warn!(path = %path.display(), %err, "Could not read the VM public key file");
+            Vec::new()
+        }
+    };
+
+    let mut keys = Vec::new();
+    if let Some(key) = set(&settings.public_key) {
+        keys.extend(parse_public_keys(&key));
+    }
+    if let Some(file) = set(&settings.public_key_file) {
+        keys.extend(read(&expand_tilde(&file)));
+    }
+    if keys.is_empty()
+        && let Some(private) = set(&settings.ssh_key)
+    {
+        let mut path = expand_tilde(&private).into_os_string();
+        path.push(".pub");
+        keys.extend(read(Path::new(&path)));
+    }
+    if keys.is_empty() {
+        let default = expand_tilde("~/.ssh/id_ed25519.pub");
+        if let Ok(text) = std::fs::read_to_string(default) {
+            keys.extend(parse_public_keys(&text));
+        }
+        keys.extend(agent());
+    }
+    let mut seen = std::collections::HashSet::new();
+    keys.retain(|key| seen.insert(key.clone()));
+    keys
+}
+
+/// Standard base64 (with padding).
+fn base64(data: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let n = chunk.iter().enumerate().fold(0u32, |n, (i, b)| n | (*b as u32) << (16 - 8 * i));
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(ALPHABET[(n >> (18 - 6 * i) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+/// QEMU arguments delivering `keys` to the guest as a systemd credential in
+/// an SMBIOS OEM string (the guest's PID 1 imports those into
+/// `/run/credentials/@system`). Base64, so newlines and commas survive
+/// QEMU's option parsing. Empty for no keys.
+pub fn authorized_keys_args(keys: &[String]) -> Vec<String> {
+    if keys.is_empty() {
+        return Vec::new();
+    }
+    let value = base64(format!("{}\n", keys.join("\n")).as_bytes());
+    vec![
+        "-smbios".into(),
+        format!("type=11,value=io.systemd.credential.binary:{KEYS_CREDENTIAL}={value}"),
+    ]
+}
+
 /// What a VM boots from.
 pub enum DiskMode<'a> {
     /// A throw-away snapshot of the base image.
@@ -698,7 +826,7 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
         entry: &DesktopEntry,
         persistent: bool,
     ) -> Result<VmId, VmError> {
-        let settings = self.config.vm.clone();
+        let mut settings = self.config.vm.clone();
         let image = match settings.image.as_deref().filter(|i| !i.trim().is_empty()) {
             Some(image) => expand_tilde(image),
             None => return Err(VmError::NotConfigured),
@@ -709,6 +837,14 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
         if self.vm.len() >= settings.max_instances.max(1) as usize {
             return Err(VmError::TooManyInstances(settings.max_instances.max(1)));
         }
+        // The guest's login key travels with the machine definition (an extra
+        // QEMU argument), so a persistent VM saved under another key is
+        // cold-booted - and picks up the new key - instead of restored.
+        let keys = authorized_keys(&settings, agent_public_keys);
+        if keys.is_empty() {
+            warn!("No public key found for the VM guest (no ssh-agent keys, no ~/.ssh/id_ed25519.pub); login relies on a key baked into the image");
+        }
+        settings.extra_qemu_args.extend(authorized_keys_args(&keys));
         let terminal = settings
             .terminal
             .as_deref()
@@ -1834,5 +1970,79 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64
+    }
+}
+
+#[cfg(test)]
+mod key_tests {
+    use super::*;
+
+    const ED: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample me@host";
+
+    #[test]
+    fn base64_matches_the_rfc_vectors() {
+        for (plain, encoded) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(base64(plain.as_bytes()), encoded, "{plain:?}");
+        }
+    }
+
+    #[test]
+    fn only_key_lines_are_kept() {
+        let text = format!("# comment\n\n{ED}\nThe agent has no identities.\n");
+        assert_eq!(parse_public_keys(&text), vec![ED.to_string()]);
+    }
+
+    #[test]
+    fn explicit_keys_skip_the_agent() {
+        let settings = VmSettings {
+            public_key: Some(ED.into()),
+            ..VmSettings::default()
+        };
+        let keys = authorized_keys(&settings, || panic!("agent must not be asked"));
+        assert_eq!(keys, vec![ED.to_string()]);
+    }
+
+    #[test]
+    fn public_key_file_and_private_key_neighbour_are_read() {
+        let dir = std::env::temp_dir().join(format!("ironland-keys-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("some.pub");
+        std::fs::write(&file, format!("{ED}\n")).unwrap();
+        let from_file = VmSettings {
+            public_key_file: Some(file.display().to_string()),
+            ..VmSettings::default()
+        };
+        assert_eq!(authorized_keys(&from_file, Vec::new), vec![ED.to_string()]);
+
+        let private = dir.join("some");
+        let from_private = VmSettings {
+            ssh_key: Some(private.display().to_string()),
+            ..VmSettings::default()
+        };
+        assert_eq!(authorized_keys(&from_private, Vec::new), vec![ED.to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn default_falls_back_to_the_agent_and_dedups() {
+        let keys = authorized_keys(&VmSettings::default(), || vec![ED.into(), ED.into()]);
+        assert_eq!(keys.iter().filter(|k| *k == ED).count(), 1);
+    }
+
+    #[test]
+    fn keys_become_one_smbios_credential() {
+        assert!(authorized_keys_args(&[]).is_empty());
+        let args = authorized_keys_args(&[ED.to_string()]);
+        assert_eq!(args[0], "-smbios");
+        assert!(args[1].starts_with("type=11,value=io.systemd.credential.binary:ironland.authorized_keys="));
+        assert!(!args[1].contains(' '));
     }
 }

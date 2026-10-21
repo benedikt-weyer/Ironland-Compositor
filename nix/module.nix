@@ -5,6 +5,37 @@ let
   settingsFormat = pkgs.formats.toml { };
 in
 {
+  options.services.ironland-compositor.vm = {
+    enable = lib.mkEnableOption ''
+      launching programs in QEMU VMs (`Left`/`Right` in the launcher). Builds
+      the guest disk image (`nix/vm-guest.nix`) with the system and points
+      `[vm] image` at it. The guest accepts the login key(s) the compositor
+      hands it at boot: `[vm] public_key`/`public_key_file`, else
+      `~/.ssh/id_ed25519.pub` plus whatever the ssh-agent holds, and ssh uses
+      the agent (or `~/.ssh/id_*`) to log in
+    '';
+    user = lib.mkOption {
+      type = lib.types.str;
+      default = "user";
+      description = "Account inside the guest the compositor logs in as.";
+    };
+    extraPackages = lib.mkOption {
+      type = lib.types.listOf lib.types.package;
+      default = [ ];
+      example = lib.literalExpression "[ pkgs.firefox ]";
+      description = ''
+        Programs installed in the guest. A launcher entry started as virtual
+        runs its `Exec=` command *in the guest*, so it has to be installed
+        there under the same command name.
+      '';
+    };
+    image = lib.mkOption {
+      type = lib.types.path;
+      readOnly = true;
+      description = "The built guest disk image (qcow2).";
+    };
+  };
+
   options.services.ironland-compositor.settings = lib.mkOption {
     type = settingsFormat.type;
     default = { };
@@ -85,7 +116,8 @@ in
       `startup_timeout_secs` (default 180), `terminal` (the guest's terminal
       for `Terminal=true` entries, default the top-level `terminal`) and
       `extra_qemu_args` tune the rest. Nothing happens until `image` is set.
-      `scripts/build-vm-guest` builds a suitable guest image.
+      `vm.enable` (a separate NixOS option) builds the guest image and sets
+      `image`; `scripts/build-vm-guest` builds one by hand.
     '';
     example = lib.literalExpression ''
       {
@@ -112,6 +144,30 @@ in
   # against; the compositor authenticates as the user it runs as, using the
   # service name `ironland-compositor` (see `src/ui/lock.rs`).
   config.security.pam.services.ironland-compositor = { };
+
+  config.services.ironland-compositor.vm.image =
+    let
+      guest = import (pkgs.path + "/nixos/lib/eval-config.nix") {
+        system = pkgs.stdenv.hostPlatform.system;
+        modules = [
+          ./vm-guest.nix
+          {
+            ironland.vmGuest.user = cfg.vm.user;
+            ironland.vmGuest.extraPackages = cfg.vm.extraPackages;
+          }
+        ];
+      };
+      images = guest.config.system.build.images.qemu;
+    in
+    # The image builder emits a directory holding the one qcow2.
+    pkgs.runCommand "ironland-vm-guest.qcow2" { } ''
+      ln -s ${images}/*.qcow2 $out
+    '';
+
+  config.services.ironland-compositor.settings.vm = lib.mkIf cfg.vm.enable {
+    image = toString cfg.vm.image;
+    user = cfg.vm.user;
+  };
 
   config.environment.etc."ironland-compositor/config.toml".source =
     settingsFormat.generate "ironland-compositor-config.toml" cfg.settings;

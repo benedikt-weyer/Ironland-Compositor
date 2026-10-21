@@ -370,6 +370,14 @@ pub struct VmSettings {
     /// Private key authorized for `user` inside the guest. `None` lets ssh
     /// pick from the usual places (ssh-agent, `~/.ssh/id_*`).
     pub ssh_key: Option<String>,
+    /// Public key(s) the guest should accept for `user`, as in an
+    /// `authorized_keys` file (one per line). The compositor hands them to the
+    /// guest at boot, so the image needn't have a key baked in.
+    pub public_key: Option<String>,
+    /// File holding the public key(s), like `public_key`. When neither is
+    /// set, the key is `<ssh_key>.pub`, else `~/.ssh/id_ed25519.pub` plus
+    /// whatever the ssh-agent (`$SSH_AUTH_SOCK`) holds.
+    pub public_key_file: Option<String>,
     /// Use KVM acceleration. Turn off only where /dev/kvm isn't available
     /// (the guest then runs under plain emulation, far slower).
     pub kvm: bool,
@@ -400,6 +408,8 @@ impl Default for VmSettings {
             cpus: 2,
             user: "user".to_string(),
             ssh_key: None,
+            public_key: None,
+            public_key_file: None,
             kvm: true,
             max_instances: 8,
             startup_timeout_secs: 180,

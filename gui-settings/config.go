@@ -128,7 +128,10 @@ type VMSettings struct {
 	User string `json:"user"`
 	// SSHKey is the private key authorized for User in the guest.
 	SSHKey *string `json:"ssh_key"`
-	KVM    bool    `json:"kvm"`
+	// PublicKey / PublicKeyFile are the public key(s) the guest accepts.
+	PublicKey     *string `json:"public_key"`
+	PublicKeyFile *string `json:"public_key_file"`
+	KVM           bool    `json:"kvm"`
 	// MaxInstances caps how many VMs may run at once.
 	MaxInstances uint32 `json:"max_instances"`
 	// StartupTimeoutSecs is how long a VM may take to show its first window.

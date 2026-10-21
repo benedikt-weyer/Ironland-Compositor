@@ -57,6 +57,13 @@ in
         KbdInteractiveAuthentication = false;
         PermitRootLogin = "no";
       };
+      # The compositor hands the login key(s) over at boot as a systemd
+      # credential (an SMBIOS OEM string, see `authorized_keys_args` in
+      # `src/shell/vm.rs`), taken from the user's ssh-agent or ~/.ssh, so the
+      # image carries no key and one build serves every user. Root-only file,
+      # hence the root-run command; `authorizedKeys` above still works too.
+      authorizedKeysCommand = "${pkgs.coreutils}/bin/cat /run/credentials/@system/ironland.authorized_keys";
+      authorizedKeysCommandUser = "root";
     };
 
     # Lets the compositor set the clock of a guest restored from saved state
