@@ -1,17 +1,17 @@
-//! Persistence for VMs started with the launcher's Right key (see
-//! [`super::vm`]): a per-application qcow2 overlay on top of `vm.image` plus a
+//! Persistence for VMs started from the launcher's persistent tab (see
+//! [`super::vm`]): a per-application qcow2 overlay on top of the application's own image (`vm.programs`) plus a
 //! QEMU internal snapshot of the guest's disk *and memory*.
 //!
 //! The first launch of an application cold-boots. When its program exits
 //! cleanly the compositor asks QEMU, over QMP, to `savevm` and quit; the next
 //! launch of the same application starts QEMU with `-loadvm`, so the guest
 //! resumes where it was (fast, no boot) with every file the previous session
-//! wrote still there. Launches with the Left key never touch any of this.
+//! wrote still there. Launches from the throw-away tab never touch any of this.
 //!
 //! Layout, one directory per application under [`state_root`]:
 //!
 //! ```text
-//! <state_root>/<key>/disk.qcow2   overlay; backing file is vm.image
+//! <state_root>/<key>/disk.qcow2   overlay; backing file is the application's image
 //! <state_root>/<key>/meta.json    [`PersistMeta`]: what the overlay is valid for
 //! ```
 //!

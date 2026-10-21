@@ -4,7 +4,7 @@
 //!
 //! Lets the shell's launcher start a desktop entry in a VM (see
 //! `crate::shell::vm`) the same way the compositor's own launcher overlay does
-//! with its Left/Right keys. A client names an application by desktop entry
+//! with its VM tabs. A client names an application by desktop entry
 //! id; the compositor resolves that against the entries installed on the host
 //! ([`crate::launcher::find_entry`]) and runs the entry's own `Exec` in the
 //! guest, so the protocol can't be used to run arbitrary commands.
@@ -19,7 +19,7 @@
 //! (security-context) clients.
 
 use smithay::reexports::wayland_server::{
-    Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, WEnum,
+    Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource, WEnum,
     backend::{ClientId, GlobalId},
 };
 use smithay::wayland::{Dispatch2, GlobalDispatch2};
@@ -37,8 +37,9 @@ use crate::{
 /// depending on `AnvilState` (and its `Backend` type parameter) directly.
 pub trait VmLaunchHandler: 'static {
     fn vm_launch_state(&mut self) -> &mut VmLaunchState;
-    /// Whether a guest image is configured, i.e. launches can be attempted.
-    fn vm_launch_configured(&self) -> bool;
+    /// The programs (desktop entry ids without `.desktop`) that have a VM set
+    /// up, i.e. can be launched.
+    fn vm_launch_programs(&self) -> Vec<String>;
     /// Starts the desktop entry `entry_id` in a VM.
     fn vm_launch_entry(&mut self, entry_id: &str, persistent: bool) -> Result<VmId, Refusal>;
     /// Hands `watcher` to the running VM `vm`, to be told how it goes.
@@ -64,7 +65,7 @@ impl Refusal {
 impl From<&VmError> for Refusal {
     fn from(err: &VmError) -> Self {
         let error = match err {
-            VmError::NotConfigured => Error::NotConfigured,
+            VmError::NotConfigured(_) => Error::NotConfigured,
             VmError::ImageMissing(_) => Error::ImageMissing,
             VmError::TooManyInstances(_) => Error::TooMany,
             VmError::NoCommand => Error::NoCommand,
@@ -117,6 +118,9 @@ impl Watcher {
 pub struct VmLaunchState {
     global: GlobalId,
     managers: Vec<IronlandVmLauncherV1>,
+    /// The list last announced to the clients (sorted), to tell when it
+    /// changed.
+    programs: Vec<String>,
 }
 
 impl VmLaunchState {
@@ -124,10 +128,11 @@ impl VmLaunchState {
     where
         D: GlobalDispatch<IronlandVmLauncherV1, GlobalData> + 'static,
     {
-        let global = dh.create_global::<D, IronlandVmLauncherV1, _>(1, GlobalData);
+        let global = dh.create_global::<D, IronlandVmLauncherV1, _>(2, GlobalData);
         VmLaunchState {
             global,
             managers: Vec::new(),
+            programs: Vec::new(),
         }
     }
 
@@ -136,12 +141,31 @@ impl VmLaunchState {
         self.global.clone()
     }
 
-    /// Tells every bound client whether VM launches can work, after that
-    /// changed (the `[vm]` config gained or lost its image).
-    pub fn broadcast_availability(&self, configured: bool) {
-        for manager in &self.managers {
-            manager.availability(configured as u32);
+    /// Tells every bound client which programs can be launched in a VM, if
+    /// that differs from what they were last told (the `[vm]` config changed,
+    /// or VM images were installed or removed).
+    pub fn update_programs(&mut self, mut programs: Vec<String>) {
+        programs.sort();
+        programs.dedup();
+        if programs == self.programs {
+            return;
         }
+        self.programs = programs;
+        for manager in &self.managers {
+            announce(manager, &self.programs);
+        }
+    }
+}
+
+/// Sends `manager` the current state: whether anything is launchable, and
+/// (from version 2) which programs.
+fn announce(manager: &IronlandVmLauncherV1, programs: &[String]) {
+    manager.availability(!programs.is_empty() as u32);
+    if manager.version() >= 2 {
+        for program in programs {
+            manager.program(program.clone());
+        }
+        manager.programs_done();
     }
 }
 
@@ -176,8 +200,14 @@ where
         data_init: &mut DataInit<'_, D>,
     ) {
         let resource = data_init.init(resource, GlobalData);
-        resource.availability(state.vm_launch_configured() as u32);
-        state.vm_launch_state().managers.push(resource);
+        // What a client is told on binding is the live list, which may be
+        // newer than the last one broadcast (images appear in /etc without
+        // the config changing).
+        let programs = state.vm_launch_programs();
+        state.vm_launch_state().update_programs(programs);
+        let known = state.vm_launch_state();
+        announce(&resource, &known.programs);
+        known.managers.push(resource);
     }
 
     fn can_view(&self, client: &Client) -> bool {
@@ -252,7 +282,7 @@ mod tests {
     #[test]
     fn every_vm_error_maps_to_a_distinct_protocol_error_with_a_short_message() {
         let errors = [
-            (VmError::NotConfigured, Error::NotConfigured),
+            (VmError::NotConfigured("A".into()), Error::NotConfigured),
             (VmError::ImageMissing("/x".into()), Error::ImageMissing),
             (VmError::TooManyInstances(2), Error::TooMany),
             (VmError::NoCommand, Error::NoCommand),
@@ -332,13 +362,13 @@ mod wire_tests {
         Running,
         Saving,
         Finished(Finish),
-        SetConfigured(bool),
+        SetPrograms(Vec<&'static str>),
         Stop,
     }
 
     struct TestState {
         vm: VmLaunchState,
-        configured: bool,
+        programs: Vec<String>,
         launches: Arc<Mutex<Vec<(String, bool)>>>,
         watchers: Vec<Watcher>,
     }
@@ -347,8 +377,8 @@ mod wire_tests {
         fn vm_launch_state(&mut self) -> &mut VmLaunchState {
             &mut self.vm
         }
-        fn vm_launch_configured(&self) -> bool {
-            self.configured
+        fn vm_launch_programs(&self) -> Vec<String> {
+            self.programs.clone()
         }
         fn vm_launch_entry(&mut self, entry_id: &str, persistent: bool) -> Result<VmId, Refusal> {
             self.launches
@@ -384,7 +414,7 @@ mod wire_tests {
                 let mut display = Display::<TestState>::new().unwrap();
                 let mut state = TestState {
                     vm: VmLaunchState::new::<TestState>(&display.handle()),
-                    configured: true,
+                    programs: vec!["foot".to_string(), "Alacritty".to_string()],
                     launches: launches_in_thread,
                     watchers: Vec::new(),
                 };
@@ -403,9 +433,9 @@ mod wire_tests {
                             Command::Finished(f) => {
                                 state.watchers.iter().for_each(|w| w.finished(f))
                             }
-                            Command::SetConfigured(c) => {
-                                state.configured = c;
-                                state.vm.broadcast_availability(c);
+                            Command::SetPrograms(programs) => {
+                                state.programs = programs.iter().map(|p| p.to_string()).collect();
+                                state.vm.update_programs(state.programs.clone());
                             }
                             Command::Stop => return,
                         }
@@ -473,8 +503,13 @@ mod wire_tests {
             _: &Connection,
             _: &QueueHandle<Self>,
         ) {
-            let c_launcher::Event::Availability { configured } = event;
-            app.log.push(format!("availability {configured}"));
+            app.log.push(match event {
+                c_launcher::Event::Availability { configured } => {
+                    format!("availability {configured}")
+                }
+                c_launcher::Event::Program { entry } => format!("program {entry}"),
+                c_launcher::Event::ProgramsDone => "programs_done".to_string(),
+            });
         }
     }
 
@@ -509,12 +544,21 @@ mod wire_tests {
     impl Client {
         /// Connects over `stream` and binds the launcher global.
         fn bind(stream: UnixStream) -> Option<Client> {
+            Self::bind_versions(stream, 1..=2)
+        }
+
+        /// Like [`Self::bind`], but binding a version in `versions` (the
+        /// newest the server offers is used).
+        fn bind_versions(
+            stream: UnixStream,
+            versions: std::ops::RangeInclusive<u32>,
+        ) -> Option<Client> {
             let conn = Connection::from_socket(stream).unwrap();
             let (globals, mut queue) = registry_queue_init::<App>(&conn).unwrap();
             let mut app = App::default();
             queue.roundtrip(&mut app).unwrap();
             let launcher = globals
-                .bind::<c_launcher::IronlandVmLauncherV1, _, _>(&queue.handle(), 1..=1, ())
+                .bind::<c_launcher::IronlandVmLauncherV1, _, _>(&queue.handle(), versions, ())
                 .ok()?;
             Some(Client {
                 conn,
@@ -546,15 +590,24 @@ mod wire_tests {
         UnixStream::pair().unwrap()
     }
 
+    /// What a version 2 client is told on binding, with the test server's
+    /// programs (sorted).
+    const HELLO: [&str; 4] = [
+        "availability 1",
+        "program Alacritty",
+        "program foot",
+        "programs_done",
+    ];
+
     #[test]
-    fn binding_reports_availability_and_a_launch_reports_progress() {
+    fn binding_reports_the_programs_and_a_launch_reports_progress() {
         let (client_end, server_end) = pair();
         let server = Server::start(vec![(server_end, ClientState::default())]);
         let mut client = Client::bind(client_end).expect("the global should be advertised");
-        assert_eq!(client.wait_for_log(1), ["availability 1"]);
+        assert_eq!(client.wait_for_log(4), HELLO);
 
         let _launch = client.launch("org.mozilla.firefox", c_launcher::Mode::Persistent);
-        assert_eq!(client.wait_for_log(2)[1], "starting 7");
+        assert_eq!(client.wait_for_log(5)[4], "starting 7");
         assert_eq!(
             *server.launches.lock().unwrap(),
             [("org.mozilla.firefox".to_string(), true)]
@@ -564,9 +617,20 @@ mod wire_tests {
         server.send(Command::Saving);
         server.send(Command::Finished(Finish::Saved));
         assert_eq!(
-            client.wait_for_log(5)[2..],
+            client.wait_for_log(8)[5..],
             ["running", "saving", "finished Saved"]
         );
+    }
+
+    #[test]
+    fn a_version_1_client_only_hears_availability() {
+        let (client_end, server_end) = pair();
+        let _server = Server::start(vec![(server_end, ClientState::default())]);
+        let mut client = Client::bind_versions(client_end, 1..=1).unwrap();
+        assert_eq!(client.wait_for_log(1), ["availability 1"]);
+        std::thread::sleep(Duration::from_millis(50));
+        client.queue.roundtrip(&mut client.app).unwrap();
+        assert_eq!(client.app.log, ["availability 1"]);
     }
 
     #[test]
@@ -575,7 +639,7 @@ mod wire_tests {
         let server = Server::start(vec![(server_end, ClientState::default())]);
         let mut client = Client::bind(client_end).unwrap();
         let _launch = client.launch("foot", c_launcher::Mode::Throwaway);
-        client.wait_for_log(2);
+        client.wait_for_log(5);
         assert_eq!(
             *server.launches.lock().unwrap(),
             [("foot".to_string(), false)]
@@ -590,39 +654,59 @@ mod wire_tests {
 
         let _a = client.launch("missing", c_launcher::Mode::Throwaway);
         let _b = client.launch("busy", c_launcher::Mode::Persistent);
-        let log = client.wait_for_log(3);
-        assert!(log[1].starts_with("failed UnknownEntry"), "{log:?}");
-        assert!(log[1].contains("missing"), "{log:?}");
-        assert!(log[2].starts_with("failed AlreadyRunning"), "{log:?}");
+        let log = client.wait_for_log(6);
+        assert!(log[4].starts_with("failed UnknownEntry"), "{log:?}");
+        assert!(log[4].contains("missing"), "{log:?}");
+        assert!(log[5].starts_with("failed AlreadyRunning"), "{log:?}");
         assert_eq!(log.iter().filter(|l| l.starts_with("starting")).count(), 0);
     }
 
     #[test]
-    fn availability_follows_the_configuration() {
+    fn the_program_list_follows_the_configuration() {
         let (client_end, server_end) = pair();
         let server = Server::start(vec![(server_end, ClientState::default())]);
         let mut client = Client::bind(client_end).unwrap();
-        server.send(Command::SetConfigured(false));
-        server.send(Command::SetConfigured(true));
+        client.wait_for_log(4);
+        server.send(Command::SetPrograms(vec![]));
+        server.send(Command::SetPrograms(vec!["htop"]));
         assert_eq!(
-            client.wait_for_log(3),
-            ["availability 1", "availability 0", "availability 1"]
+            client.wait_for_log(9)[4..],
+            [
+                "availability 0",
+                "programs_done",
+                "availability 1",
+                "program htop",
+                "programs_done"
+            ]
         );
     }
 
     #[test]
-    fn destroying_the_manager_stops_availability_updates() {
+    fn an_unchanged_program_list_is_not_announced_again() {
         let (client_end, server_end) = pair();
         let server = Server::start(vec![(server_end, ClientState::default())]);
         let mut client = Client::bind(client_end).unwrap();
-        client.wait_for_log(1);
+        client.wait_for_log(4);
+        // Same programs as the server started with, in another order.
+        server.send(Command::SetPrograms(vec!["foot", "Alacritty"]));
+        std::thread::sleep(Duration::from_millis(50));
+        client.queue.roundtrip(&mut client.app).unwrap();
+        assert_eq!(client.app.log, HELLO);
+    }
+
+    #[test]
+    fn destroying_the_manager_stops_program_updates() {
+        let (client_end, server_end) = pair();
+        let server = Server::start(vec![(server_end, ClientState::default())]);
+        let mut client = Client::bind(client_end).unwrap();
+        client.wait_for_log(4);
         client.launcher.destroy();
         client.conn.flush().unwrap();
         std::thread::sleep(Duration::from_millis(50));
-        server.send(Command::SetConfigured(false));
+        server.send(Command::SetPrograms(vec![]));
         std::thread::sleep(Duration::from_millis(50));
         client.queue.roundtrip(&mut client.app).unwrap();
-        assert_eq!(client.app.log, ["availability 1"]);
+        assert_eq!(client.app.log, HELLO);
     }
 
     #[test]

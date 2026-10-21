@@ -89,7 +89,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             }
 
             KeyAction::ToggleLauncher => {
-                self.launcher.vm_available = self.config.vm.is_configured();
+                self.launcher.set_vm_programs(self.config.vm.all_programs().into_keys());
                 self.launcher.toggle();
             }
 
@@ -117,15 +117,19 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                 self.launcher.close();
             }
 
-            KeyAction::LauncherActivate => {
-                if let Some(entry) = self.launcher.activate() {
-                    let envs: Vec<_> = self.compositor_envs().collect();
-                    crate::launcher::launch_and_log(&entry, &envs);
+            KeyAction::LauncherActivate => match self.launcher.tab() {
+                crate::drawing::LauncherTab::Apps => {
+                    if let Some(entry) = self.launcher.activate() {
+                        let envs: Vec<_> = self.compositor_envs().collect();
+                        crate::launcher::launch_and_log(&entry, &envs);
+                    }
                 }
-            }
+                crate::drawing::LauncherTab::Vm => self.launch_selected_in_vm(false),
+                crate::drawing::LauncherTab::Persistent => self.launch_selected_in_vm(true),
+            },
 
-            KeyAction::LauncherActivateVm => self.launch_selected_in_vm(false),
-            KeyAction::LauncherActivateVmPersistent => self.launch_selected_in_vm(true),
+            KeyAction::LauncherTabLeft => self.launcher.switch_tab(-1),
+            KeyAction::LauncherTabRight => self.launcher.switch_tab(1),
 
             KeyAction::ToggleDecorations => {
                 for element in self.space.elements() {

@@ -5,19 +5,28 @@ let
   settingsFormat = pkgs.formats.toml { };
 in
 {
+  imports = [
+    (lib.mkRemovedOptionModule [ "services" "ironland-compositor" "vm" "extraPackages" ] ''
+      A VM now runs exactly one program, installed in its own image: list the
+      packages per program in `services.ironland-compositor.vm.programs.<entry id>.packages`.
+    '')
+  ];
+
   options.services.ironland-compositor.vm = {
     enable = lib.mkOption {
       type = lib.types.bool;
       default = true;
       description = ''
-        Launching programs in QEMU VMs (`Left`/`Right` in the launcher).
-        Builds the guest disk image (`nix/vm-guest.nix`) with the system and
-        links it at `/etc/ironland-compositor/guest.qcow2`, which the
-        compositor uses whenever `[vm] image` is unset. The guest accepts the
-        login key(s) the compositor hands it at boot: `[vm] public_key`/
-        `public_key_file`, else `~/.ssh/id_ed25519.pub` plus whatever the
-        ssh-agent holds, and ssh uses the agent (or `~/.ssh/id_*`) to log in.
-        On by default; set to false to skip building the guest image.
+        Launching programs in QEMU VMs (the launcher's VM tabs, reached with
+        the Left/Right arrow keys). Builds one guest disk image per entry of
+        `programs` (`nix/vm-guest.nix`) with the system and links it at
+        `/etc/ironland-compositor/vm/<entry id>.qcow2`, where the compositor
+        finds it whenever `[vm.programs]` doesn't name another. The guest
+        accepts the login key(s) the compositor hands it at boot:
+        `[vm] public_key`/`public_key_file`, else `~/.ssh/id_ed25519.pub`
+        plus whatever the ssh-agent holds, and ssh uses the agent (or
+        `~/.ssh/id_*`) to log in. On by default; set to false to skip
+        building the guest images.
       '';
     };
     user = lib.mkOption {
@@ -25,20 +34,40 @@ in
       default = "user";
       description = "Account inside the guest the compositor logs in as.";
     };
-    extraPackages = lib.mkOption {
-      type = lib.types.listOf lib.types.package;
-      default = [ ];
-      example = lib.literalExpression "[ pkgs.firefox ]";
+    programs = lib.mkOption {
+      default = { };
+      type = lib.types.attrsOf (lib.types.submodule {
+        options.packages = lib.mkOption {
+          type = lib.types.listOf lib.types.package;
+          example = lib.literalExpression "[ pkgs.alacritty ]";
+          description = ''
+            What is installed in this program's VM: the program itself, under
+            the command name its desktop entry's `Exec=` uses, and anything it
+            needs. Nothing else is in the image (besides `waypipe` and an SSH
+            server), so each VM starts with just its one program.
+          '';
+        };
+      });
+      example = lib.literalExpression ''
+        {
+          Alacritty.packages = [ pkgs.alacritty ];
+          "org.gnome.Calculator".packages = [ pkgs.gnome-calculator ];
+        }
+      '';
       description = ''
-        Programs installed in the guest. A launcher entry started as virtual
-        runs its `Exec=` command *in the guest*, so it has to be installed
-        there under the same command name.
+        The programs that can be started in a VM, by desktop entry id (the
+        `.desktop` file name without the suffix, matching what the launcher
+        lists: `Alacritty` for `Alacritty.desktop`). Each gets its own guest
+        image with exactly the given packages installed, started from the
+        launcher's VM tabs. Only the programs named here appear under those
+        tabs, and a program's desktop entry still has to be installed on the
+        host, since the launcher reads it from there.
       '';
     };
-    image = lib.mkOption {
-      type = lib.types.path;
+    images = lib.mkOption {
+      type = lib.types.attrsOf lib.types.path;
       readOnly = true;
-      description = "The built guest disk image (qcow2).";
+      description = "The built guest disk images (qcow2), by program.";
     };
   };
 
@@ -106,24 +135,26 @@ in
       of bringing up the session, after XWayland is ready and `DISPLAY`/
       `WAYLAND_DISPLAY` are exported, so the shell and everything it launches
       inherit a complete environment; the unit must exist but must not be
-      started by anything else. Under `vm`, launcher entries can be started
-      inside a throw-away QEMU VM (press Left instead of Enter in the
-      launcher) with their windows shown on the desktop like any other (Right
-      starts a *persistent* VM instead: its disk and memory are saved when the
-      program exits and restored on the next persistent launch of that
-      application, keeping its files and starting in about a second; they live
-      under `state_dir`, default
-      `~/.local/share/ironland-compositor/vm/persistent`):
-      `image` is the bootable guest disk (qcow2/raw; VMs boot a snapshot of
-      it, so it's never modified and one image serves any number of VMs),
-      which must run an SSH server accepting `ssh_key` for `user` (default
-      `"user"`) and have `waypipe` installed; `memory_mb` (default 2048),
-      `cpus` (default 2), `kvm` (default true), `max_instances` (default 8),
+      started by anything else. Under `vm`, programs can be started inside
+      a QEMU VM from the launcher's VM tabs (Left/Right in the launcher),
+      with their windows shown on the desktop like any other. A VM runs one
+      program and has its own guest image with only that installed: `programs`
+      maps a desktop entry id to its image, in addition to the images the
+      system provides in `/etc/ironland-compositor/vm`. The left tab starts a
+      throw-away VM (VMs boot a snapshot of the image, so it's never modified);
+      the right tab starts a *persistent* one, whose disk and memory are saved
+      when the program exits and restored on the next persistent launch of
+      that application, keeping its files and starting in about a second (they
+      live under `state_dir`, default
+      `~/.local/share/ironland-compositor/vm/persistent`). A guest image must
+      run an SSH server accepting `ssh_key` for `user` (default `"user"`) and
+      have `waypipe` installed. `memory_mb` (default 2048), `cpus` (default
+      2), `kvm` (default true), `max_instances` (default 8),
       `startup_timeout_secs` (default 180), `terminal` (the guest's terminal
       for `Terminal=true` entries, default the top-level `terminal`) and
-      `extra_qemu_args` tune the rest. Nothing happens until `image` is set.
-      `vm.enable` (a separate NixOS option) builds the guest image and sets
-      `image`; `scripts/build-vm-guest` builds one by hand.
+      `extra_qemu_args` tune the rest. Nothing is offered until a program is
+      set up. `vm.programs` (a separate NixOS option) builds the guest images;
+      `scripts/build-vm-guest` builds one by hand.
     '';
     example = lib.literalExpression ''
       {
@@ -151,7 +182,8 @@ in
   # service name `ironland-compositor` (see `src/ui/lock.rs`).
   config.security.pam.services.ironland-compositor = { };
 
-  config.services.ironland-compositor.vm.image =
+  config.services.ironland-compositor.vm.images = lib.mapAttrs (
+    name: program:
     let
       guest = import (pkgs.path + "/nixos/lib/eval-config.nix") {
         system = pkgs.stdenv.hostPlatform.system;
@@ -159,27 +191,35 @@ in
           ./vm-guest.nix
           {
             ironland.vmGuest.user = cfg.vm.user;
-            ironland.vmGuest.extraPackages = cfg.vm.extraPackages;
+            ironland.vmGuest.packages = program.packages;
           }
         ];
       };
       images = guest.config.system.build.images.qemu;
     in
     # The image builder emits a directory holding the one qcow2.
-    pkgs.runCommand "ironland-vm-guest.qcow2" { } ''
+    pkgs.runCommand "ironland-vm-${name}.qcow2" { } ''
       ln -s ${images}/*.qcow2 $out
-    '';
+    ''
+  ) cfg.vm.programs;
 
-  # Not `settings.vm.image`: a user's own config.toml replaces the one in
-  # /etc wholesale, which would hide the image. The compositor looks here
-  # whenever `[vm] image` is unset (`ironland_config::SYSTEM_VM_IMAGE`).
-  config.environment.etc."ironland-compositor/guest.qcow2" = lib.mkIf cfg.vm.enable {
-    source = cfg.vm.image;
-  };
+  # Not `settings.vm.programs`: a user's own config.toml replaces the one in
+  # /etc wholesale, which would hide the images. The compositor looks here
+  # for programs besides those in `[vm.programs]`
+  # (`ironland_config::SYSTEM_VM_DIR`).
+  config.environment.etc = lib.mkMerge [
+    (lib.mkIf cfg.vm.enable (
+      lib.mapAttrs' (
+        name: image: lib.nameValuePair "ironland-compositor/vm/${name}.qcow2" { source = image; }
+      ) cfg.vm.images
+    ))
+    {
+      "ironland-compositor/config.toml".source =
+        settingsFormat.generate "ironland-compositor-config.toml" cfg.settings;
+    }
+  ];
+
   config.services.ironland-compositor.settings.vm = lib.mkIf cfg.vm.enable {
     user = cfg.vm.user;
   };
-
-  config.environment.etc."ironland-compositor/config.toml".source =
-    settingsFormat.generate "ironland-compositor-config.toml" cfg.settings;
 }

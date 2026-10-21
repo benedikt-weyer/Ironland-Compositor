@@ -258,20 +258,26 @@
       })) // {
       nixosModules.default = import ./nix/module.nix;
 
-      # The guest OS for programs launched "as virtual" (`src/shell/vm.rs`).
-      # Build its disk image with `scripts/build-vm-guest`, which supplies the
-      # ssh public key via `IRONLAND_VM_SSH_PUBKEY` (hence `--impure`); the key
-      # can equally be set through `ironland.vmGuest.authorizedKeys` in a NixOS
-      # config that imports `nixosModules.vm-guest`.
+      # The guest OS for one program launched "as virtual"
+      # (`src/shell/vm.rs`). Build its disk image with
+      # `scripts/build-vm-guest`, which supplies the ssh public key via
+      # `IRONLAND_VM_SSH_PUBKEY` and the program's nixpkgs package names via
+      # `IRONLAND_VM_PACKAGES` (hence `--impure`); both can equally be set
+      # through `ironland.vmGuest.authorizedKeys`/`.packages` in a NixOS config
+      # that imports `nixosModules.vm-guest`.
       nixosModules.vm-guest = import ./nix/vm-guest.nix;
       nixosConfigurations.vm-guest = nixpkgs.lib.nixosSystem {
         system = "x86_64-linux";
         modules = [
           self.nixosModules.vm-guest
-          ({ lib, ... }: {
+          ({ lib, pkgs, ... }: {
             ironland.vmGuest.authorizedKeys =
               let key = builtins.getEnv "IRONLAND_VM_SSH_PUBKEY";
               in lib.optional (key != "") key;
+            ironland.vmGuest.packages =
+              map (name: pkgs.${name})
+                (lib.filter (name: name != "")
+                  (lib.splitString " " (builtins.getEnv "IRONLAND_VM_PACKAGES")));
           })
         ];
       };
@@ -302,7 +308,7 @@
             };
 
             # Nested VMs here run without KVM and `run-vm` shouldn't wait on
-            # building a guest image nobody launches from.
+            # building guest images nobody launches from.
             services.ironland-compositor.vm.enable = false;
 
             users.users.dev = {

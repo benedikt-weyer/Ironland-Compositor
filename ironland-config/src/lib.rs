@@ -22,7 +22,11 @@
 //! position - lives in the compositor crate's own `src/keybindings.rs`
 //! instead, built on top of the plain-data types here.
 
-use std::{collections::HashMap, env, fs, path::PathBuf};
+use std::{
+    collections::{BTreeMap, HashMap},
+    env, fs,
+    path::PathBuf,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -345,22 +349,29 @@ impl Default for SessionSettings {
     }
 }
 
-/// Running programs inside throw-away QEMU virtual machines whose windows
-/// are forwarded to the host desktop (see `shell::vm` in the compositor
-/// crate). Each launch boots its own VM from `image`, in `-snapshot` mode so
-/// nothing the guest writes ever reaches the image and any number of VMs can
-/// share one image. The guest must run an SSH server (key authentication,
-/// reachable as `user` with `ssh_key`) and have `waypipe` installed; the
-/// compositor then runs `waypipe ssh` against it, which turns the guest
-/// application's Wayland windows into ordinary host windows.
+/// Running programs inside QEMU virtual machines whose windows are forwarded
+/// to the host desktop (see `shell::vm` in the compositor crate).
 ///
-/// Off until `image` is set: with no image the launcher's "launch in VM" key
-/// just reports that VMs aren't configured.
+/// A VM runs **one program**, and that program is installed in the VM's own
+/// disk image: `programs` maps a desktop entry id to the image built for it,
+/// and only those programs can be started in a VM (the launchers list just
+/// them under their VM tabs). A throw-away launch boots the image in
+/// `-snapshot` mode so nothing the guest writes ever reaches it, and any
+/// number of VMs can share one image. The guest must run an SSH server (key
+/// authentication, reachable as `user` with `ssh_key`) and have `waypipe`
+/// installed; the compositor then runs `waypipe ssh` against it, which turns
+/// the guest application's Wayland windows into ordinary host windows.
+///
+/// Off until a program is configured, either here or through the images the
+/// NixOS module links into [`SYSTEM_VM_DIR`].
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct VmSettings {
-    /// Bootable guest disk image (qcow2 or raw). `None` disables VM launches.
-    pub image: Option<String>,
+    /// Programs that can be started in a VM: desktop entry id (with or
+    /// without `.desktop`) -> the bootable guest disk image (qcow2 or raw)
+    /// with exactly that program installed. Adds to (and, for the same id,
+    /// overrides) the images found in [`SYSTEM_VM_DIR`].
+    pub programs: BTreeMap<String, String>,
     /// Guest RAM, in MiB.
     pub memory_mb: u32,
     /// Guest virtual CPU count.
@@ -403,7 +414,7 @@ pub struct VmSettings {
 impl Default for VmSettings {
     fn default() -> Self {
         Self {
-            image: None,
+            programs: BTreeMap::new(),
             memory_mb: 2048,
             cpus: 2,
             user: "user".to_string(),
@@ -420,30 +431,64 @@ impl Default for VmSettings {
     }
 }
 
-/// Where the NixOS module (`services.ironland-compositor.vm.enable`) links the
-/// guest image it builds. Found independently of `config.toml` because a
-/// user's own config file replaces `/etc`'s wholesale, which would otherwise
-/// hide an image the system provides.
-pub const SYSTEM_VM_IMAGE: &str = "/etc/ironland-compositor/guest.qcow2";
+/// Where the NixOS module (`services.ironland-compositor.vm.programs`) links
+/// the guest images it builds, one `<desktop entry id>.qcow2` per program.
+/// Found independently of `config.toml` because a user's own config file
+/// replaces `/etc`'s wholesale, which would otherwise hide the images the
+/// system provides.
+pub const SYSTEM_VM_DIR: &str = "/etc/ironland-compositor/vm";
+
+/// A desktop entry id without its `.desktop` suffix, the form VM programs are
+/// keyed by.
+pub fn program_id(entry_id: &str) -> &str {
+    entry_id.strip_suffix(".desktop").unwrap_or(entry_id)
+}
 
 impl VmSettings {
-    /// The guest image to boot: `image` if set, else the system-provided one
-    /// ([`SYSTEM_VM_IMAGE`]) if it exists.
-    pub fn image_path(&self) -> Option<String> {
-        self.image
-            .as_deref()
-            .filter(|image| !image.trim().is_empty())
-            .map(str::to_string)
-            .or_else(|| {
-                std::path::Path::new(SYSTEM_VM_IMAGE)
-                    .exists()
-                    .then(|| SYSTEM_VM_IMAGE.to_string())
-            })
+    /// Every program that can be started in a VM, with its image: those in
+    /// `programs`, over the images in `system_dir` (named
+    /// `<desktop entry id>.qcow2`; a dangling link doesn't count). Keys have
+    /// no `.desktop` suffix and blank paths are dropped.
+    pub fn programs_in(&self, system_dir: &std::path::Path) -> BTreeMap<String, String> {
+        let mut programs = BTreeMap::new();
+        if let Ok(dir) = std::fs::read_dir(system_dir) {
+            for file in dir.flatten() {
+                let path = file.path();
+                let Some(id) = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(|name| name.strip_suffix(".qcow2"))
+                else {
+                    continue;
+                };
+                if !id.is_empty() && path.exists() {
+                    programs.insert(id.to_string(), path.to_string_lossy().into_owned());
+                }
+            }
+        }
+        for (id, image) in &self.programs {
+            let (id, image) = (program_id(id.trim()), image.trim());
+            if !id.is_empty() && !image.is_empty() {
+                programs.insert(id.to_string(), image.to_string());
+            }
+        }
+        programs
     }
 
-    /// Whether a guest image is available, i.e. VM launches are possible.
+    /// [`Self::programs_in`] for the system directory.
+    pub fn all_programs(&self) -> BTreeMap<String, String> {
+        self.programs_in(std::path::Path::new(SYSTEM_VM_DIR))
+    }
+
+    /// The guest image with the program for desktop entry `entry_id` (with or
+    /// without `.desktop`) installed, if it can be started in a VM.
+    pub fn image_for(&self, entry_id: &str) -> Option<String> {
+        self.all_programs().remove(program_id(entry_id))
+    }
+
+    /// Whether any program can be started in a VM.
     pub fn is_configured(&self) -> bool {
-        self.image_path().is_some()
+        !self.all_programs().is_empty()
     }
 }
 
@@ -1323,10 +1368,11 @@ mod tests {
     }
 
     #[test]
-    fn vm_is_unconfigured_by_default() {
+    fn vm_has_no_programs_by_default() {
         let raw: RawConfig = toml::from_str("").unwrap();
         assert_eq!(raw.vm, VmSettings::default());
-        assert!(!raw.vm.is_configured());
+        let empty = std::env::temp_dir().join(format!("ironland-vm-none-{}", std::process::id()));
+        assert!(raw.vm.programs_in(&empty).is_empty());
         assert_eq!(raw.vm.memory_mb, 2048);
         assert_eq!(raw.vm.max_instances, 8);
     }
@@ -1334,20 +1380,62 @@ mod tests {
     #[test]
     fn vm_settings_parse_and_keep_unset_fields_at_their_defaults() {
         let raw: RawConfig = toml::from_str(
-            "[vm]\nimage = \"/var/lib/vm/guest.qcow2\"\nmemory_mb = 4096\nextra_qemu_args = [\"-cpu\", \"host\"]\n",
+            "[vm]\nmemory_mb = 4096\nextra_qemu_args = [\"-cpu\", \"host\"]\n\n[vm.programs]\nAlacritty = \"/var/lib/vm/alacritty.qcow2\"\n",
         )
         .unwrap();
-        assert!(raw.vm.is_configured());
+        assert_eq!(raw.vm.programs["Alacritty"], "/var/lib/vm/alacritty.qcow2");
         assert_eq!(raw.vm.memory_mb, 4096);
         assert_eq!(raw.vm.cpus, 2);
         assert_eq!(raw.vm.user, "user");
         assert_eq!(raw.vm.extra_qemu_args, vec!["-cpu", "host"]);
     }
 
+    fn system_dir(name: &str, files: &[&str]) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("ironland-vm-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        for file in files {
+            fs::write(dir.join(file), "").unwrap();
+        }
+        dir
+    }
+
     #[test]
-    fn a_blank_vm_image_counts_as_unconfigured() {
-        let raw: RawConfig = toml::from_str("[vm]\nimage = \"  \"\n").unwrap();
-        assert!(!raw.vm.is_configured());
+    fn programs_come_from_the_system_images_and_the_config() {
+        let dir = system_dir(
+            "merge",
+            &["foot.qcow2", "org.gnome.Calculator.qcow2", "notes.txt"],
+        );
+        let raw: RawConfig = toml::from_str(
+            "[vm.programs]\n\"Alacritty.desktop\" = \"/img/a.qcow2\"\nfoot = \"/img/own-foot.qcow2\"\nblank = \"  \"\n",
+        )
+        .unwrap();
+        let programs = raw.vm.programs_in(&dir);
+        assert_eq!(
+            programs.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["Alacritty", "foot", "org.gnome.Calculator"]
+        );
+        // The config wins over the system's image for the same program.
+        assert_eq!(programs["foot"], "/img/own-foot.qcow2");
+        assert_eq!(
+            programs["org.gnome.Calculator"],
+            dir.join("org.gnome.Calculator.qcow2").to_string_lossy()
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_dangling_system_image_link_is_not_a_program() {
+        let dir = system_dir("dangling", &[]);
+        std::os::unix::fs::symlink("/nonexistent/x.qcow2", dir.join("gone.qcow2")).unwrap();
+        assert!(VmSettings::default().programs_in(&dir).is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn program_ids_ignore_the_desktop_suffix() {
+        assert_eq!(program_id("Alacritty.desktop"), "Alacritty");
+        assert_eq!(program_id("Alacritty"), "Alacritty");
     }
 
     #[test]

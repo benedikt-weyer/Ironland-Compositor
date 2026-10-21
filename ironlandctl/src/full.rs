@@ -108,7 +108,6 @@ pub fn write(doc: &mut DocumentMut, full: &FullConfig) {
 
     let vm = ensure_table(doc, "vm");
     for (key, text) in [
-        ("image", &cfg.vm.image),
         ("ssh_key", &cfg.vm.ssh_key),
         ("public_key", &cfg.vm.public_key),
         ("public_key_file", &cfg.vm.public_key_file),

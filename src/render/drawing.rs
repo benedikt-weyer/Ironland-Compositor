@@ -17,6 +17,8 @@ use smithay::{
     utils::{Logical, Physical, Point, Scale, Size, Transform},
 };
 
+use std::collections::HashSet;
+
 use crate::{font::Canvas, launcher::DesktopEntry};
 #[cfg(feature = "debug")]
 use smithay::{
@@ -266,6 +268,7 @@ where
 const LAUNCHER_WIDTH: i32 = 480;
 const LAUNCHER_ROW_HEIGHT: i32 = 26;
 const LAUNCHER_HEADER_HEIGHT: i32 = 36;
+const LAUNCHER_TAB_HEIGHT: i32 = 28;
 const LAUNCHER_PADDING: i32 = 10;
 const LAUNCHER_FOOTER_LINE_HEIGHT: i32 = 22;
 const LAUNCHER_FOOTER_PADDING: i32 = 6;
@@ -279,12 +282,56 @@ const COLOR_TEXT: [u8; 4] = [235, 230, 225, 255];
 const COLOR_MUTED_TEXT: [u8; 4] = [150, 140, 130, 255];
 const COLOR_ERROR_TEXT: [u8; 4] = [235, 120, 110, 255];
 
+/// The launcher's views, switched with the Left/Right arrow keys: ordinary
+/// applications in the middle, with the programs set up for throw-away VMs to
+/// the left and for persistent VMs to the right. The VM views list only the
+/// programs that have a VM configured (`vm.programs`, see
+/// [`ironland_config::VmSettings`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LauncherTab {
+    /// Every installed application; Enter starts it on the host.
+    #[default]
+    Apps,
+    /// Programs with a VM set up; Enter starts one in a throw-away VM.
+    Vm,
+    /// Programs with a VM set up; Enter starts one in a persistent VM.
+    Persistent,
+}
+
+impl LauncherTab {
+    /// Left to right, as drawn.
+    const ALL: [LauncherTab; 3] = [LauncherTab::Vm, LauncherTab::Apps, LauncherTab::Persistent];
+
+    fn label(self) -> &'static str {
+        match self {
+            LauncherTab::Vm => "VM",
+            LauncherTab::Apps => "Apps",
+            LauncherTab::Persistent => "Persistent",
+        }
+    }
+
+    fn position(self) -> usize {
+        Self::ALL.iter().position(|&tab| tab == self).unwrap_or(1)
+    }
+
+    /// The neighbouring tab `delta` steps to the right (negative: left),
+    /// stopping at the ends.
+    fn shifted(self, delta: i32) -> LauncherTab {
+        let last = Self::ALL.len() as i32 - 1;
+        Self::ALL[(self.position() as i32 + delta).clamp(0, last) as usize]
+    }
+
+    fn lists_only_vm_programs(self) -> bool {
+        self != LauncherTab::Apps
+    }
+}
+
 /// One line of the launcher's footer, and in which style.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum FooterLine {
     /// Key hints (normal colour).
     Hint(&'static str),
-    /// Key hints with VM launching unavailable (no guest image; muted).
+    /// Key hints with VM launching unavailable (no VM programs; muted).
     HintNoVm(&'static str),
     /// Why the last launch attempt failed (error colour).
     Error(String),
@@ -293,14 +340,24 @@ enum FooterLine {
 /// The launcher's bottom lines: a pending error beats the key hints, and the
 /// hints say plainly when VM launching can't work yet. Each line must fit the
 /// overlay (about 38 characters).
-fn footer_lines(vm_available: bool, status: Option<&str>) -> Vec<FooterLine> {
+fn footer_lines(tab: LauncherTab, vm_available: bool, status: Option<&str>) -> Vec<FooterLine> {
     match status {
         Some(message) => vec![FooterLine::Error(message.to_string())],
-        None if vm_available => vec![
-            FooterLine::Hint("Enter: launch   Left: throw-away VM"),
-            FooterLine::Hint("Right: persistent VM (keeps state)"),
-        ],
-        None => vec![FooterLine::HintNoVm("Enter: launch   VM: no guest image set")],
+        None if !vm_available => vec![FooterLine::HintNoVm("Enter: launch   VM: none set up")],
+        None => match tab {
+            LauncherTab::Apps => vec![
+                FooterLine::Hint("Enter: launch on this computer"),
+                FooterLine::Hint("Left: VM   Right: persistent VM"),
+            ],
+            LauncherTab::Vm => vec![
+                FooterLine::Hint("Enter: launch in a throw-away VM"),
+                FooterLine::Hint("Right: back to apps"),
+            ],
+            LauncherTab::Persistent => vec![
+                FooterLine::Hint("Enter: launch in a persistent VM"),
+                FooterLine::Hint("Left: back to apps"),
+            ],
+        },
     }
 }
 
@@ -313,9 +370,10 @@ pub struct LauncherState {
     entries: Vec<DesktopEntry>,
     filtered: Vec<usize>,
     selected: usize,
-    /// Whether launching in a VM can work (an image is configured); only
-    /// changes how the key hint reads. Set by the caller when opening.
-    pub vm_available: bool,
+    tab: LauncherTab,
+    /// Programs (desktop entry ids without `.desktop`) that have a VM set up:
+    /// all the VM tabs list. Set by the caller when opening.
+    vm_programs: HashSet<String>,
     /// Error from the last launch attempt, shown instead of the key hints
     /// until the next keystroke.
     status: Option<String>,
@@ -331,7 +389,8 @@ impl Default for LauncherState {
             entries: Vec::new(),
             filtered: Vec::new(),
             selected: 0,
-            vm_available: false,
+            tab: LauncherTab::Apps,
+            vm_programs: HashSet::new(),
             status: None,
             buffer: None,
             dirty: true,
@@ -349,11 +408,41 @@ impl LauncherState {
     pub fn open(&mut self) {
         self.entries = crate::launcher::scan_desktop_entries();
         self.query.clear();
-        self.status = None;
-        self.selected = 0;
-        self.filtered = crate::launcher::filter_entries(&self.entries, &self.query);
+        self.tab = LauncherTab::Apps;
+        self.refresh_filter();
         self.visible = true;
-        self.dirty = true;
+    }
+
+    /// Sets which programs have a VM, from the config (call before
+    /// [`Self::open`]). Without any, the VM tabs are unavailable.
+    pub fn set_vm_programs(&mut self, programs: impl IntoIterator<Item = String>) {
+        self.vm_programs = programs.into_iter().collect();
+    }
+
+    /// Whether any program can be started in a VM, i.e. the VM tabs exist.
+    pub fn vm_available(&self) -> bool {
+        !self.vm_programs.is_empty()
+    }
+
+    pub fn tab(&self) -> LauncherTab {
+        self.tab
+    }
+
+    /// Moves to the tab `delta` places to the right (negative: left). Does
+    /// nothing while no program has a VM.
+    pub fn switch_tab(&mut self, delta: i32) {
+        if !self.vm_available() {
+            return;
+        }
+        let tab = self.tab.shifted(delta);
+        if tab != self.tab {
+            self.tab = tab;
+            self.refresh_filter();
+        }
+    }
+
+    fn is_vm_program(&self, entry: &DesktopEntry) -> bool {
+        self.vm_programs.contains(ironland_config::program_id(&entry.id))
     }
 
     pub fn close(&mut self) {
@@ -381,7 +470,11 @@ impl LauncherState {
     }
 
     fn refresh_filter(&mut self) {
-        self.filtered = crate::launcher::filter_entries(&self.entries, &self.query);
+        let mut filtered = crate::launcher::filter_entries(&self.entries, &self.query);
+        if self.tab.lists_only_vm_programs() {
+            filtered.retain(|&i| self.is_vm_program(&self.entries[i]));
+        }
+        self.filtered = filtered;
         self.selected = 0;
         self.status = None;
         self.dirty = true;
@@ -425,7 +518,12 @@ impl LauncherState {
     }
 
     fn footer_lines(&self) -> Vec<FooterLine> {
-        footer_lines(self.vm_available, self.status.as_deref())
+        footer_lines(self.tab, self.vm_available(), self.status.as_deref())
+    }
+
+    /// The tab strip is only there once there is a VM tab to switch to.
+    fn tab_strip_height(&self) -> i32 {
+        if self.vm_available() { LAUNCHER_TAB_HEIGHT } else { 0 }
     }
 
     fn footer_height(&self) -> i32 {
@@ -436,6 +534,7 @@ impl LauncherState {
     pub fn logical_size(&self) -> Size<i32, Logical> {
         let rows = self.filtered.len().clamp(1, LAUNCHER_MAX_ROWS);
         let height = LAUNCHER_HEADER_HEIGHT
+            + self.tab_strip_height()
             + rows as i32 * LAUNCHER_ROW_HEIGHT
             + LAUNCHER_PADDING
             + self.footer_height();
@@ -456,17 +555,46 @@ impl LauncherState {
             COLOR_TEXT,
         );
 
+        let list_top = LAUNCHER_HEADER_HEIGHT + self.tab_strip_height();
+        if self.vm_available() {
+            let tab_width = size.w / LauncherTab::ALL.len() as i32;
+            for (i, tab) in LauncherTab::ALL.into_iter().enumerate() {
+                let x = i as i32 * tab_width;
+                let active = tab == self.tab;
+                if active {
+                    canvas.fill_rect(x, LAUNCHER_HEADER_HEIGHT, tab_width, LAUNCHER_TAB_HEIGHT, COLOR_SELECTED_BG);
+                }
+                let label = tab.label();
+                let text_width = label.chars().count() as i32
+                    * (crate::font::GLYPH_WIDTH as i32 + 1)
+                    * LAUNCHER_FONT_SCALE;
+                canvas.draw_text(
+                    x + (tab_width - text_width) / 2,
+                    LAUNCHER_HEADER_HEIGHT
+                        + (LAUNCHER_TAB_HEIGHT - GLYPH_LINE_HEIGHT * LAUNCHER_FONT_SCALE) / 2,
+                    label,
+                    LAUNCHER_FONT_SCALE,
+                    if active { COLOR_TEXT } else { COLOR_MUTED_TEXT },
+                );
+            }
+        }
+
         if self.filtered.is_empty() {
+            let message = match (self.tab, self.vm_programs.is_empty()) {
+                (LauncherTab::Apps, _) => "No matching applications",
+                (_, true) => "No programs set up for VMs",
+                _ => "No matching VM programs",
+            };
             canvas.draw_text(
                 LAUNCHER_PADDING,
-                LAUNCHER_HEADER_HEIGHT + LAUNCHER_PADDING,
-                "No matching applications",
+                list_top + LAUNCHER_PADDING,
+                message,
                 LAUNCHER_FONT_SCALE,
                 COLOR_MUTED_TEXT,
             );
         } else {
             for (row, &entry_idx) in self.filtered.iter().take(LAUNCHER_MAX_ROWS).enumerate() {
-                let row_y = LAUNCHER_HEADER_HEIGHT + row as i32 * LAUNCHER_ROW_HEIGHT;
+                let row_y = list_top + row as i32 * LAUNCHER_ROW_HEIGHT;
                 if row == self.selected {
                     canvas.fill_rect(0, row_y, size.w, LAUNCHER_ROW_HEIGHT, COLOR_SELECTED_BG);
                 }
@@ -592,25 +720,37 @@ mod tests {
     }
 
     #[test]
-    fn footer_hints_name_all_three_launch_modes() {
-        let lines = footer_lines(true, None);
-        let all = lines.iter().map(hint_text).collect::<Vec<_>>().join(" ");
-        assert!(all.contains("Enter"));
-        assert!(all.contains("Left") && all.to_lowercase().contains("throw-away"));
-        assert!(all.contains("Right") && all.to_lowercase().contains("persistent"));
-        assert!(lines.iter().all(|l| matches!(l, FooterLine::Hint(_))));
+    fn footer_hints_explain_each_tab() {
+        let text = |tab| {
+            footer_lines(tab, true, None)
+                .iter()
+                .map(hint_text)
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_lowercase()
+        };
+        let apps = text(LauncherTab::Apps);
+        assert!(apps.contains("enter") && apps.contains("left") && apps.contains("right"));
+        assert!(apps.contains("persistent"));
+        let vm = text(LauncherTab::Vm);
+        assert!(vm.contains("throw-away") && vm.contains("right"));
+        let persistent = text(LauncherTab::Persistent);
+        assert!(persistent.contains("persistent") && persistent.contains("left"));
+        for tab in LauncherTab::ALL {
+            assert!(footer_lines(tab, true, None).iter().all(|l| matches!(l, FooterLine::Hint(_))));
+        }
     }
 
     #[test]
-    fn footer_says_when_vms_are_not_set_up() {
-        let lines = footer_lines(false, None);
+    fn footer_says_when_no_vm_is_set_up() {
+        let lines = footer_lines(LauncherTab::Apps, false, None);
         assert!(matches!(lines.as_slice(), [FooterLine::HintNoVm(_)]));
     }
 
     #[test]
     fn a_launch_error_replaces_the_hints() {
         assert_eq!(
-            footer_lines(true, Some("boom")),
+            footer_lines(LauncherTab::Vm, true, Some("boom")),
             vec![FooterLine::Error("boom".into())]
         );
     }
@@ -619,21 +759,106 @@ mod tests {
     fn footer_lines_fit_the_launcher_width() {
         let per_char = (crate::font::GLYPH_WIDTH as i32 + 1) * LAUNCHER_FONT_SCALE;
         let max_chars = ((LAUNCHER_WIDTH - LAUNCHER_PADDING * 2) / per_char) as usize;
-        for lines in [footer_lines(true, None), footer_lines(false, None)] {
-            for line in &lines {
-                assert!(hint_text(line).chars().count() <= max_chars, "{line:?} is too wide");
+        for tab in LauncherTab::ALL {
+            for vm_available in [true, false] {
+                for line in &footer_lines(tab, vm_available, None) {
+                    assert!(hint_text(line).chars().count() <= max_chars, "{line:?} is too wide");
+                }
             }
         }
     }
 
     #[test]
-    fn the_overlay_grows_with_the_footer() {
-        let with_vms = LauncherState {
-            vm_available: true,
+    fn tab_labels_fit_their_third_of_the_overlay() {
+        let per_char = (crate::font::GLYPH_WIDTH as i32 + 1) * LAUNCHER_FONT_SCALE;
+        for tab in LauncherTab::ALL {
+            assert!(tab.label().chars().count() as i32 * per_char < LAUNCHER_WIDTH / 3);
+        }
+    }
+
+    fn entry(id: &str, name: &str) -> DesktopEntry {
+        DesktopEntry { id: id.into(), name: name.into(), exec: name.into(), terminal: false }
+    }
+
+    /// A launcher showing Alacritty, Firefox and foot, of which only
+    /// Alacritty and foot have a VM set up.
+    fn launcher_with_vm_programs() -> LauncherState {
+        let mut launcher = LauncherState {
+            entries: vec![
+                entry("Alacritty.desktop", "Alacritty"),
+                entry("firefox.desktop", "Firefox"),
+                entry("foot.desktop", "foot"),
+            ],
             ..LauncherState::default()
         };
-        let without_vms = LauncherState::default();
-        assert!(without_vms.logical_size().h < with_vms.logical_size().h);
+        launcher.set_vm_programs(["Alacritty".to_string(), "foot".to_string()]);
+        launcher.refresh_filter();
+        launcher
+    }
+
+    fn names(launcher: &LauncherState) -> Vec<String> {
+        launcher
+            .filtered
+            .iter()
+            .map(|&i| launcher.entries[i].name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn the_vm_tabs_list_only_programs_that_have_a_vm() {
+        let mut launcher = launcher_with_vm_programs();
+        assert_eq!(launcher.tab(), LauncherTab::Apps);
+        assert_eq!(names(&launcher), ["Alacritty", "Firefox", "foot"]);
+
+        launcher.switch_tab(-1);
+        assert_eq!(launcher.tab(), LauncherTab::Vm);
+        assert_eq!(names(&launcher), ["Alacritty", "foot"]);
+
+        launcher.switch_tab(1);
+        launcher.switch_tab(1);
+        assert_eq!(launcher.tab(), LauncherTab::Persistent);
+        assert_eq!(names(&launcher), ["Alacritty", "foot"]);
+    }
+
+    #[test]
+    fn arrows_walk_vm_then_apps_then_persistent_and_stop_at_the_ends() {
+        let mut launcher = launcher_with_vm_programs();
+        launcher.switch_tab(-1);
+        launcher.switch_tab(-1);
+        assert_eq!(launcher.tab(), LauncherTab::Vm);
+        launcher.switch_tab(1);
+        assert_eq!(launcher.tab(), LauncherTab::Apps);
+        launcher.switch_tab(1);
+        launcher.switch_tab(1);
+        assert_eq!(launcher.tab(), LauncherTab::Persistent);
+    }
+
+    #[test]
+    fn typing_filters_within_the_current_tab() {
+        let mut launcher = launcher_with_vm_programs();
+        launcher.switch_tab(-1);
+        launcher.push_char('f');
+        assert_eq!(names(&launcher), ["foot"]);
+        launcher.switch_tab(1);
+        assert_eq!(names(&launcher), ["Firefox", "foot"]);
+    }
+
+    #[test]
+    fn without_vm_programs_there_are_no_tabs() {
+        let mut launcher = launcher_with_vm_programs();
+        launcher.set_vm_programs([]);
+        assert!(!launcher.vm_available());
+        launcher.switch_tab(-1);
+        assert_eq!(launcher.tab(), LauncherTab::Apps);
+        assert_eq!(names(&launcher).len(), 3);
+    }
+
+    #[test]
+    fn the_overlay_grows_by_the_tab_strip_once_a_vm_program_exists() {
+        let mut launcher = LauncherState::default();
+        let plain = launcher.logical_size().h;
+        launcher.set_vm_programs(["foot".to_string()]);
+        assert!(launcher.logical_size().h > plain);
     }
 
     #[test]
@@ -643,10 +868,7 @@ mod tests {
         launcher.push_char('a');
         assert!(launcher.status.is_none());
 
-        launcher.entries = vec![
-            DesktopEntry { id: "a".into(), name: "A".into(), exec: "a".into(), terminal: false },
-            DesktopEntry { id: "b".into(), name: "B".into(), exec: "b".into(), terminal: false },
-        ];
+        launcher.entries = vec![entry("a", "A"), entry("b", "B")];
         launcher.filtered = vec![0, 1];
         launcher.set_status("nope");
         launcher.move_selection(1);

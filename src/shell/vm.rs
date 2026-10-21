@@ -31,8 +31,8 @@
 //!
 //! Two flavours, chosen per launch:
 //!
-//! * **throw-away** (launcher Left key): as above, nothing survives the VM;
-//! * **persistent** (launcher Right key): the VM runs on a per-application
+//! * **throw-away** (launcher's VM tab): as above, nothing survives the VM;
+//! * **persistent** (launcher's persistent tab): the VM runs on a per-application
 //!   disk overlay and, when its program exits cleanly, its disk *and memory*
 //!   are saved (QMP `savevm`, see [`super::vm_state`]). The next persistent
 //!   launch of that application restores them with `-loadvm`: no boot, and
@@ -100,8 +100,8 @@ pub enum VmEvent {
 
 #[derive(Debug, thiserror::Error)]
 pub enum VmError {
-    #[error("no VM image configured (set `image` under [vm] in the config)")]
-    NotConfigured,
+    #[error("{0} has no VM set up (add it under `vm.programs`, or `[vm.programs]` in the config)")]
+    NotConfigured(String),
     #[error("VM image {0} does not exist")]
     ImageMissing(PathBuf),
     #[error("{0} VMs are already running (`max_instances` under [vm])")]
@@ -125,7 +125,7 @@ impl VmError {
     /// characters at its font size; the full text goes to the log).
     pub fn short(&self) -> String {
         match self {
-            VmError::NotConfigured => "VM not set up (no image in config)".into(),
+            VmError::NotConfigured(_) => "No VM set up for this app".into(),
             VmError::ImageMissing(_) => "VM image file not found".into(),
             VmError::TooManyInstances(max) => format!("Too many VMs running (max {max})"),
             VmError::NoCommand => "Nothing to run for this entry".into(),
@@ -826,9 +826,10 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
         persistent: bool,
     ) -> Result<VmId, VmError> {
         let mut settings = self.config.vm.clone();
-        let image = match settings.image_path() {
+        // One program per VM: the program's own image, with only it installed.
+        let image = match settings.image_for(&entry.id) {
             Some(image) => expand_tilde(&image),
-            None => return Err(VmError::NotConfigured),
+            None => return Err(VmError::NotConfigured(entry.name.clone())),
         };
         if !image.exists() {
             return Err(VmError::ImageMissing(image));
@@ -1202,16 +1203,13 @@ mod tests {
     }
 
     fn settings() -> VmSettings {
-        VmSettings {
-            image: Some("/img/guest.qcow2".into()),
-            ..VmSettings::default()
-        }
+        VmSettings::default()
     }
 
     #[test]
     fn short_errors_fit_the_launcher_footer() {
         let errors = [
-            VmError::NotConfigured,
+            VmError::NotConfigured("A Very Long Application Name".into()),
             VmError::ImageMissing("/some/very/long/path/guest.qcow2".into()),
             VmError::TooManyInstances(8),
             VmError::NoCommand,
@@ -1815,7 +1813,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let mut settings = VmSettings {
-            image: Some(image.display().to_string()),
             memory_mb: 1024,
             ..VmSettings::default()
         };
@@ -1918,7 +1915,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let settings = VmSettings {
-            image: Some(image.display().to_string()),
             memory_mb: 1024,
             ssh_key: Some(key),
             ..VmSettings::default()

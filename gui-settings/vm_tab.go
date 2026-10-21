@@ -45,8 +45,9 @@ func parseAtLeastOne(text string) (uint32, error) {
 }
 
 // buildVMTab lays out the settings for launching programs inside QEMU VMs
-// (the launcher's Left/Right keys): the guest image, how to log in to it, and
-// the VM's size. Takes effect on the next VM launch.
+// (the launcher's VM tabs, reached with the Left/Right keys): how to log in
+// to the guest and the VM's size. Which programs have a VM is set up in
+// vm.programs, not here. Takes effect on the next VM launch.
 func buildVMTab(cfg *Config) fyne.CanvasObject {
 	defaults := defaultConfig().VM
 	vm := &cfg.VM
@@ -80,9 +81,6 @@ func buildVMTab(cfg *Config) fyne.CanvasObject {
 		return e
 	}
 
-	image := textEntry("path to a qcow2/raw disk image (blank: the system-provided one, if any)",
-		func() string { return optionalText(vm.Image) },
-		func(t string) { setOptionalText(&vm.Image, t) })
 	user := textEntry("user",
 		func() string { return vm.User },
 		func(t string) { vm.User = strings.TrimSpace(t) })
@@ -122,9 +120,6 @@ func buildVMTab(cfg *Config) fyne.CanvasObject {
 	maxDiff, maxReset := numberReset(maxInstances, func() uint32 { return vm.MaxInstances }, defaults.MaxInstances)
 
 	form := widget.NewForm(
-		widget.NewFormItem("Guest image", resets.item(image,
-			func() bool { return !sameOptional(vm.Image, defaults.Image) },
-			func() { image.SetText(optionalText(defaults.Image)) })),
 		widget.NewFormItem("Guest user", resets.item(user,
 			func() bool { return vm.User != defaults.User },
 			func() { user.SetText(defaults.User) })),
@@ -146,9 +141,10 @@ func buildVMTab(cfg *Config) fyne.CanvasObject {
 	)
 
 	hint := widget.NewLabel(
-		"Press Left in the launcher to start the selected app in a throw-away VM, Right for a persistent one." +
-			" The guest image must run an SSH server and have waypipe installed (on NixOS, enable" +
-			" services.ironland-compositor.vm to have one built for you).\n\n" +
+		"In the launcher, Left opens the tab of programs that start in a throw-away VM and Right the tab of" +
+			" persistent ones. Each VM runs one program from its own guest image (SSH server, waypipe and just" +
+			" that program): list the programs under [vm.programs] in the config, or on NixOS in" +
+			" services.ironland-compositor.vm.programs, which builds the images for you.\n\n" +
 			"The guest accepts the public key set here; with neither field set, that is ~/.ssh/id_ed25519.pub" +
 			" plus whatever your ssh-agent holds, and logging in uses the agent. Takes effect on the next VM launch.",
 	)

@@ -30,6 +30,11 @@
     on this desktop, marked with a badge (see the compositor's `[vm]`
     configuration for how VMs are set up).
 
+    A VM runs exactly one program, installed in the VM's own disk image, so
+    only applications that have such an image can be started this way; the
+    manager lists them (`program`) and a client should offer VM launching
+    for those only.
+
     A client names the application by its desktop entry id, never by a
     command line: the compositor resolves the id against the desktop entries
     installed on the host and runs that entry's `Exec` in the guest. A
@@ -47,15 +52,16 @@
     and destroying the object (or disconnecting) leaves it running.
   </description>
 
-  <interface name="ironland_vm_launcher_v1" version="1">
+  <interface name="ironland_vm_launcher_v1" version="2">
     <description summary="starts applications in virtual machines">
-      The manager global. On binding it immediately sends `availability`.
+      The manager global. On binding it immediately sends `availability`
+      and, from version 2, the list of programs that can be started.
     </description>
 
     <enum name="mode">
       <description summary="what kind of VM to start">
-        Both kinds boot a VM from the configured guest image and show the
-        program's windows on the host.
+        Both kinds boot a VM from the guest image of the program being
+        started and show the program's windows on the host.
       </description>
       <entry name="throwaway" value="0" summary="nothing survives the VM">
         The VM runs on a temporary snapshot of the image that is thrown away
@@ -94,12 +100,32 @@
     <event name="availability">
       <description summary="whether VM launches can work">
         Sent when the manager is bound and again whenever it changes.
-        `configured` is 1 when the compositor has a guest image configured
-        and launches can be attempted, 0 when it has none (every launch
-        would fail with `not_configured`). A client should only offer VM
-        launching while this is 1.
+        `configured` is 1 when at least one program can be started in a VM
+        (see `program`) and 0 when none can (every launch would fail with
+        `not_configured`). A client should only offer VM launching while
+        this is 1.
       </description>
       <arg name="configured" type="uint"/>
+    </event>
+
+    <event name="program" since="2">
+      <description summary="an application that can be started in a VM">
+        Names one application that has a VM set up, by desktop entry id
+        without the `.desktop` suffix. Sent in a batch of zero or more,
+        terminated by `programs_done`, on binding and again, as a complete
+        new list, whenever the set changes (for instance after the
+        configuration or the installed VM images change). Launching any
+        other application is refused with `not_configured`.
+      </description>
+      <arg name="entry" type="string" summary="desktop entry id, without .desktop"/>
+    </event>
+
+    <event name="programs_done" since="2">
+      <description summary="the list of programs is complete">
+        Ends a batch of `program` events. The batch is the complete list of
+        applications that can currently be started in a VM: it replaces any
+        list received earlier.
+      </description>
     </event>
   </interface>
 
@@ -114,7 +140,8 @@
       <description summary="why a launch was refused"/>
       <entry name="unknown_entry" value="0"
              summary="no installed application has that desktop entry id"/>
-      <entry name="not_configured" value="1" summary="no guest image is configured"/>
+      <entry name="not_configured" value="1"
+             summary="no VM is set up for this application"/>
       <entry name="image_missing" value="2" summary="the configured guest image does not exist"/>
       <entry name="too_many" value="3" summary="the limit on concurrent VMs is reached"/>
       <entry name="already_running" value="4"

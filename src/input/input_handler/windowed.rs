@@ -123,8 +123,8 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                     | KeyAction::LauncherUp
                     | KeyAction::LauncherDown
                     | KeyAction::LauncherActivate
-                    | KeyAction::LauncherActivateVm
-                    | KeyAction::LauncherActivateVmPersistent
+                    | KeyAction::LauncherTabLeft
+                    | KeyAction::LauncherTabRight
                     | KeyAction::LauncherClose
                     | KeyAction::ToggleFloating
                     | KeyAction::KillWindow

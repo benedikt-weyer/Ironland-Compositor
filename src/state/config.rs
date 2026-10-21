@@ -10,6 +10,10 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
         }
         self.config_last_checked = Instant::now();
 
+        // VM images can appear in /etc (a NixOS switch) without the config
+        // file changing.
+        self.announce_vm_programs();
+
         let (new_config, path) = match crate::config::Config::try_load() {
             Ok(loaded) => loaded,
             Err(err) => {
@@ -23,6 +27,13 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
 
         self.apply_config(new_config);
         info!(path = ?path, "Applied compositor config without restarting");
+    }
+
+    /// Tells the shell which programs can be launched in a VM, if that
+    /// changed.
+    fn announce_vm_programs(&mut self) {
+        self.vm_launch_state
+            .update_programs(self.config.vm.all_programs().into_keys().collect());
     }
 
     pub(super) fn apply_config(&mut self, new_config: crate::config::Config) {
@@ -55,13 +66,8 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
         }
 
         let top_bar_changed = new_config.top_bar != old_config.top_bar;
-        let vm_configured_changed = new_config.vm.is_configured() != old_config.vm.is_configured();
         self.config = new_config;
-
-        if vm_configured_changed {
-            self.vm_launch_state
-                .broadcast_availability(self.config.vm.is_configured());
-        }
+        self.announce_vm_programs();
 
         if top_bar_changed {
             use xdg_decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode;

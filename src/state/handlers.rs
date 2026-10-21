@@ -85,8 +85,8 @@ impl<BackendData: Backend + 'static> crate::vm_launch::VmLaunchHandler for Anvil
         &mut self.vm_launch_state
     }
 
-    fn vm_launch_configured(&self) -> bool {
-        self.config.vm.is_configured()
+    fn vm_launch_programs(&self) -> Vec<String> {
+        self.config.vm.all_programs().into_keys().collect()
     }
 
     fn vm_launch_entry(

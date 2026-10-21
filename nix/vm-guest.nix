@@ -1,11 +1,13 @@
 # NixOS guest for programs launched "as virtual" from ironland-compositor's
 # launcher (see `src/shell/vm.rs`): a minimal headless system that boots fast,
 # runs an SSH server for the compositor's `waypipe ssh` to log in to, and has
-# `waypipe` plus a few Wayland programs installed. The compositor boots a
-# throw-away snapshot of the disk image per launched window.
+# `waypipe` plus the one program the image is for installed (`packages`).
+# Every program gets its own image, built by `services.ironland-compositor.vm
+# .programs` (`nix/module.nix`); the compositor boots a snapshot of it per
+# launch.
 #
-# Build the image with `scripts/build-vm-guest`, which also creates the ssh key
-# the compositor logs in with.
+# Build one by hand with `scripts/build-vm-guest <package>`, which also
+# creates the ssh key the compositor logs in with.
 { config, lib, pkgs, modulesPath, ... }:
 
 let
@@ -29,14 +31,16 @@ in
         disabled entirely, so with none the guest is unreachable.
       '';
     };
-    extraPackages = lib.mkOption {
+    packages = lib.mkOption {
       type = lib.types.listOf lib.types.package;
       default = [ ];
       example = lib.literalExpression "[ pkgs.firefox ]";
       description = ''
-        Programs to install in the guest. A launcher entry started as
-        virtual runs its `Exec=` command *in the guest*, so the program has to
-        be installed here under the same command name.
+        The program this image is for (and anything it needs). A launcher
+        entry started as virtual runs its `Exec=` command *in the guest*, so
+        the program has to be installed here under the same command name. A
+        `Terminal=true` entry also needs its terminal emulator (`terminal`
+        under `[vm]`, else the top-level `terminal` setting) in the list.
       '';
     };
   };
@@ -81,7 +85,7 @@ in
     # (persistent VMs): it would otherwise resume on the time it was saved at.
     services.qemuGuest.enable = true;
 
-    environment.systemPackages = [ pkgs.waypipe pkgs.foot ] ++ cfg.extraPackages;
+    environment.systemPackages = [ pkgs.waypipe ] ++ cfg.packages;
     fonts.packages = [ pkgs.dejavu_fonts ];
     # Mesa's software rasterizer, for programs that want GL.
     hardware.graphics.enable = true;

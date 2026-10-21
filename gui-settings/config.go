@@ -118,8 +118,11 @@ type SessionSettings struct {
 // vm_tab.go). Fields without a control there (terminal, extra QEMU args, ...)
 // are carried through so saving doesn't reset them.
 type VMSettings struct {
-	// Image is the bootable guest disk image; empty/null disables VM launches.
-	Image *string `json:"image"`
+	// Programs maps a desktop entry id to the guest disk image with exactly
+	// that program installed (one program per VM). Edited in the config file
+	// or provided by the system (services.ironland-compositor.vm.programs);
+	// carried through here so saving doesn't drop it.
+	Programs map[string]string `json:"programs"`
 	// MemoryMB is the guest RAM in MiB.
 	MemoryMB uint32 `json:"memory_mb"`
 	CPUs     uint32 `json:"cpus"`

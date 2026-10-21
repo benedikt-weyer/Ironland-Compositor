@@ -99,8 +99,6 @@ pub enum SettingKey {
     WindowAnimationsEnabled,
     #[value(name = "window_animations.duration_ms")]
     WindowAnimationsDurationMs,
-    #[value(name = "vm.image")]
-    VmImage,
     #[value(name = "vm.user")]
     VmUser,
     #[value(name = "vm.ssh_key")]
@@ -169,7 +167,6 @@ impl SettingKey {
             SessionShellUnit,
             WindowAnimationsEnabled,
             WindowAnimationsDurationMs,
-            VmImage,
             VmUser,
             VmSshKey,
             VmPublicKey,
@@ -228,7 +225,6 @@ impl SettingKey {
             SessionShellUnit => "session.shell_unit",
             WindowAnimationsEnabled => "window_animations.enabled",
             WindowAnimationsDurationMs => "window_animations.duration_ms",
-            VmImage => "vm.image",
             VmUser => "vm.user",
             VmSshKey => "vm.ssh_key",
             VmPublicKey => "vm.public_key",
@@ -294,7 +290,6 @@ pub fn get(full: &FullConfig, key: SettingKey) -> String {
         SessionShellUnit => cfg.session.shell_unit.clone(),
         WindowAnimationsEnabled => cfg.window_animations.enabled.to_string(),
         WindowAnimationsDurationMs => cfg.window_animations.duration_ms.to_string(),
-        VmImage => cfg.vm.image.clone().unwrap_or_default(),
         VmUser => cfg.vm.user.clone(),
         VmSshKey => cfg.vm.ssh_key.clone().unwrap_or_default(),
         VmPublicKey => cfg.vm.public_key.clone().unwrap_or_default(),
@@ -404,7 +399,6 @@ fn table_and_leaf(key: SettingKey) -> (&'static [&'static str], &'static str) {
         SessionShellUnit => (&["session"], "shell_unit"),
         WindowAnimationsEnabled => (&["window_animations"], "enabled"),
         WindowAnimationsDurationMs => (&["window_animations"], "duration_ms"),
-        VmImage => (&["vm"], "image"),
         VmUser => (&["vm"], "user"),
         VmSshKey => (&["vm"], "ssh_key"),
         VmPublicKey => (&["vm"], "public_key"),
@@ -442,7 +436,7 @@ pub fn set(doc: &mut DocumentMut, key: SettingKey, raw: &str) -> Result<()> {
         }
         // Optional strings: blank means "not set", which is how the compositor
         // reads them anyway, so drop the key instead of storing "".
-        VmImage | VmSshKey | VmPublicKey | VmPublicKeyFile => {
+        VmSshKey | VmPublicKey | VmPublicKeyFile => {
             if raw.trim().is_empty() {
                 table.remove(leaf);
             } else {
