@@ -35,6 +35,7 @@ func main() {
 	workspacesTab := buildWorkspacesTab(&cfg)
 	focusTab := buildFocusTab(&cfg)
 	sessionTab := buildSessionTab(&cfg)
+	vmTab := buildVMTab(&cfg)
 	appearanceTab := buildAppearanceTab(&cfg, w)
 
 	status := widget.NewLabel(statusText(loadedFrom))
@@ -57,6 +58,7 @@ func main() {
 		container.NewTabItem("Workspaces", workspacesTab),
 		container.NewTabItem("Focus", focusTab),
 		container.NewTabItem("Session", sessionTab),
+		container.NewTabItem("Virtual machines", vmTab),
 		container.NewTabItem("Appearance", appearanceTab),
 	)
 

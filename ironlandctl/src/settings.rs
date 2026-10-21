@@ -99,6 +99,24 @@ pub enum SettingKey {
     WindowAnimationsEnabled,
     #[value(name = "window_animations.duration_ms")]
     WindowAnimationsDurationMs,
+    #[value(name = "vm.image")]
+    VmImage,
+    #[value(name = "vm.user")]
+    VmUser,
+    #[value(name = "vm.ssh_key")]
+    VmSshKey,
+    #[value(name = "vm.public_key")]
+    VmPublicKey,
+    #[value(name = "vm.public_key_file")]
+    VmPublicKeyFile,
+    #[value(name = "vm.memory_mb")]
+    VmMemoryMb,
+    #[value(name = "vm.cpus")]
+    VmCpus,
+    #[value(name = "vm.kvm")]
+    VmKvm,
+    #[value(name = "vm.max_instances")]
+    VmMaxInstances,
 }
 
 impl SettingKey {
@@ -151,6 +169,15 @@ impl SettingKey {
             SessionShellUnit,
             WindowAnimationsEnabled,
             WindowAnimationsDurationMs,
+            VmImage,
+            VmUser,
+            VmSshKey,
+            VmPublicKey,
+            VmPublicKeyFile,
+            VmMemoryMb,
+            VmCpus,
+            VmKvm,
+            VmMaxInstances,
         ]
     }
 
@@ -201,6 +228,15 @@ impl SettingKey {
             SessionShellUnit => "session.shell_unit",
             WindowAnimationsEnabled => "window_animations.enabled",
             WindowAnimationsDurationMs => "window_animations.duration_ms",
+            VmImage => "vm.image",
+            VmUser => "vm.user",
+            VmSshKey => "vm.ssh_key",
+            VmPublicKey => "vm.public_key",
+            VmPublicKeyFile => "vm.public_key_file",
+            VmMemoryMb => "vm.memory_mb",
+            VmCpus => "vm.cpus",
+            VmKvm => "vm.kvm",
+            VmMaxInstances => "vm.max_instances",
         }
     }
 }
@@ -258,6 +294,15 @@ pub fn get(full: &FullConfig, key: SettingKey) -> String {
         SessionShellUnit => cfg.session.shell_unit.clone(),
         WindowAnimationsEnabled => cfg.window_animations.enabled.to_string(),
         WindowAnimationsDurationMs => cfg.window_animations.duration_ms.to_string(),
+        VmImage => cfg.vm.image.clone().unwrap_or_default(),
+        VmUser => cfg.vm.user.clone(),
+        VmSshKey => cfg.vm.ssh_key.clone().unwrap_or_default(),
+        VmPublicKey => cfg.vm.public_key.clone().unwrap_or_default(),
+        VmPublicKeyFile => cfg.vm.public_key_file.clone().unwrap_or_default(),
+        VmMemoryMb => cfg.vm.memory_mb.to_string(),
+        VmCpus => cfg.vm.cpus.to_string(),
+        VmKvm => cfg.vm.kvm.to_string(),
+        VmMaxInstances => cfg.vm.max_instances.to_string(),
     }
 }
 
@@ -359,6 +404,15 @@ fn table_and_leaf(key: SettingKey) -> (&'static [&'static str], &'static str) {
         SessionShellUnit => (&["session"], "shell_unit"),
         WindowAnimationsEnabled => (&["window_animations"], "enabled"),
         WindowAnimationsDurationMs => (&["window_animations"], "duration_ms"),
+        VmImage => (&["vm"], "image"),
+        VmUser => (&["vm"], "user"),
+        VmSshKey => (&["vm"], "ssh_key"),
+        VmPublicKey => (&["vm"], "public_key"),
+        VmPublicKeyFile => (&["vm"], "public_key_file"),
+        VmMemoryMb => (&["vm"], "memory_mb"),
+        VmCpus => (&["vm"], "cpus"),
+        VmKvm => (&["vm"], "kvm"),
+        VmMaxInstances => (&["vm"], "max_instances"),
     }
 }
 
@@ -386,6 +440,29 @@ pub fn set(doc: &mut DocumentMut, key: SettingKey, raw: &str) -> Result<()> {
         | KeyboardLayout | KeyboardVariant | KeyboardOptions | CursorTheme => {
             table[leaf] = value(raw);
         }
+        // Optional strings: blank means "not set", which is how the compositor
+        // reads them anyway, so drop the key instead of storing "".
+        VmImage | VmSshKey | VmPublicKey | VmPublicKeyFile => {
+            if raw.trim().is_empty() {
+                table.remove(leaf);
+            } else {
+                table[leaf] = value(raw.trim());
+            }
+        }
+        VmUser => {
+            let user = raw.trim();
+            if user.is_empty() || user.chars().any(char::is_whitespace) {
+                bail!("expected a guest account name such as user, got {raw:?}");
+            }
+            table[leaf] = value(user);
+        }
+        VmMemoryMb | VmCpus | VmMaxInstances => {
+            let n = parse_u32(raw)?;
+            if n == 0 {
+                bail!("{} must be at least 1", key.dotted());
+            }
+            table[leaf] = value(i64::from(n));
+        }
         SessionShellUnit => {
             let unit = raw.trim();
             if unit.is_empty() || unit.chars().any(char::is_whitespace) {
@@ -410,6 +487,7 @@ pub fn set(doc: &mut DocumentMut, key: SettingKey, raw: &str) -> Result<()> {
         | WorkspacesKeepDisconnected
         | SessionStartShell
         | WindowAnimationsEnabled
+        | VmKvm
         | AppearanceDarkMode => {
             table[leaf] = value(parse_bool(raw)?);
         }

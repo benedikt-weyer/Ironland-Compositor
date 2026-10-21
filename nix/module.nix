@@ -8,8 +8,9 @@ in
   options.services.ironland-compositor.vm = {
     enable = lib.mkEnableOption ''
       launching programs in QEMU VMs (`Left`/`Right` in the launcher). Builds
-      the guest disk image (`nix/vm-guest.nix`) with the system and points
-      `[vm] image` at it. The guest accepts the login key(s) the compositor
+      the guest disk image (`nix/vm-guest.nix`) with the system and links it
+      at `/etc/ironland-compositor/guest.qcow2`, which the compositor uses
+      whenever `[vm] image` is unset. The guest accepts the login key(s) the compositor
       hands it at boot: `[vm] public_key`/`public_key_file`, else
       `~/.ssh/id_ed25519.pub` plus whatever the ssh-agent holds, and ssh uses
       the agent (or `~/.ssh/id_*`) to log in
@@ -164,8 +165,13 @@ in
       ln -s ${images}/*.qcow2 $out
     '';
 
+  # Not `settings.vm.image`: a user's own config.toml replaces the one in
+  # /etc wholesale, which would hide the image. The compositor looks here
+  # whenever `[vm] image` is unset (`ironland_config::SYSTEM_VM_IMAGE`).
+  config.environment.etc."ironland-compositor/guest.qcow2" = lib.mkIf cfg.vm.enable {
+    source = cfg.vm.image;
+  };
   config.services.ironland-compositor.settings.vm = lib.mkIf cfg.vm.enable {
-    image = toString cfg.vm.image;
     user = cfg.vm.user;
   };
 

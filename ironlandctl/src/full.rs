@@ -106,6 +106,26 @@ pub fn write(doc: &mut DocumentMut, full: &FullConfig) {
     window_animations["enabled"] = value(cfg.window_animations.enabled);
     window_animations["duration_ms"] = value(i64::from(cfg.window_animations.duration_ms));
 
+    let vm = ensure_table(doc, "vm");
+    for (key, text) in [
+        ("image", &cfg.vm.image),
+        ("ssh_key", &cfg.vm.ssh_key),
+        ("public_key", &cfg.vm.public_key),
+        ("public_key_file", &cfg.vm.public_key_file),
+    ] {
+        match text.as_deref() {
+            Some(text) if !text.trim().is_empty() => vm[key] = value(text),
+            _ => {
+                vm.remove(key);
+            }
+        }
+    }
+    vm["user"] = value(cfg.vm.user.as_str());
+    vm["memory_mb"] = value(i64::from(cfg.vm.memory_mb));
+    vm["cpus"] = value(i64::from(cfg.vm.cpus));
+    vm["kvm"] = value(cfg.vm.kvm);
+    vm["max_instances"] = value(i64::from(cfg.vm.max_instances));
+
     let mut shortcuts = Table::new();
     let mut action_names: Vec<&String> = cfg.shortcuts.keys().collect();
     action_names.sort();

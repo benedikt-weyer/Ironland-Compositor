@@ -420,10 +420,30 @@ impl Default for VmSettings {
     }
 }
 
+/// Where the NixOS module (`services.ironland-compositor.vm.enable`) links the
+/// guest image it builds. Found independently of `config.toml` because a
+/// user's own config file replaces `/etc`'s wholesale, which would otherwise
+/// hide an image the system provides.
+pub const SYSTEM_VM_IMAGE: &str = "/etc/ironland-compositor/guest.qcow2";
+
 impl VmSettings {
-    /// Whether a guest image is configured, i.e. VM launches are possible.
+    /// The guest image to boot: `image` if set, else the system-provided one
+    /// ([`SYSTEM_VM_IMAGE`]) if it exists.
+    pub fn image_path(&self) -> Option<String> {
+        self.image
+            .as_deref()
+            .filter(|image| !image.trim().is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                std::path::Path::new(SYSTEM_VM_IMAGE)
+                    .exists()
+                    .then(|| SYSTEM_VM_IMAGE.to_string())
+            })
+    }
+
+    /// Whether a guest image is available, i.e. VM launches are possible.
     pub fn is_configured(&self) -> bool {
-        self.image.as_deref().is_some_and(|image| !image.trim().is_empty())
+        self.image_path().is_some()
     }
 }
 
@@ -1335,8 +1355,7 @@ mod tests {
         let raw: RawConfig = toml::from_str("").unwrap();
         assert!(raw.workspaces.keep_disconnected);
 
-        let raw: RawConfig =
-            toml::from_str("[workspaces]\nkeep_disconnected = false\n").unwrap();
+        let raw: RawConfig = toml::from_str("[workspaces]\nkeep_disconnected = false\n").unwrap();
         assert!(!raw.workspaces.keep_disconnected);
     }
 

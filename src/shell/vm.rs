@@ -458,10 +458,7 @@ fn agent_public_keys() -> Vec<String> {
 /// `<ssh_key>.pub` next to the configured private key; else
 /// `~/.ssh/id_ed25519.pub` plus every key the ssh-agent holds (`agent` is only
 /// called then). Empty means the guest has to have a key baked in.
-pub fn authorized_keys(
-    settings: &VmSettings,
-    agent: impl FnOnce() -> Vec<String>,
-) -> Vec<String> {
+pub fn authorized_keys(settings: &VmSettings, agent: impl FnOnce() -> Vec<String>) -> Vec<String> {
     let set = |value: &Option<String>| value.clone().filter(|v| !v.trim().is_empty());
     let read = |path: &Path| match std::fs::read_to_string(path) {
         Ok(text) => parse_public_keys(&text),
@@ -499,11 +496,13 @@ pub fn authorized_keys(
 
 /// Standard base64 (with padding).
 fn base64(data: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
-        let n = chunk.iter().enumerate().fold(0u32, |n, (i, b)| n | (*b as u32) << (16 - 8 * i));
+        let n = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |n, (i, b)| n | (*b as u32) << (16 - 8 * i));
         for i in 0..4 {
             if i <= chunk.len() {
                 out.push(ALPHABET[(n >> (18 - 6 * i) & 63) as usize] as char);
@@ -827,8 +826,8 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
         persistent: bool,
     ) -> Result<VmId, VmError> {
         let mut settings = self.config.vm.clone();
-        let image = match settings.image.as_deref().filter(|i| !i.trim().is_empty()) {
-            Some(image) => expand_tilde(image),
+        let image = match settings.image_path() {
+            Some(image) => expand_tilde(&image),
             None => return Err(VmError::NotConfigured),
         };
         if !image.exists() {
@@ -842,7 +841,9 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
         // cold-booted - and picks up the new key - instead of restored.
         let keys = authorized_keys(&settings, agent_public_keys);
         if keys.is_empty() {
-            warn!("No public key found for the VM guest (no ssh-agent keys, no ~/.ssh/id_ed25519.pub); login relies on a key baked into the image");
+            warn!(
+                "No public key found for the VM guest (no ssh-agent keys, no ~/.ssh/id_ed25519.pub); login relies on a key baked into the image"
+            );
         }
         settings.extra_qemu_args.extend(authorized_keys_args(&keys));
         let terminal = settings
@@ -2027,7 +2028,10 @@ mod key_tests {
             ssh_key: Some(private.display().to_string()),
             ..VmSettings::default()
         };
-        assert_eq!(authorized_keys(&from_private, Vec::new), vec![ED.to_string()]);
+        assert_eq!(
+            authorized_keys(&from_private, Vec::new),
+            vec![ED.to_string()]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2042,7 +2046,11 @@ mod key_tests {
         assert!(authorized_keys_args(&[]).is_empty());
         let args = authorized_keys_args(&[ED.to_string()]);
         assert_eq!(args[0], "-smbios");
-        assert!(args[1].starts_with("type=11,value=io.systemd.credential.binary:ironland.authorized_keys="));
+        assert!(
+            args[1].starts_with(
+                "type=11,value=io.systemd.credential.binary:ironland.authorized_keys="
+            )
+        );
         assert!(!args[1].contains(' '));
     }
 }

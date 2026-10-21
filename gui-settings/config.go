@@ -114,10 +114,9 @@ type SessionSettings struct {
 }
 
 // VMSettings mirrors `ironland_config::VmSettings`: launching programs
-// inside QEMU VMs whose windows appear on the host desktop. There is no GUI
-// tab for these yet - this struct exists so a `Config` round-tripped through
-// this GUI (load, edit something else, apply) doesn't silently reset a [vm]
-// section set via the config file.
+// inside QEMU VMs whose windows appear on the host desktop (edited in
+// vm_tab.go). Fields without a control there (terminal, extra QEMU args, ...)
+// are carried through so saving doesn't reset them.
 type VMSettings struct {
 	// Image is the bootable guest disk image; empty/null disables VM launches.
 	Image *string `json:"image"`
@@ -217,7 +216,7 @@ type Config struct {
 	Focus       FocusSettings             `json:"focus"`
 	Lock        LockSettings              `json:"lock"`
 	Session     SessionSettings           `json:"session"`
-	VM          VMSettings                `json:"vm"` // no GUI tab yet; carried through so saving doesn't reset it
+	VM          VMSettings                `json:"vm"`
 	Performance PerformanceSettings       `json:"performance"`
 	KeyTracker  KeyTrackerSettings        `json:"key_tracker"`
 	Appearance  AppearanceSettings        `json:"appearance"`
