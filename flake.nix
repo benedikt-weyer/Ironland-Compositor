@@ -301,6 +301,10 @@
               keyboard.layout = "us";
             };
 
+            # Nested VMs here run without KVM and `run-vm` shouldn't wait on
+            # building a guest image nobody launches from.
+            services.ironland-compositor.vm.enable = false;
+
             users.users.dev = {
               isNormalUser = true;
               extraGroups = [ "wheel" "video" "input" "render" ];

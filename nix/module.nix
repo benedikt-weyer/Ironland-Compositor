@@ -6,15 +6,20 @@ let
 in
 {
   options.services.ironland-compositor.vm = {
-    enable = lib.mkEnableOption ''
-      launching programs in QEMU VMs (`Left`/`Right` in the launcher). Builds
-      the guest disk image (`nix/vm-guest.nix`) with the system and links it
-      at `/etc/ironland-compositor/guest.qcow2`, which the compositor uses
-      whenever `[vm] image` is unset. The guest accepts the login key(s) the compositor
-      hands it at boot: `[vm] public_key`/`public_key_file`, else
-      `~/.ssh/id_ed25519.pub` plus whatever the ssh-agent holds, and ssh uses
-      the agent (or `~/.ssh/id_*`) to log in
-    '';
+    enable = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = ''
+        Launching programs in QEMU VMs (`Left`/`Right` in the launcher).
+        Builds the guest disk image (`nix/vm-guest.nix`) with the system and
+        links it at `/etc/ironland-compositor/guest.qcow2`, which the
+        compositor uses whenever `[vm] image` is unset. The guest accepts the
+        login key(s) the compositor hands it at boot: `[vm] public_key`/
+        `public_key_file`, else `~/.ssh/id_ed25519.pub` plus whatever the
+        ssh-agent holds, and ssh uses the agent (or `~/.ssh/id_*`) to log in.
+        On by default; set to false to skip building the guest image.
+      '';
+    };
     user = lib.mkOption {
       type = lib.types.str;
       default = "user";
