@@ -18,9 +18,10 @@
 //!
 //! Lifecycle of one VM:
 //!
-//! 1. `qemu-system-x86_64` starts headless on a `-snapshot` of the configured
-//!    image (so guests never modify it and many can share it), with the
-//!    guest's port 22 forwarded to a free loopback port.
+//! 1. `qemu-system-x86_64` starts headless on a `-snapshot` of the program's
+//!    own image (`vm.programs`: one program per VM, installed in that image;
+//!    so guests never modify it and many can share it), with the guest's
+//!    port 22 forwarded to a free loopback port.
 //! 2. A probe thread waits for the guest's SSH banner on that port and then
 //!    reports [`VmEvent::GuestReady`] over a calloop channel.
 //! 3. The main thread starts `waypipe ssh ... <command>` against the VM's
