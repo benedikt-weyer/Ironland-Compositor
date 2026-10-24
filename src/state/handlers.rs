@@ -80,6 +80,16 @@ impl<BackendData: Backend> crate::display_filter::DisplayFilterHandler for Anvil
     }
 }
 
+impl<BackendData: Backend> crate::cinema_mode::CinemaModeHandler for AnvilState<BackendData> {
+    fn cinema_mode_state(&mut self) -> &mut crate::cinema_mode::CinemaModeState {
+        &mut self.cinema_mode_state
+    }
+
+    fn cinema_mode_default_output(&self) -> Option<String> {
+        crate::input_handler::current_output_for_workspace_nav(self).map(|output| output.name())
+    }
+}
+
 impl<BackendData: Backend + 'static> crate::vm_launch::VmLaunchHandler for AnvilState<BackendData> {
     fn vm_launch_state(&mut self) -> &mut crate::vm_launch::VmLaunchState {
         &mut self.vm_launch_state

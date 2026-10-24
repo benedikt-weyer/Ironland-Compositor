@@ -1,0 +1,106 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="ironland_cinema_mode_v1">
+  <copyright>
+    Copyright © 2026 the ironland-compositor contributors
+
+    Permission is hereby granted, free of charge, to any person obtaining a
+    copy of this software and associated documentation files (the
+    "Software"), to deal in the Software without restriction, including
+    without limitation the rights to use, copy, modify, merge, publish,
+    distribute, sublicense, and/or sell copies of the Software, and to
+    permit persons to whom the Software is furnished to do so, subject to
+    the following conditions:
+
+    The above copyright notice and this permission notice shall be included
+    in all copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+    OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+    MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+    IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+    CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+    TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+    SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+  </copyright>
+
+  <description summary="darken every output but one (cinema mode)">
+    Lets a client switch the desktop into a "cinema mode": one output stays
+    as it is and every other output goes dark, so a film on the lit output
+    isn't competing with a bright second monitor. Optionally the dark
+    outputs glow faintly in the colors found along the border of the lit
+    output, as if its light spilled over onto the screens around it.
+
+    Like the display filter, this is a pure mechanism: the compositor only
+    applies what was asked for, and *when* cinema mode should be on is the
+    client's business. Nothing here needs the user's permission, since the
+    effect is purely visual, never hides anything the user can't bring back
+    by switching it off, and ends by itself if the client does.
+
+    The mode is tied to the lifetime of the object: when a client destroys
+    it or disconnects (including by crashing), whatever it requested is
+    withdrawn, so a dead shell can never leave screens black. If several
+    live objects have made requests, the most recent request wins as a
+    whole (the output and the glow of the object that made it). When the
+    object that made the most recent request goes away, the most recent
+    request of the remaining live objects takes over. Binding the global or
+    creating an object requests nothing by itself.
+
+    Dark outputs keep showing the pointer, and input keeps working on them;
+    only their picture is replaced. The compositor fades the dark outputs
+    in and out over a fraction of a second, so the client doesn't need to
+    animate anything.
+
+    If the lit output is unplugged while the mode is on, the mode does
+    nothing until an output of that name is back (rather than blacking out
+    every screen).
+  </description>
+
+  <interface name="ironland_cinema_mode_v1" version="1">
+    <request name="destroy" type="destructor">
+      <description summary="withdraw this object's requests">
+        Ends whatever this object requested; the outputs fade back in unless
+        another live object still has cinema mode switched on.
+      </description>
+    </request>
+
+    <request name="enable">
+      <description summary="switch cinema mode on">
+        Turns cinema mode on with `output` as the one that stays lit; every
+        other output goes dark. If `output` is null the compositor picks the
+        output the user is working on at the moment of the request: the one
+        with the keyboard-focused window, otherwise the one under the
+        pointer. The pick is made once; it doesn't follow the pointer or
+        focus afterwards.
+
+        Sending enable again, with the same or another output, keeps the
+        mode on and moves the lit screen (the dark ones fade as needed). The
+        glow strength set with set_glow is kept.
+      </description>
+      <arg name="output" type="object" interface="wl_output" allow-null="true"
+           summary="the output that stays lit, or null for the current one"/>
+    </request>
+
+    <request name="disable">
+      <description summary="switch cinema mode off">
+        Turns cinema mode off: the dark outputs fade back to normal. The
+        glow strength set with set_glow is kept for the next enable.
+      </description>
+    </request>
+
+    <request name="set_glow">
+      <description summary="set the strength of the glow on the dark outputs">
+        Sets how strongly the dark outputs pick up the colors along the
+        border of the lit output: 0 turns the glow off (the dark outputs
+        stay plain black, the default), 100 is the strongest. Values above
+        100 are treated as 100. A stronger glow is both brighter and
+        reaches further across the dark outputs.
+
+        The glow follows the picture on the lit output as it changes. It
+        only shows on dark outputs, and only while cinema mode is on; the
+        value is remembered either way. Takes effect at once, also while
+        cinema mode is already on.
+      </description>
+      <arg name="strength" type="uint" summary="glow strength, 0 (off) to 100"/>
+    </request>
+  </interface>
+</protocol>

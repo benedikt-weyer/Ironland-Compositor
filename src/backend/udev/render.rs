@@ -350,6 +350,8 @@ impl AnvilState<UdevData> {
                 tint_kelvin,
             )
         });
+        let cinema = self.cinema_mode_state.current();
+        let cinema_frame = self.cinema.frame(cinema.as_ref(), &self.space, &output);
         let capture_frame_index = surface.capture_frame_index;
         let since_vblank = surface.pending_vblank_at.take().map(|at| at.elapsed());
         let result = render_surface(
@@ -378,6 +380,7 @@ impl AnvilState<UdevData> {
             drop_indicator,
             drop_indicator_cache,
             tint,
+            cinema_frame,
             &self.config.performance,
             &*perf_stats,
             fps_overlay_cache,
@@ -386,7 +389,10 @@ impl AnvilState<UdevData> {
             presented,
         );
         let reschedule = match result {
-            Ok((has_rendered, states, timings)) => {
+            Ok((has_rendered, states, timings, border_strips)) => {
+                if let Some(strips) = border_strips {
+                    self.cinema.submit(&strips);
+                }
                 let dmabuf_feedback = surface.dmabuf_feedback.clone();
                 if has_rendered {
                     surface.capture_frame_index = surface.capture_frame_index.wrapping_add(1);
@@ -538,13 +544,22 @@ pub(super) fn render_surface<'a>(
     drop_indicator: Option<Rectangle<i32, Logical>>,
     drop_indicator_cache: &mut crate::border::BorderCache,
     tint: Option<smithay::backend::renderer::element::solid::SolidColorRenderElement>,
+    cinema: crate::cinema::CinemaFrame,
     performance: &crate::config::PerformanceSettings,
     perf_stats: &crate::perf_overlay::FrameStats,
     fps_overlay_cache: &mut crate::perf_overlay::OverlayCache,
     key_tracker: &mut crate::key_tracker::KeyTracker,
     pending_captures: Vec<smithay::wayland::image_copy_capture::Frame>,
     presented: Duration,
-) -> Result<(bool, RenderElementStates, RenderTimings), SwapBuffersError> {
+) -> Result<
+    (
+        bool,
+        RenderElementStates,
+        RenderTimings,
+        Option<crate::cinema::BorderStrips>,
+    ),
+    SwapBuffersError,
+> {
     let build_start = Instant::now();
     let output_geometry = space.output_geometry(output).unwrap();
     let scale = Scale::from(output.current_scale().fractional_scale());
@@ -813,6 +828,19 @@ pub(super) fn render_surface<'a>(
         }
     }
 
+    // Cinema mode: a dark output is covered behind everything drawn so far
+    // (so the cursor stays visible), in front of its windows. The lock screen
+    // takes precedence, it must stay readable on every output.
+    let mut sample_border = None;
+    match cinema {
+        crate::cinema::CinemaFrame::Normal => {}
+        crate::cinema::CinemaFrame::Lit { force } => sample_border = Some(force),
+        crate::cinema::CinemaFrame::Dark(cover) if !locked => {
+            custom_elements.push(cover.element(renderer));
+        }
+        crate::cinema::CinemaFrame::Dark(_) => {}
+    }
+
     // Night mode: frontmost, so it also tints the cursor and the lock panel.
     if let Some(tint) = tint {
         custom_elements.insert(0, CustomRenderElements::Tint(tint));
@@ -894,6 +922,13 @@ pub(super) fn render_surface<'a>(
         }
     }
 
+    // The lit output of cinema mode: its border colors for the glow on the
+    // dark ones. A frame without changes has nothing new to read, unless no
+    // colors were read yet.
+    let border_strips = sample_border
+        .filter(|&force| force || !render_frame_result.is_empty)
+        .and_then(|_| sample_udev_border(&render_frame_result, renderer, output));
+
     let (rendered, states) = (!render_frame_result.is_empty, render_frame_result.states);
 
     update_primary_scanout_output(space, output, dnd_icon, cursor_status, &states);
@@ -917,6 +952,7 @@ pub(super) fn render_surface<'a>(
             damage_and_draw,
             submit,
         },
+        border_strips,
     ))
 }
 
@@ -995,3 +1031,51 @@ pub(super) fn capture_udev_frame<'a, B, F, E>(
     crate::screencopy::fulfill(pending, renderer, &fb, size, presented);
 }
 
+/// Reads the border colors of the frame `render_frame_result` (from
+/// `surface.drm_output.render_frame`, called immediately before this) holds,
+/// for cinema mode's glow (see `crate::cinema`). Composites it into an
+/// offscreen renderbuffer first, exactly like [`capture_udev_frame`], since
+/// the frame may have been scanned out directly and so exist in no readable
+/// framebuffer. `None` if any step fails.
+pub(super) fn sample_udev_border<'a, B, F, E>(
+    render_frame_result: &smithay::backend::drm::compositor::RenderFrameResult<'_, B, F, E>,
+    renderer: &mut UdevRenderer<'a>,
+    output: &Output,
+) -> Option<crate::cinema::BorderStrips>
+where
+    B: smithay::backend::allocator::Buffer + smithay::backend::allocator::dmabuf::AsDmabuf,
+    <B as smithay::backend::allocator::dmabuf::AsDmabuf>::Error: std::fmt::Debug,
+    F: smithay::backend::drm::Framebuffer,
+    E: smithay::backend::renderer::element::Element + smithay::backend::renderer::element::RenderElement<UdevRenderer<'a>>,
+{
+    use smithay::backend::renderer::gles::GlesRenderbuffer;
+    use smithay::backend::renderer::{Bind, Offscreen};
+
+    let size = crate::screencopy::output_buffer_size(output)?;
+    let mut offscreen: GlesRenderbuffer = renderer
+        .create_buffer(Fourcc::Argb8888, size)
+        .inspect_err(|err| tracing::debug!(?err, "cinema: failed to allocate sampling buffer"))
+        .ok()?;
+    let mut fb = renderer
+        .bind(&mut offscreen)
+        .inspect_err(|err| tracing::debug!(?err, "cinema: failed to bind sampling buffer"))
+        .ok()?;
+
+    let physical_size: Size<i32, Physical> = (size.w, size.h).into();
+    let sync = render_frame_result
+        .blit_frame_result(
+            physical_size,
+            output.current_transform(),
+            output.current_scale().fractional_scale(),
+            renderer,
+            &mut fb,
+            [Rectangle::from_size(physical_size)],
+            [],
+        )
+        .inspect_err(|err| tracing::debug!(?err, "cinema: failed to composite frame for sampling"))
+        .ok()?;
+    // The strips are read right after, so the composite has to be done.
+    let _ = sync.wait();
+
+    crate::cinema::read_border_strips(renderer, &fb, size)
+}

@@ -1,6 +1,7 @@
 //! Rendering pipeline, drawing helpers, overlays and wallpaper handling.
 
 pub mod border;
+pub mod cinema;
 #[cfg(any(feature = "udev", feature = "xwayland"))]
 pub mod cursor;
 pub mod drawing;
@@ -73,7 +74,9 @@ smithay::backend::renderer::element::render_elements! {
     // The focus-highlight border around the currently focused window (see
     // `crate::border`).
     Border=crate::border::BorderRenderElement,
-    // The night-mode tint over the whole output (see `crate::tint`).
+    // A solid quad over the whole output: the night-mode tint (see
+    // `crate::tint`) or the black cover of a dark output in cinema mode (see
+    // `crate::cinema`).
     Tint=smithay::backend::renderer::element::solid::SolidColorRenderElement,
     #[cfg(feature = "debug")]
     // Note: We would like to borrow this element instead, but that would introduce

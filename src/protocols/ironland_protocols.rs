@@ -1,10 +1,11 @@
 //! Server-side generated bindings for ironland-compositor's own small
 //! Wayland protocol extensions (XML under `protocols/`): named shortcuts,
 //! single-surface focus grabs, per-window workspace membership, an
-//! in-memory clipboard history, a screen-wide color filter, and launching
-//! applications inside VMs (see `crate::shortcuts`, `crate::focus_grab`,
-//! `crate::display_filter`, `crate::workspace_windows`, `crate::clipboard`
-//! and `crate::vm_launch`).
+//! in-memory clipboard history, a screen-wide color filter, a cinema mode
+//! that darkens all outputs but one, and launching applications inside VMs
+//! (see `crate::shortcuts`, `crate::focus_grab`, `crate::display_filter`,
+//! `crate::workspace_windows`, `crate::clipboard`, `crate::cinema_mode` and
+//! `crate::vm_launch`).
 //!
 //! These aren't in the `wayland-protocols`/`wayland-protocols-wlr` crates
 //! (nothing standard covers either need, and Hyprland's own equivalents -
@@ -131,4 +132,17 @@ pub mod display_filter {
     use self::__interfaces::*;
 
     wayland_scanner::generate_server_code!("./protocols/ironland-display-filter-v1.xml");
+}
+
+pub mod cinema_mode {
+    use wayland_server;
+    use wayland_server::protocol::*;
+
+    pub mod __interfaces {
+        use wayland_server::protocol::__interfaces::*;
+        wayland_scanner::generate_interfaces!("./protocols/ironland-cinema-mode-v1.xml");
+    }
+    use self::__interfaces::*;
+
+    wayland_scanner::generate_server_code!("./protocols/ironland-cinema-mode-v1.xml");
 }

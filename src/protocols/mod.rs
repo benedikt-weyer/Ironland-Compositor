@@ -1,6 +1,7 @@
 //! Wayland protocol server sides: the custom `ironland-*` extensions and the
 //! standard protocols bridged to the shell.
 
+pub mod cinema_mode;
 pub mod clipboard;
 pub mod display_filter;
 pub mod ext_workspace;

@@ -102,7 +102,7 @@ pub(super) fn launcher_key_action(keysym: Keysym) -> KeyAction {
 /// The output workspace navigation/movement should act on: the output
 /// backing the currently focused window if there is one, else whichever
 /// output the pointer is over, else the first output.
-pub(super) fn current_output_for_workspace_nav<BackendData: Backend>(
+pub(crate) fn current_output_for_workspace_nav<BackendData: Backend>(
     state: &AnvilState<BackendData>,
 ) -> Option<smithay::output::Output> {
     if let Some(keyboard) = state.seat.get_keyboard()
