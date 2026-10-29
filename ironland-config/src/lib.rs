@@ -409,6 +409,10 @@ pub struct VmSettings {
     /// than Left) keep their disk overlay and saved state, one directory per
     /// application. `None` uses `$XDG_DATA_HOME/ironland-compositor/vm/persistent`.
     pub state_dir: Option<String>,
+    /// The Tor client (`tor`) the VMs' Tor-only mode goes through. Started by
+    /// the compositor, on the host and outside every VM, when a VM first
+    /// switches to Tor, and stopped when none uses it.
+    pub tor_binary: String,
 }
 
 impl Default for VmSettings {
@@ -427,6 +431,7 @@ impl Default for VmSettings {
             terminal: None,
             extra_qemu_args: Vec::new(),
             state_dir: None,
+            tor_binary: "tor".to_string(),
         }
     }
 }

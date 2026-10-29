@@ -69,6 +69,17 @@ impl<BackendData: Backend> AnvilState<BackendData> {
             return;
         }
 
+        // The VM overview owns the pointer too: a left click is a button press
+        // (or a selection, or - outside the panel - closes it).
+        if self.vm_overview.is_visible() {
+            if wl_pointer::ButtonState::Released == state
+                && evt.button() == Some(MouseButton::Left)
+            {
+                self.vm_overview_click();
+            }
+            return;
+        }
+
         if wl_pointer::ButtonState::Pressed == state {
             let super_held = self
                 .seat
@@ -208,8 +219,8 @@ impl<BackendData: Backend> AnvilState<BackendData> {
         &self,
         pos: Point<f64, Logical>,
     ) -> Option<(PointerFocusTarget, Point<f64, Logical>)> {
-        // Nothing is reachable behind the screen lock or the overview.
-        if self.lock.is_locked() || self.overview.is_visible() {
+        // Nothing is reachable behind the screen lock or the overviews.
+        if self.lock.is_locked() || self.overview.is_visible() || self.vm_overview.is_visible() {
             return None;
         }
         let output = self.space.outputs().find(|o| {

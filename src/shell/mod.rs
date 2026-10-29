@@ -51,7 +51,9 @@ mod grabs;
 pub(crate) mod ssd;
 pub mod tiling;
 pub mod vm;
-mod vm_state;
+pub mod vm_state;
+pub mod vm_gateway;
+pub mod vm_tor;
 #[cfg(feature = "xwayland")]
 mod x11;
 mod xdg;

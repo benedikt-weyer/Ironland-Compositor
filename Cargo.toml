@@ -104,6 +104,8 @@ wayland-server = "0.31.14"
 # already targets a current libwayland.
 wayland-backend = { version = "0.3.17", features = ["libwayland_server_1_23"] }
 wayland-scanner = "0.31.11"
+smoltcp = { version = "0.14.0", default-features = false, features = ["std", "medium-ethernet", "proto-ipv4", "proto-dhcpv4", "socket-tcp", "socket-udp"] }
+heapless = "0.9"
 
 [dependencies.smithay]
 git = "https://github.com/Smithay/smithay.git"

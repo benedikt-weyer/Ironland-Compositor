@@ -143,6 +143,8 @@ type VMSettings struct {
 	ExtraQemuArgs []string `json:"extra_qemu_args"`
 	// StateDir is where persistent VMs keep their disk and saved state.
 	StateDir *string `json:"state_dir"`
+	// TorBinary is the Tor client the VMs' Tor-only mode runs on the host.
+	TorBinary string `json:"tor_binary"`
 }
 
 // FocusSettings mirrors `ironland_config::FocusSettings`: both default off,

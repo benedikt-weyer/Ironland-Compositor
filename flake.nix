@@ -109,7 +109,8 @@
           # binary itself needs Xwayland on its PATH instead.
           #
           # Programs launched "as virtual" (see `src/shell/vm.rs`) shell out
-          # to `qemu-system-x86_64`, `waypipe` and `ssh` by bare name too.
+          # to `qemu-system-x86_64`, `waypipe` and `ssh` by bare name too, and
+          # a VM's Tor mode runs the host's `tor` (`vm.tor_binary`).
           # Those are *suffixed* rather than prefixed so a copy the user
           # already has on PATH wins.
           #
@@ -126,7 +127,7 @@
           # generated here instead of checked in statically.
           postFixup = ''
             wrapProgram $out/bin/ironland-compositor --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.xwayland ]} \
-              --suffix PATH : ${pkgs.lib.makeBinPath [ pkgs.qemu_kvm pkgs.waypipe pkgs.openssh ]}
+              --suffix PATH : ${pkgs.lib.makeBinPath [ pkgs.qemu_kvm pkgs.waypipe pkgs.openssh pkgs.tor ]}
             # `ironlandctl outputs detect` shells out to `wayland-info` by
             # bare name to enumerate connected monitors, so it needs
             # wayland-utils on its PATH the same way ironland-compositor
@@ -219,6 +220,8 @@
             qemu_kvm
             waypipe
             openssh
+            # A VM's Tor mode (`src/shell/vm_tor.rs`).
+            tor
           ] ++ nativeBuildInputs ++ buildInputs;
 
           RUST_SRC_PATH = "${pkgs.rust.packages.stable.rustPlatform.rustLibSrc}";

@@ -151,7 +151,9 @@ in
       have `waypipe` installed. `memory_mb` (default 2048), `cpus` (default
       2), `kvm` (default true), `max_instances` (default 8),
       `startup_timeout_secs` (default 180), `terminal` (the guest's terminal
-      for `Terminal=true` entries, default the top-level `terminal`) and
+      for `Terminal=true` entries, default the top-level `terminal`),
+      `tor_binary` (the host's Tor client for a VM's Tor-only mode, default
+      `"tor"`: it has to be on the compositor's PATH) and
       `extra_qemu_args` tune the rest. Nothing is offered until a program is
       set up. `vm.programs` (a separate NixOS option) builds the guest images;
       `scripts/build-vm-guest` builds one by hand.

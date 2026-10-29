@@ -524,12 +524,12 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
                     match event {
                         crate::shell::vm::VmEvent::GuestReady(id) => data.vm_guest_ready(id),
                         crate::shell::vm::VmEvent::SaveFailed(id, why) => data.vm_save_failed(id, why),
-                        crate::shell::vm::VmEvent::InternetSet {
+                        crate::shell::vm::VmEvent::NetworkSet {
                             id,
                             qemu_pid,
-                            online,
+                            mode,
                             result,
-                        } => data.vm_internet_set(id, qemu_pid, online, result),
+                        } => data.vm_network_set(id, qemu_pid, mode, result),
                     }
                 }
             })

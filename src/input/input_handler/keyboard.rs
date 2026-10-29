@@ -103,6 +103,10 @@ impl<BackendData: Backend> AnvilState<BackendData> {
 
             KeyAction::VmOverviewToggleInternet => self.vm_overview_toggle_internet(),
 
+            KeyAction::VmOverviewMode(mode) => self.vm_overview_set_mode(mode),
+
+            KeyAction::VmOverviewNewIdentity => self.vm_overview_new_identity(),
+
             KeyAction::LauncherType(c) => {
                 self.launcher.push_char(c);
             }

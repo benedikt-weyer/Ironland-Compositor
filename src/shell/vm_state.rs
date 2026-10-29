@@ -57,16 +57,69 @@ pub struct PersistMeta {
     pub machine: String,
     /// Whether the overlay holds a saved state ([`STATE_TAG`]) to load.
     pub has_state: bool,
-    /// Whether the VM may reach the internet. Turned off from the VM overview
-    /// and kept here so it still applies the next time the VM starts - also
-    /// after a reboot of the computer. Absent in files from before the
-    /// setting existed, which means "online".
-    #[serde(default = "network_enabled_default")]
-    pub network_enabled: bool,
+    /// How the VM reaches the internet. Chosen in the VM overview and kept
+    /// here so it still applies the next time the VM starts - also after a
+    /// reboot of the computer.
+    pub network: NetMode,
 }
 
-fn network_enabled_default() -> bool {
-    true
+/// How a VM is connected to the outside world.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetMode {
+    /// Straight through the host's network (QEMU's NAT).
+    #[default]
+    Online,
+    /// Only through Tor, by way of the VM's transparent gateway (see
+    /// [`super::vm_gateway`]); a Tor client on the host does the rest.
+    Tor,
+    /// Not at all. The compositor's own ssh link to the guest still works.
+    Offline,
+}
+
+impl NetMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            NetMode::Online => "online",
+            NetMode::Tor => "tor",
+            NetMode::Offline => "offline",
+        }
+    }
+}
+
+/// `meta.json` as it is on disk: [`PersistMeta`], plus what older versions
+/// wrote.
+#[derive(Deserialize)]
+struct MetaFile {
+    image: String,
+    image_len: u64,
+    image_mtime: u64,
+    machine: String,
+    has_state: bool,
+    network: Option<NetMode>,
+    /// The only network setting there was before Tor: on or off.
+    network_enabled: Option<bool>,
+}
+
+impl From<MetaFile> for PersistMeta {
+    fn from(file: MetaFile) -> Self {
+        let network = file.network.unwrap_or(match file.network_enabled {
+            Some(false) => NetMode::Offline,
+            _ => NetMode::Online,
+        });
+        PersistMeta {
+            image: file.image,
+            image_len: file.image_len,
+            image_mtime: file.image_mtime,
+            machine: file.machine,
+            has_state: file.has_state,
+            network,
+        }
+    }
+}
+
+fn parse_meta(bytes: &[u8]) -> Option<PersistMeta> {
+    serde_json::from_slice::<MetaFile>(bytes).ok().map(Into::into)
 }
 
 /// What [`prepare`] found or made.
@@ -116,10 +169,11 @@ pub fn state_root(settings: &VmSettings) -> PathBuf {
     data_home.join("ironland-compositor/vm/persistent")
 }
 
-/// Version of the guest's network devices (see `qemu_args`): one NIC for the
-/// internet and one for the compositor's own ssh link. Part of the machine
-/// fingerprint because a saved state only loads into the same devices.
-const NETWORK_LAYOUT: u32 = 2;
+/// Version of the guest's network devices (see `qemu_args`): one NIC each for
+/// the internet, for the Tor gateway and for the compositor's own ssh link.
+/// Part of the machine fingerprint because a saved state only loads into the
+/// same devices.
+const NETWORK_LAYOUT: u32 = 3;
 
 /// The settings a saved state is tied to: it can only be loaded into a
 /// machine configured identically.
@@ -162,7 +216,7 @@ pub fn image_format(image: &Path) -> io::Result<&'static str> {
 }
 
 fn read_meta(path: &Path) -> Option<PersistMeta> {
-    serde_json::from_slice(&fs::read(path).ok()?).ok()
+    parse_meta(&fs::read(path).ok()?)
 }
 
 fn write_meta(path: &Path, meta: &PersistMeta) -> io::Result<()> {
@@ -246,7 +300,7 @@ pub fn prepare(dir: &Path, image: &Path, settings: &VmSettings) -> Result<Prepar
         image_mtime: mtime,
         machine: fingerprint,
         has_state: false,
-        network_enabled: true,
+        network: NetMode::Online,
     };
     write_meta(&meta_path, &meta).map_err(|e| format!("writing {}: {e}", meta_path.display()))?;
     Ok(Prepared {
@@ -272,14 +326,10 @@ pub fn mark_saved(
     write_meta(meta_path, &meta)
 }
 
-/// Stores whether the VM described by `meta` may reach the internet, for its
-/// next start (and for a save at the end of this run).
-pub fn set_network_enabled(
-    meta: &mut PersistMeta,
-    meta_path: &Path,
-    enabled: bool,
-) -> io::Result<()> {
-    meta.network_enabled = enabled;
+/// Stores how the VM described by `meta` is connected, for its next start
+/// (and for a save at the end of this run).
+pub fn set_network_mode(meta: &mut PersistMeta, meta_path: &Path, mode: NetMode) -> io::Result<()> {
+    meta.network = mode;
     write_meta(meta_path, meta)
 }
 
@@ -511,27 +561,41 @@ fn qmp_command(
     }
 }
 
-/// Id of the host-side network backend that gives the guest its internet
-/// (`-netdev user,id=inet`, see `vm::qemu_args`). Taking its link down cuts
-/// the guest off without touching the ssh link, which runs over a second
-/// device.
+/// Ids of the host-side network backends (see `vm::qemu_args`): the guest's
+/// NAT to the internet, and its Tor gateway. A NIC whose link is down carries
+/// nothing, so a mode is just which of these two are up; the ssh link the
+/// compositor uses is a third device that is never touched.
 pub const INTERNET_NETDEV: &str = "inet";
+pub const TOR_NETDEV: &str = "tor";
 
-fn set_link_command(up: bool) -> Value {
-    json!({"execute": "set_link", "arguments": {"name": INTERNET_NETDEV, "up": up}})
+fn set_link_command(netdev: &str, up: bool) -> Value {
+    json!({"execute": "set_link", "arguments": {"name": netdev, "up": up}})
 }
 
-/// Brings the guest's internet link up or down over the QMP socket at `path`.
-/// With `resume`, also starts a guest that was launched paused (`-S`), so a
-/// VM that must start offline never runs with the link up. Blocks; call from
-/// a helper thread.
-pub fn set_internet_over_socket(path: &Path, up: bool, resume: bool) -> Result<(), String> {
+/// The links a mode wants, in the order they are changed: whatever is being
+/// taken away goes first, so there is never a moment with more connectivity
+/// than either the old or the new mode allows.
+fn links_for(mode: NetMode) -> [(&'static str, bool); 2] {
+    match mode {
+        NetMode::Online => [(TOR_NETDEV, false), (INTERNET_NETDEV, true)],
+        NetMode::Tor => [(INTERNET_NETDEV, false), (TOR_NETDEV, true)],
+        NetMode::Offline => [(INTERNET_NETDEV, false), (TOR_NETDEV, false)],
+    }
+}
+
+/// Puts the guest into `mode` over the QMP socket at `path`. With `resume`,
+/// also starts a guest that was launched paused (`-S`), so a VM that must
+/// not start online never runs a single instruction with the wrong links.
+/// Blocks; call from a helper thread.
+pub fn set_network_over_socket(path: &Path, mode: NetMode, resume: bool) -> Result<(), String> {
     let (mut writer, mut reader) = qmp_session(connect_with_retries(path)?)?;
     reader
         .get_ref()
         .set_read_timeout(Some(Duration::from_secs(10)))
         .map_err(|e| e.to_string())?;
-    qmp_command(&mut writer, &mut reader, &set_link_command(up))?;
+    for (netdev, up) in links_for(mode) {
+        qmp_command(&mut writer, &mut reader, &set_link_command(netdev, up))?;
+    }
     if resume {
         qmp_command(&mut writer, &mut reader, &json!({"execute": "cont"}))?;
     }
@@ -885,35 +949,55 @@ mod tests {
         })
     }
 
-    #[test]
-    fn cutting_the_internet_takes_the_internet_netdev_down() {
-        let dir = scratch("net-down");
+    /// `(netdev, up)` of every `set_link` the monitor was sent for `mode`.
+    fn links_set_for(name: &str, mode: NetMode, resume: bool) -> (Vec<(String, bool)>, Vec<String>) {
+        let dir = scratch(name);
         let path = dir.join("qmp.sock");
         let monitor = fake_monitor(&path);
-        set_internet_over_socket(&path, false, false).unwrap();
+        set_network_over_socket(&path, mode, resume).unwrap();
         let seen = monitor.join().unwrap();
-        assert_eq!(seen.len(), 2, "{seen:?}");
-        assert_eq!(seen[0]["execute"], "qmp_capabilities");
-        assert_eq!(seen[1]["execute"], "set_link");
-        assert_eq!(seen[1]["arguments"]["name"], INTERNET_NETDEV);
-        assert_eq!(seen[1]["arguments"]["up"], false);
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn a_vm_started_paused_is_resumed_only_after_its_link_is_set() {
-        let dir = scratch("net-resume");
-        let path = dir.join("qmp.sock");
-        let monitor = fake_monitor(&path);
-        set_internet_over_socket(&path, false, true).unwrap();
-        let commands: Vec<String> = monitor
-            .join()
-            .unwrap()
+        let links = seen
+            .iter()
+            .filter(|c| c["execute"] == "set_link")
+            .map(|c| {
+                (
+                    c["arguments"]["name"].as_str().unwrap().to_string(),
+                    c["arguments"]["up"].as_bool().unwrap(),
+                )
+            })
+            .collect();
+        let commands = seen
             .iter()
             .map(|c| c["execute"].as_str().unwrap().to_string())
             .collect();
-        assert_eq!(commands, ["qmp_capabilities", "set_link", "cont"]);
         fs::remove_dir_all(dir).unwrap();
+        (links, commands)
+    }
+
+    #[test]
+    fn each_mode_sets_exactly_the_links_it_stands_for() {
+        let link = |name: &str, up| (name.to_string(), up);
+        // Whatever is taken away goes first.
+        assert_eq!(
+            links_set_for("m-online", NetMode::Online, false).0,
+            [link("tor", false), link("inet", true)]
+        );
+        assert_eq!(
+            links_set_for("m-tor", NetMode::Tor, false).0,
+            [link("inet", false), link("tor", true)]
+        );
+        assert_eq!(
+            links_set_for("m-off", NetMode::Offline, false).0,
+            [link("inet", false), link("tor", false)]
+        );
+    }
+
+    #[test]
+    fn a_vm_started_paused_is_resumed_only_after_its_links_are_set() {
+        let (_, commands) = links_set_for("net-resume", NetMode::Tor, true);
+        assert_eq!(commands, ["qmp_capabilities", "set_link", "set_link", "cont"]);
+        let (_, commands) = links_set_for("net-noresume", NetMode::Tor, false);
+        assert_eq!(commands, ["qmp_capabilities", "set_link", "set_link"]);
     }
 
     #[test]
@@ -935,7 +1019,7 @@ mod tests {
                 writer.write_all(reply.as_bytes()).unwrap();
             }
         });
-        let err = set_internet_over_socket(&path, false, true).unwrap_err();
+        let err = set_network_over_socket(&path, NetMode::Offline, true).unwrap_err();
         assert!(err.contains("not found"), "{err}");
         monitor.join().unwrap();
         fs::remove_dir_all(dir).unwrap();
@@ -943,13 +1027,45 @@ mod tests {
 
     #[test]
     fn metadata_from_before_the_network_setting_means_online() {
-        let old = r#"{"image":"/i","image_len":1,"image_mtime":2,"machine":"m","has_state":true}"#;
-        let meta: PersistMeta = serde_json::from_str(old).unwrap();
-        assert!(meta.network_enabled);
+        let old = br#"{"image":"/i","image_len":1,"image_mtime":2,"machine":"m","has_state":true}"#;
+        assert_eq!(parse_meta(old).unwrap().network, NetMode::Online);
     }
 
     #[test]
-    fn a_vm_without_internet_stays_that_way_across_restarts_and_saves() {
+    fn metadata_from_the_on_off_setting_keeps_its_meaning() {
+        let file = |extra: &str| {
+            format!(
+                r#"{{"image":"/i","image_len":1,"image_mtime":2,"machine":"m","has_state":true{extra}}}"#
+            )
+        };
+        // A VM switched off by the version that only knew on and off must
+        // not come back online.
+        let off = parse_meta(file(r#","network_enabled":false"#).as_bytes()).unwrap();
+        assert_eq!(off.network, NetMode::Offline);
+        let on = parse_meta(file(r#","network_enabled":true"#).as_bytes()).unwrap();
+        assert_eq!(on.network, NetMode::Online);
+        // The new setting wins when both are there.
+        let tor = parse_meta(file(r#","network":"tor","network_enabled":false"#).as_bytes()).unwrap();
+        assert_eq!(tor.network, NetMode::Tor);
+    }
+
+    #[test]
+    fn the_mode_is_written_by_name() {
+        let meta = PersistMeta {
+            image: "/i".into(),
+            image_len: 1,
+            image_mtime: 2,
+            machine: "m".into(),
+            has_state: false,
+            network: NetMode::Tor,
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        assert!(json.contains(r#""network":"tor""#), "{json}");
+        assert_eq!(parse_meta(json.as_bytes()), Some(meta));
+    }
+
+    #[test]
+    fn a_vms_network_mode_survives_restarts_and_saves() {
         let dir = scratch("net-persist");
         let image = dir.join("base.raw");
         fs::write(&image, b"not qcow2").unwrap();
@@ -965,30 +1081,33 @@ mod tests {
             image_mtime: mtime,
             machine: machine_fingerprint(&settings()),
             has_state: false,
-            network_enabled: true,
+            network: NetMode::Online,
         };
         let meta_path = state.join("meta.json");
         write_meta(&meta_path, &meta).unwrap();
 
-        set_network_enabled(&mut meta, &meta_path, false).unwrap();
+        set_network_mode(&mut meta, &meta_path, NetMode::Tor).unwrap();
 
         // The next launch reads it back...
         let prepared = prepare(&state, &image, &settings()).unwrap();
-        assert!(!prepared.meta.network_enabled);
+        assert_eq!(prepared.meta.network, NetMode::Tor);
         // ...and so does the one after a save at the end of this run.
         mark_saved(&meta, &meta_path, &settings()).unwrap();
         let prepared = prepare(&state, &image, &settings()).unwrap();
         assert!(prepared.load_state);
-        assert!(!prepared.meta.network_enabled);
+        assert_eq!(prepared.meta.network, NetMode::Tor);
 
-        set_network_enabled(&mut meta, &meta_path, true).unwrap();
-        assert!(prepare(&state, &image, &settings()).unwrap().meta.network_enabled);
+        set_network_mode(&mut meta, &meta_path, NetMode::Online).unwrap();
+        assert_eq!(
+            prepare(&state, &image, &settings()).unwrap().meta.network,
+            NetMode::Online
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn the_network_layout_is_part_of_the_machine() {
-        assert!(machine_fingerprint(&settings()).starts_with("net=2;"));
+        assert!(machine_fingerprint(&settings()).starts_with("net=3;"));
     }
 
     #[test]
@@ -1018,7 +1137,7 @@ mod tests {
             image_mtime: 2,
             machine: "m".into(),
             has_state: true,
-            network_enabled: false,
+            network: NetMode::Offline,
         };
         write_meta(&app.join("meta.json"), &meta).unwrap();
         // No metadata, and one set aside after an image change.

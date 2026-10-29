@@ -71,7 +71,9 @@ impl From<&VmError> for Refusal {
             VmError::NoCommand => Error::NoCommand,
             VmError::AlreadyRunning(_) => Error::AlreadyRunning,
             VmError::State(_) => Error::State,
-            VmError::Io { .. } => Error::Other,
+            // The protocol has no error of its own for this; the message
+            // says what is wrong.
+            VmError::Tor(_) | VmError::Io { .. } => Error::Other,
         };
         // The short message is meant for a one-line display; the shell shows
         // it as is.
@@ -288,6 +290,7 @@ mod tests {
             (VmError::NoCommand, Error::NoCommand),
             (VmError::AlreadyRunning("A".into()), Error::AlreadyRunning),
             (VmError::State("s".into()), Error::State),
+            (VmError::Tor("t".into()), Error::Other),
             (
                 VmError::Io {
                     context: "c",

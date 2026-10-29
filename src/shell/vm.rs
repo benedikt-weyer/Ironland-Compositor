@@ -70,7 +70,11 @@ use smithay::{
 };
 use tracing::{debug, error, info, warn};
 
-use super::vm_state::{self, PersistMeta};
+use super::{
+    vm_gateway::{Gateway, TorEndpoint},
+    vm_state::{self, NetMode, PersistMeta},
+    vm_tor::{self, TorService},
+};
 use crate::{
     ClientState,
     config::VmSettings,
@@ -78,7 +82,8 @@ use crate::{
     state::{AnvilState, Backend, insert_client_with_identity},
     vm_launch::{Finish, Watcher},
     vm_overview::{
-        self, HostRoute, Link, PersistedEntry, Phase, ProgramEntry, RunningVm, VmOverviewData,
+        self, HostRoute, Link, PersistedEntry, Phase, ProgramEntry, RunningVm, TorLink,
+        VmOverviewData,
     },
 };
 
@@ -102,14 +107,14 @@ pub enum VmEvent {
     GuestReady(VmId),
     /// Saving a persistent VM's state failed; the VM should be dropped.
     SaveFailed(VmId, String),
-    /// A helper thread finished switching a VM's internet link (see
-    /// [`AnvilState::set_vm_internet`]). `qemu_pid` names the QEMU it talked
+    /// A helper thread finished putting a VM into a network mode (see
+    /// [`AnvilState::set_vm_network`]). `qemu_pid` names the QEMU it talked
     /// to, so a result from one that has since been replaced (a failed
     /// restore falls back to a cold boot) can be told from the current one.
-    InternetSet {
+    NetworkSet {
         id: VmId,
         qemu_pid: u32,
-        online: bool,
+        mode: NetMode,
         result: Result<(), String>,
     },
 }
@@ -128,6 +133,8 @@ pub enum VmError {
     AlreadyRunning(String),
     #[error("preparing the persistent VM state: {0}")]
     State(String),
+    #[error("Tor is not available: {0}")]
+    Tor(String),
     #[error("{context}: {source}")]
     Io {
         context: &'static str,
@@ -147,6 +154,7 @@ impl VmError {
             VmError::NoCommand => "Nothing to run for this entry".into(),
             VmError::AlreadyRunning(_) => "Persistent VM already running".into(),
             VmError::State(_) => "Could not prepare VM state (see log)".into(),
+            VmError::Tor(_) => "Tor is not available (see log)".into(),
             VmError::Io { .. } => "Could not start the VM (see log)".into(),
         }
     }
@@ -174,8 +182,8 @@ enum EndReason {
     /// QEMU exited right after starting from a saved state: the state could
     /// not be loaded. Not an end: the guest is cold-booted instead.
     RestoreFailed(ExitStatus),
-    /// A VM that has to start without internet could not have its link taken
-    /// down, so it was never let run.
+    /// A VM that has to start in a mode other than online could not be put
+    /// into it, so it was never let run.
     NetworkFailed(String),
 }
 
@@ -191,7 +199,7 @@ impl std::fmt::Display for EndReason {
             EndReason::SaveTimedOut => write!(f, "saving the state took too long"),
             EndReason::RestoreFailed(status) => write!(f, "restoring the state failed ({status})"),
             EndReason::NetworkFailed(why) => {
-                write!(f, "could not cut the internet link before starting: {why}")
+                write!(f, "could not set its network mode before starting: {why}")
             }
         }
     }
@@ -267,21 +275,22 @@ struct VmInstance {
     watchers: Vec<Watcher>,
     started: Instant,
     /// Monitor socket every VM has (a persistent one saves its state through
-    /// it, any one switches its internet link through it).
+    /// it, any one switches its network links through it).
     qmp: PathBuf,
-    internet: Internet,
+    network: Network,
+    /// Serves the VM's Tor card (see [`super::vm_gateway`]).
+    gateway: Gateway,
     usage: Usage,
 }
 
-/// Whether a VM can reach the internet: the state of its internet NIC's link
-/// (see [`qemu_args`]).
+/// How a VM is connected to the outside world (see [`NetMode`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Internet {
-    online: bool,
-    /// A switch to this state is under way on a helper thread.
-    pending: Option<bool>,
-    /// Started with the CPUs stopped (`-S`) until the link is down; the guest
-    /// has not run yet.
+struct Network {
+    mode: NetMode,
+    /// A switch to this mode is under way on a helper thread.
+    pending: Option<NetMode>,
+    /// Started with the CPUs stopped (`-S`) until its links are set; the
+    /// guest has not run yet.
     held: bool,
 }
 
@@ -300,6 +309,8 @@ pub struct VmManager {
     instances: HashMap<VmId, VmInstance>,
     events: Sender<VmEvent>,
     reaper_running: bool,
+    /// The host's Tor client, shared by the VMs in Tor mode.
+    tor: TorService,
 }
 
 impl VmManager {
@@ -313,6 +324,7 @@ impl VmManager {
                 instances: HashMap::new(),
                 events,
                 reaper_running: false,
+                tor: TorService::new(TorEndpoint::default()),
             },
             channel,
         )
@@ -410,11 +422,14 @@ impl VmManager {
     /// The running VMs as the VM overview shows them, oldest first, with
     /// their resource use sampled now.
     fn running(&mut self, now: Instant, memory_mb: u32) -> Vec<RunningVm> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let tor = self.tor.status();
         let mut running: Vec<RunningVm> = self
             .instances
             .iter_mut()
             .map(|(&id, vm)| {
                 vm.sample_cpu(now);
+                let stats = vm.gateway.stats();
                 RunningVm {
                     id,
                     name: vm.name.clone(),
@@ -430,10 +445,17 @@ impl VmManager {
                     cpu_percent: vm.usage.cpu_percent,
                     rss_bytes: process_rss_bytes(vm.qemu.id()),
                     memory_mb,
-                    link: match vm.internet.pending {
-                        Some(online) => Link::Switching { online },
-                        None if vm.internet.online => Link::Online,
-                        None => Link::Offline,
+                    link: match (vm.network.pending, vm.network.mode) {
+                        (Some(to), _) => Link::Switching { to },
+                        (None, NetMode::Online) => Link::Online,
+                        (None, NetMode::Offline) => Link::Offline,
+                        (None, NetMode::Tor) => Link::Tor(TorLink {
+                            running: tor.running,
+                            bootstrap: tor.bootstrap,
+                            problem: tor.problem.clone(),
+                            flows: stats.flows.load(Relaxed),
+                            identity: stats.identity.load(Relaxed),
+                        }),
                     },
                     ssh_port: vm.ssh_port,
                 }
@@ -441,6 +463,13 @@ impl VmManager {
             .collect();
         running.sort_by_key(|vm| vm.id);
         running
+    }
+
+    /// Whether any VM is in, or going into, Tor mode.
+    fn wants_tor(&self) -> bool {
+        self.instances
+            .values()
+            .any(|vm| vm.network.mode == NetMode::Tor || vm.network.pending == Some(NetMode::Tor))
     }
 
     /// Persistent keys with a VM running.
@@ -458,6 +487,11 @@ impl Drop for VmManager {
             vm.kill();
         }
     }
+}
+
+/// `text` cut short enough for the overview's one-line status.
+fn clip_status(text: &str) -> String {
+    text.chars().take(50).collect()
 }
 
 /// CPU time (user + system, in clock ticks) from the text of `/proc/<pid>/stat`.
@@ -677,15 +711,20 @@ pub enum DiskMode<'a> {
     /// A throw-away snapshot of the base image.
     Snapshot {
         image: &'a Path,
-        /// Monitor socket QEMU listens on, for switching the internet link.
+        /// Monitor socket QEMU listens on, for switching the network links.
         qmp: &'a Path,
+        /// Unix socket of the VM's Tor gateway (see [`super::vm_gateway`]),
+        /// which QEMU connects its Tor card to.
+        gateway: &'a Path,
     },
     /// A persistent per-application overlay (see [`vm_state`]).
     Persistent {
         overlay: &'a Path,
         /// Monitor socket QEMU listens on, for saving the state and
-        /// switching the internet link.
+        /// switching the network links.
         qmp: &'a Path,
+        /// The Tor gateway's socket, as for [`DiskMode::Snapshot`].
+        gateway: &'a Path,
         /// Guest-agent socket QEMU listens on, for setting the clock.
         qga: &'a Path,
         /// Restore the saved state instead of booting.
@@ -758,19 +797,26 @@ pub fn qemu_args(
             }
         }
     }
-    let (DiskMode::Snapshot { qmp, .. } | DiskMode::Persistent { qmp, .. }) = &disk;
+    let (DiskMode::Snapshot { qmp, gateway, .. } | DiskMode::Persistent { qmp, gateway, .. }) =
+        &disk;
     push(&[
         "-qmp",
         &format!("unix:{},server=on,wait=off", qmp.display()),
     ]);
-    // Two NICs, so the internet can be cut without cutting the compositor off
-    // from the guest: taking a NIC's link down (QMP `set_link`) stops all
-    // traffic through it, including the ssh session `waypipe` runs over.
+    // Three NICs. Taking a NIC's link down (QMP `set_link`) stops all traffic
+    // through it, so the network modes are made of which links are up, and
+    // the one the compositor reaches the guest over is its own device that
+    // is never touched. The order matters: the guest prefers the first NIC
+    // for its default route, so when several are up the earlier one wins.
     //
-    // * `inet` (first, so the guest prefers it for its default route): NAT
-    //   onto the host's network. This is the one the VM overview switches.
+    // * `inet`: NAT onto the host's network (online mode).
+    // * `tor`: a unix socket QEMU connects to, served by the VM's gateway
+    //   (see `vm_gateway`), which lets only Tor out (Tor mode).
     // * `mgmt`: `restrict=on` lets the guest reach nothing outside; only the
-    //   forwarded ssh port works. A separate subnet keeps the two apart.
+    //   forwarded ssh port works. Last, so it never carries a default route
+    //   that a mode with no link up would then leak through - it can't.
+    //
+    // A separate subnet each keeps them apart.
     push(&[
         "-netdev",
         &format!("user,id={}", vm_state::INTERNET_NETDEV),
@@ -778,6 +824,19 @@ pub fn qemu_args(
         &format!(
             "virtio-net-pci,netdev={},id=nic_inet",
             vm_state::INTERNET_NETDEV
+        ),
+    ]);
+    push(&[
+        "-netdev",
+        &format!(
+            "stream,id={},addr.type=unix,addr.path={}",
+            vm_state::TOR_NETDEV,
+            gateway.display()
+        ),
+        "-device",
+        &format!(
+            "virtio-net-pci,netdev={},id=nic_tor",
+            vm_state::TOR_NETDEV
         ),
     ]);
     push(&[
@@ -889,13 +948,13 @@ fn runtime_root() -> PathBuf {
 /// Picks a currently-free loopback TCP port. Racy by nature (the port is
 /// released before QEMU binds it), but a collision only makes QEMU fail to
 /// start, which is reported like any other failed launch.
-fn free_loopback_port() -> io::Result<u16> {
+pub(super) fn free_loopback_port() -> io::Result<u16> {
     Ok(TcpListener::bind(("127.0.0.1", 0))?.local_addr()?.port())
 }
 
 /// Makes `cmd`'s child die with SIGKILL if the compositor does, so a crash
 /// can't leave VMs running.
-fn die_with_parent(cmd: &mut Command) {
+pub(super) fn die_with_parent(cmd: &mut Command) {
     // Safety: runs between fork and exec; `prctl(PR_SET_PDEATHSIG)` is
     // async-signal-safe and allocates nothing.
     unsafe {
@@ -964,15 +1023,15 @@ fn spawn_probe(
     }
 }
 
-/// Switches the internet link of the QEMU `qemu_pid` listening on `qmp` on a
+/// Puts the QEMU `qemu_pid` listening on `qmp` into network `mode` on a
 /// helper thread (the monitor can take a moment to answer) and reports the
-/// outcome as [`VmEvent::InternetSet`]. With `resume`, also lets a QEMU that
+/// outcome as [`VmEvent::NetworkSet`]. With `resume`, also lets a QEMU that
 /// was started paused (`-S`) run.
-fn spawn_set_internet(
+fn spawn_set_network(
     id: VmId,
     qemu_pid: u32,
     qmp: &Path,
-    online: bool,
+    mode: NetMode,
     resume: bool,
     events: Sender<VmEvent>,
 ) {
@@ -981,19 +1040,19 @@ fn spawn_set_internet(
     let spawned = std::thread::Builder::new()
         .name(format!("vm-net-{id}"))
         .spawn(move || {
-            let result = vm_state::set_internet_over_socket(&qmp, online, resume);
-            let _ = reply.send(VmEvent::InternetSet {
+            let result = vm_state::set_network_over_socket(&qmp, mode, resume);
+            let _ = reply.send(VmEvent::NetworkSet {
                 id,
                 qemu_pid,
-                online,
+                mode,
                 result,
             });
         });
     if let Err(err) = spawned {
-        let _ = events.send(VmEvent::InternetSet {
+        let _ = events.send(VmEvent::NetworkSet {
             id,
             qemu_pid,
-            online,
+            mode,
             result: Err(err.to_string()),
         });
     }
@@ -1083,6 +1142,14 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
         } else {
             None
         };
+        // A persistent VM comes back in the mode it was left in.
+        let mode = prepared.as_ref().map_or(NetMode::Online, |p| p.meta.network);
+        if mode == NetMode::Tor {
+            self.vm
+                .tor
+                .ensure_running(&settings.tor_binary, &vm_tor::data_dir())
+                .map_err(VmError::Tor)?;
+        }
 
         let id = self.vm.next_id;
         self.vm.next_id += 1;
@@ -1114,6 +1181,12 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
                 source: io::Error::other(err.to_string()),
             })?;
 
+        // The Tor card's gateway has to be listening before QEMU starts: QEMU
+        // connects to it right away.
+        let gateway_socket = dir.join("tor.sock");
+        let gateway = Gateway::spawn(id, &gateway_socket, self.vm.tor.endpoint())
+            .map_err(VmError::io("starting the VM's Tor gateway"))?;
+
         let serial_log = dir.join("serial.log");
         let (qmp, qga) = (dir.join("qmp.sock"), dir.join("qga.sock"));
         let args_for = |load_state: bool| match &prepared {
@@ -1123,6 +1196,7 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
                 DiskMode::Persistent {
                     overlay: &p.overlay,
                     qmp: &qmp,
+                    gateway: &gateway_socket,
                     qga: &qga,
                     load_state,
                 },
@@ -1135,6 +1209,7 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
                 DiskMode::Snapshot {
                     image: &image,
                     qmp: &qmp,
+                    gateway: &gateway_socket,
                 },
                 ssh_port,
                 &serial_log,
@@ -1142,11 +1217,10 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
         };
         let load_state = prepared.as_ref().is_some_and(|p| p.load_state);
         let (mut args, mut cold_args) = (args_for(load_state), args_for(false));
-        // A VM whose internet was switched off starts with its CPUs stopped,
-        // so the link can be taken down before the guest runs a single
-        // instruction (see `start_offline`).
-        let online = prepared.as_ref().is_none_or(|p| p.meta.network_enabled);
-        if !online {
+        // A VM that must not start online starts with its CPUs stopped, so
+        // its links can be set before the guest runs a single instruction.
+        let held = mode != NetMode::Online;
+        if held {
             args.push("-S".into());
             cold_args.push("-S".into());
         }
@@ -1178,11 +1252,11 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             ?image,
             persistent,
             restoring = load_state,
-            online,
+            mode = mode.label(),
             "Started VM"
         );
-        if !online {
-            spawn_set_internet(id, qemu.id(), &qmp, false, true, self.vm.events.clone());
+        if held {
+            spawn_set_network(id, qemu.id(), &qmp, mode, true, self.vm.events.clone());
         }
         let persist = prepared.map(|p| PersistState {
             key,
@@ -1212,11 +1286,12 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
                 watchers: Vec::new(),
                 started: Instant::now(),
                 qmp,
-                internet: Internet {
-                    online,
-                    pending: (!online).then_some(false),
-                    held: !online,
+                network: Network {
+                    mode,
+                    pending: held.then_some(mode),
+                    held,
                 },
+                gateway,
                 usage: Usage::default(),
             },
         );
@@ -1316,7 +1391,7 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
                 app: app_of_key(&p.key),
                 disk_bytes: p.disk_bytes,
                 has_state: p.meta.as_ref().is_some_and(|m| m.has_state),
-                internet: p.meta.as_ref().map(|m| m.network_enabled),
+                network: p.meta.as_ref().map(|m| m.network),
                 stale: p.is_stale(),
                 running: live_keys.contains(&p.key.as_str()),
             })
@@ -1338,32 +1413,89 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             persisted,
             programs,
             route,
+            tor: self.vm.tor.status(),
             max_instances: settings.max_instances,
         };
         self.vm_overview.set_data(data);
     }
 
-    /// VM overview action: switches the selected VM's internet on or off.
-    pub fn vm_overview_toggle_internet(&mut self) {
+    /// The pointer was clicked with the VM overview open: acts on what is
+    /// under it - a row selects its VM, a button does its thing, outside the
+    /// panel closes the overlay.
+    pub fn vm_overview_click(&mut self) {
+        use crate::vm_overview::{Action, Hit};
+        let location = self.pointer.current_location();
+        let Some(output) = self.space.output_under(location).next().cloned() else {
+            return;
+        };
+        let Some(geometry) = self.space.output_geometry(&output) else {
+            return;
+        };
+        // Where the backends draw it: centered on the output.
+        let size = self.vm_overview.logical_size();
+        let origin = geometry.loc
+            + smithay::utils::Point::from((
+                (geometry.size.w - size.w) / 2,
+                ((geometry.size.h - size.h) / 2).max(0),
+            ));
+        let local = (location - origin.to_f64()).to_i32_round();
+        match self.vm_overview.hit_test(local) {
+            Hit::Select(id) => {
+                self.vm_overview.select(id);
+                self.refresh_vm_overview();
+            }
+            Hit::Button(Action::Mode(mode)) => self.vm_overview_set_mode(mode),
+            Hit::Button(Action::NewIdentity) => self.vm_overview_new_identity(),
+            Hit::Panel => {}
+            Hit::Outside => self.vm_overview.close(),
+        }
+    }
+
+    /// VM overview action: puts the selected VM into network mode `mode`.
+    pub fn vm_overview_set_mode(&mut self, mode: NetMode) {
         let Some(vm) = self.vm_overview.selected() else {
             return;
         };
         let (id, name) = (vm.id, vm.name.clone());
-        let online = match vm.link {
-            Link::Online => false,
-            Link::Offline => true,
+        match self.set_vm_network(id, mode) {
+            Ok(()) => self.vm_overview.clear_status(),
+            Err(why) => {
+                warn!(id, app = name, %why, mode = mode.label(), "Could not switch the VM's network");
+                self.vm_overview.set_status(why);
+            }
+        }
+        self.refresh_vm_overview();
+    }
+
+    /// VM overview action: the selected VM's internet on or off. From Tor
+    /// mode that means off.
+    pub fn vm_overview_toggle_internet(&mut self) {
+        let Some(vm) = self.vm_overview.selected() else {
+            return;
+        };
+        let to = match vm.link {
+            Link::Online | Link::Tor(_) => NetMode::Offline,
+            Link::Offline => NetMode::Online,
             Link::Switching { .. } => {
                 self.vm_overview.set_status("The network is still switching");
                 return;
             }
         };
-        match self.set_vm_internet(id, online) {
-            Ok(()) => self.vm_overview.clear_status(),
-            Err(why) => {
-                warn!(id, app = name, %why, "Could not switch the VM's internet");
-                self.vm_overview.set_status(why);
-            }
+        self.vm_overview_set_mode(to);
+    }
+
+    /// VM overview action: fresh Tor circuits for the selected VM.
+    pub fn vm_overview_new_identity(&mut self) {
+        let Some(vm) = self.vm_overview.selected() else {
+            return;
+        };
+        if !matches!(vm.link, Link::Tor(_)) {
+            self.vm_overview.set_status("The VM is not in Tor mode");
+            return;
         }
+        let id = vm.id;
+        self.new_tor_identity(id);
+        self.vm_overview.set_notice("New Tor identity: connections were reset");
         self.refresh_vm_overview();
     }
 
@@ -1408,34 +1540,48 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
         self.end_vm(id, EndReason::SaveFailed(why));
     }
 
-    /// Switches the internet of the running VM `id` on or off, which is what
-    /// the VM overview's toggle does. The link changes on a helper thread; the
-    /// outcome arrives as [`VmEvent::InternetSet`]. For a persistent VM the
-    /// new state is also written to its metadata then, so it holds the next
-    /// time the VM starts.
-    pub fn set_vm_internet(&mut self, id: VmId, online: bool) -> Result<(), String> {
+    /// Puts the running VM `id` into network mode `mode`: what the VM
+    /// overview's buttons do. Tor mode starts the host's Tor client if it
+    /// isn't running. The links change on a helper thread; the outcome
+    /// arrives as [`VmEvent::NetworkSet`]. For a persistent VM the new mode
+    /// is also written to its metadata then, so it holds the next time the
+    /// VM starts - also after a reboot of the computer.
+    pub fn set_vm_network(&mut self, id: VmId, mode: NetMode) -> Result<(), String> {
         let events = self.vm.events.clone();
+        let binary = self.config.vm.tor_binary.clone();
+        {
+            let vm = self.vm.instances.get(&id).ok_or("That VM is gone")?;
+            if vm.persist.as_ref().is_some_and(|p| p.saving_until.is_some()) {
+                return Err("The VM is saving its state".into());
+            }
+            if vm.network.pending.is_some() {
+                return Err("The network is still switching".into());
+            }
+            if vm.network.mode == mode {
+                return Ok(());
+            }
+        }
+        if mode == NetMode::Tor {
+            self.vm
+                .tor
+                .ensure_running(&binary, &vm_tor::data_dir())
+                .map_err(|why| {
+                    warn!(%why, "Tor is not available");
+                    format!("Tor is not available: {}", clip_status(&why))
+                })?;
+        }
         let vm = self.vm.instances.get_mut(&id).ok_or("That VM is gone")?;
-        if vm.persist.as_ref().is_some_and(|p| p.saving_until.is_some()) {
-            return Err("The VM is saving its state".into());
-        }
-        if vm.internet.pending.is_some() {
-            return Err("The network is still switching".into());
-        }
-        if vm.internet.online == online {
-            return Ok(());
-        }
-        vm.internet.pending = Some(online);
-        spawn_set_internet(id, vm.qemu.id(), &vm.qmp, online, false, events);
+        vm.network.pending = Some(mode);
+        spawn_set_network(id, vm.qemu.id(), &vm.qmp, mode, false, events);
         Ok(())
     }
 
-    /// A helper thread finished switching a VM's internet link.
-    pub fn vm_internet_set(
+    /// A helper thread finished putting a VM into a network mode.
+    pub fn vm_network_set(
         &mut self,
         id: VmId,
         qemu_pid: u32,
-        online: bool,
+        mode: NetMode,
         result: Result<(), String>,
     ) {
         let Some(vm) = self.vm.instances.get_mut(&id) else {
@@ -1444,36 +1590,60 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
         if vm.qemu.id() != qemu_pid {
             return;
         }
-        let held = std::mem::replace(&mut vm.internet.held, false);
-        vm.internet.pending = None;
+        let held = std::mem::replace(&mut vm.network.held, false);
+        vm.network.pending = None;
         match result {
             Ok(()) => {
-                vm.internet.online = online;
-                info!(id, app = vm.name, online, "Switched the VM's internet");
+                vm.network.mode = mode;
+                info!(id, app = vm.name, mode = mode.label(), "Switched the VM's network");
                 if let Some(persist) = vm.persist.as_mut()
                     && let Err(err) =
-                        vm_state::set_network_enabled(&mut persist.meta, &persist.meta_path, online)
+                        vm_state::set_network_mode(&mut persist.meta, &persist.meta_path, mode)
                 {
-                    warn!(id, %err, "Switched the VM's internet but could not record it; it will not hold after a restart");
+                    warn!(id, %err, "Switched the VM's network but could not record it; it will not hold after a restart");
                     self.vm_overview.set_status("Could not save the setting (see log)");
                 }
             }
             Err(why) if held => {
                 // The guest never ran; better to stop it than to let it
-                // loose with a network the user turned off.
+                // loose in a mode the user did not choose.
                 self.end_vm(id, EndReason::NetworkFailed(why));
             }
             Err(why) => {
-                warn!(id, app = vm.name, online, %why, "Could not switch the VM's internet");
+                warn!(id, app = vm.name, mode = mode.label(), %why, "Could not switch the VM's network");
                 self.vm_overview.set_status("Could not switch the network (see log)");
             }
         }
+        self.tor_tick();
         self.refresh_vm_overview();
+    }
+
+    /// Fresh Tor circuits for VM `id`: the connections it has open are reset
+    /// and new ones use new circuits (see [`Gateway::new_identity`]).
+    pub fn new_tor_identity(&mut self, id: VmId) {
+        if let Some(vm) = self.vm.instances.get(&id) {
+            info!(id, app = vm.name, "New Tor identity");
+            vm.gateway.new_identity();
+        }
+    }
+
+    /// Keeps the host's Tor client running exactly while a VM wants it: starts
+    /// it again if it died, stops it once no VM is in Tor mode.
+    fn tor_tick(&mut self) {
+        let binary = self.config.vm.tor_binary.clone();
+        if self.vm.wants_tor() {
+            if !self.vm.tor.running() {
+                let _ = self.vm.tor.ensure_running(&binary, &vm_tor::data_dir());
+            }
+        } else if self.vm.tor.running() {
+            self.vm.tor.stop();
+        }
     }
 
     /// Reaps VMs that finished or got stuck. Run from a timer that exists only
     /// while VMs do (see [`ensure_vm_reaper`](Self::ensure_vm_reaper)).
     fn reap_vms(&mut self) {
+        self.tor_tick();
         for (id, reason) in self.vm.find_finished(Instant::now()) {
             match reason {
                 // A persistent VM isn't over when its program is: its state
@@ -1552,8 +1722,15 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
                 persist.loaded_state = false;
                 // The new QEMU waits for its link to be cut as well (its
                 // arguments carry `-S`), and the first one's helper is gone.
-                if vm.internet.held {
-                    spawn_set_internet(id, vm.qemu.id(), &vm.qmp, false, true, self.vm.events.clone());
+                if vm.network.held {
+                    spawn_set_network(
+                        id,
+                        vm.qemu.id(),
+                        &vm.qmp,
+                        vm.network.mode,
+                        true,
+                        self.vm.events.clone(),
+                    );
                 }
             }
             Err(err) => {
@@ -1591,6 +1768,8 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
         if !failed {
             let _ = std::fs::remove_dir_all(&dir);
         }
+        // Tor is only run while a VM wants it.
+        self.tor_tick();
     }
 
     /// Makes sure the once-a-second reaper timer is running. It stops itself
@@ -1631,6 +1810,7 @@ mod tests {
         DiskMode::Snapshot {
             image: Path::new("/i"),
             qmp: Path::new("/q"),
+            gateway: Path::new("/g"),
         }
     }
 
@@ -1645,6 +1825,7 @@ mod tests {
             VmError::ImageMissing("/some/very/long/path/guest.qcow2".into()),
             VmError::TooManyInstances(8),
             VmError::NoCommand,
+            VmError::Tor("tor: No such file or directory".into()),
             VmError::Io {
                 context: "x",
                 source: io::Error::other("y"),
@@ -1691,6 +1872,7 @@ mod tests {
             DiskMode::Snapshot {
                 image: Path::new("/img/guest.qcow2"),
                 qmp: Path::new("/run/s.qmp"),
+                gateway: Path::new("/run/s.tor"),
             },
             2222,
             Path::new("/run/s.log"),
@@ -1713,20 +1895,40 @@ mod tests {
     }
 
     #[test]
-    fn qemu_args_give_the_guest_an_internet_nic_and_a_restricted_ssh_nic() {
+    fn qemu_args_give_the_guest_three_nics_in_the_order_it_prefers_them() {
         let args = qemu_args(&settings(), 1, snapshot(), 2222, Path::new("/l"));
         let joined = args.join(" ");
-        // The internet NIC comes first: the guest prefers the first NIC for
-        // its default route, so the ssh-only one never carries internet
-        // traffic while the first is up.
+        // The guest prefers the first NIC for its default route, so with
+        // several links up the earlier one wins: internet, then Tor, and the
+        // ssh-only NIC (which can't reach anything) last.
         let inet = joined.find("netdev=inet,id=nic_inet").expect(&joined);
+        let tor = joined.find("netdev=tor,id=nic_tor").expect(&joined);
         let mgmt = joined.find("netdev=mgmt,id=nic_mgmt").expect(&joined);
-        assert!(inet < mgmt, "{joined}");
+        assert!(inet < tor && tor < mgmt, "{joined}");
         assert!(joined.contains("-netdev user,id=inet "), "{joined}");
-        // The ssh forward lives on the restricted NIC, so cutting the
-        // internet NIC's link leaves the compositor's way in intact.
+        assert_eq!(joined.matches("-device virtio-net-pci").count(), 3, "{joined}");
+    }
+
+    #[test]
+    fn the_tor_card_is_served_by_the_vms_gateway_over_a_unix_socket() {
+        let args = qemu_args(&settings(), 1, snapshot(), 2222, Path::new("/l"));
+        let joined = args.join(" ");
         assert!(
-            joined.contains("user,id=mgmt,net=10.0.3.0/24,restrict=on,hostfwd=tcp:127.0.0.1:2222-:22"),
+            joined.contains("-netdev stream,id=tor,addr.type=unix,addr.path=/g "),
+            "{joined}"
+        );
+        // Nothing of the host's network is behind it.
+        assert!(!joined.contains("id=tor,hostfwd"), "{joined}");
+    }
+
+    #[test]
+    fn the_ssh_forward_lives_on_the_restricted_card_that_no_mode_touches() {
+        let args = qemu_args(&settings(), 1, snapshot(), 2222, Path::new("/l"));
+        let joined = args.join(" ");
+        assert!(
+            joined.contains(
+                "user,id=mgmt,net=10.0.3.0/24,restrict=on,hostfwd=tcp:127.0.0.1:2222-:22"
+            ),
             "{joined}"
         );
         assert!(!joined.contains("id=inet,hostfwd"), "{joined}");
@@ -1856,9 +2058,9 @@ mod tests {
     }
 
     #[test]
-    fn running_vms_report_their_internet_link() {
+    fn running_vms_report_their_network_mode() {
         let mut vm = instance(sleeper(), None, far_future(), true);
-        vm.internet.online = false;
+        vm.network.mode = NetMode::Offline;
         let mut manager = manager_with(vm);
         let running = manager.running(Instant::now(), 2048);
         assert_eq!(running.len(), 1);
@@ -1867,11 +2069,49 @@ mod tests {
         assert!(!running[0].persistent);
         assert!(running[0].rss_bytes > 0);
 
-        manager.instances.get_mut(&1).unwrap().internet.pending = Some(true);
+        manager.instances.get_mut(&1).unwrap().network.mode = NetMode::Online;
+        assert_eq!(manager.running(Instant::now(), 2048)[0].link, Link::Online);
+
+        manager.instances.get_mut(&1).unwrap().network.pending = Some(NetMode::Tor);
         assert_eq!(
             manager.running(Instant::now(), 2048)[0].link,
-            Link::Switching { online: true }
+            Link::Switching { to: NetMode::Tor }
         );
+    }
+
+    #[test]
+    fn a_vm_in_tor_mode_reports_tor_and_its_gateway() {
+        let mut vm = instance(sleeper(), None, far_future(), true);
+        vm.network.mode = NetMode::Tor;
+        let mut manager = manager_with(vm);
+        manager.instances.get(&1).unwrap().gateway.new_identity();
+        let link = manager.running(Instant::now(), 2048)[0].link.clone();
+        let Link::Tor(tor) = link else {
+            panic!("{link:?}");
+        };
+        // Tor itself isn't running in a unit test.
+        assert!(!tor.running);
+        assert_eq!(tor.flows, 0);
+        assert_eq!(tor.identity, 2, "one new identity since the start");
+    }
+
+    #[test]
+    fn tor_is_wanted_exactly_while_a_vm_is_in_or_going_into_tor_mode() {
+        let mut manager = manager_with(instance(sleeper(), None, far_future(), true));
+        assert!(!manager.wants_tor());
+        manager.instances.get_mut(&1).unwrap().network.pending = Some(NetMode::Tor);
+        assert!(manager.wants_tor(), "on its way into Tor mode");
+        let vm = manager.instances.get_mut(&1).unwrap();
+        vm.network.pending = None;
+        vm.network.mode = NetMode::Tor;
+        assert!(manager.wants_tor());
+        // On its way out it still is, until it has left.
+        manager.instances.get_mut(&1).unwrap().network.pending = Some(NetMode::Online);
+        assert!(manager.wants_tor());
+        let vm = manager.instances.get_mut(&1).unwrap();
+        vm.network.pending = None;
+        vm.network.mode = NetMode::Offline;
+        assert!(!manager.wants_tor());
     }
 
     // --- lifecycle -------------------------------------------------------
@@ -1925,13 +2165,27 @@ mod tests {
             watchers: Vec::new(),
             started: Instant::now(),
             qmp: PathBuf::from("/nonexistent/qmp.sock"),
-            internet: Internet {
-                online: true,
+            network: Network {
+                mode: NetMode::Online,
                 pending: None,
                 held: false,
             },
+            gateway: test_gateway(),
             usage: Usage::default(),
         }
+    }
+
+    /// A gateway for a test VM, on a socket of its own.
+    fn test_gateway() -> Gateway {
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "ivgw-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::SeqCst)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        Gateway::spawn(1, &dir.join("g.sock"), TorEndpoint::default()).unwrap()
     }
 
     fn manager_with(vm: VmInstance) -> VmManager {
@@ -2064,6 +2318,7 @@ mod tests {
             DiskMode::Persistent {
                 overlay: Path::new("/state/app/disk.qcow2"),
                 qmp: Path::new("/run/vm/qmp.sock"),
+                gateway: Path::new("/run/vm/tor.sock"),
                 qga: Path::new("/run/vm/qga.sock"),
                 load_state,
             },
@@ -2116,7 +2371,7 @@ mod tests {
                 image_mtime: 1,
                 machine: String::new(),
                 has_state: false,
-                network_enabled: true,
+                network: NetMode::Online,
             },
             qmp: PathBuf::from("/nonexistent/qmp.sock"),
             saving_until,
@@ -2349,18 +2604,23 @@ mod tests {
             assert_eq!(prepared.load_state, load_state_expected);
             let port = free_loopback_port().unwrap();
             let (qmp, qga) = (root.join("qmp.sock"), root.join("qga.sock"));
+            // QEMU connects its Tor card to the gateway as it starts.
+            let tor_socket = root.join(format!("tor-{}.sock", load_state_expected));
+            let gateway = Gateway::spawn(1, &tor_socket, TorEndpoint::default()).unwrap();
             let args = qemu_args(
                 &settings,
                 1,
                 DiskMode::Persistent {
                     overlay: &prepared.overlay,
                     qmp: &qmp,
+                    gateway: &tor_socket,
                     qga: &qga,
                     load_state: prepared.load_state,
                 },
                 port,
                 &root.join("serial.log"),
             );
+            std::mem::forget(gateway);
             let started = Instant::now();
             let qemu = spawn_qemu(&args, &root).unwrap();
             wait_for_ssh(port);
@@ -2429,9 +2689,9 @@ mod tests {
     }
 
     /// Whether the guest can open a TCP connection to the host's loopback
-    /// port `port` through QEMU's NAT (the gateway address stands for the
-    /// host), i.e. whether its internet works. Reaching it is a stand-in for
-    /// reaching the internet that needs no internet.
+    /// port `host_port` through QEMU's NAT (the gateway address stands for the
+    /// host), i.e. whether its direct internet works. Reaching it is a
+    /// stand-in for reaching the internet that needs no internet.
     fn guest_reaches_host(port_ssh: u16, key: &str, host_port: u16) -> bool {
         let command = format!(
             "timeout 5 bash -c 'echo > /dev/tcp/{GUEST_INTERNET_GATEWAY}/{host_port}' 2>/dev/null && echo yes || echo no"
@@ -2439,200 +2699,440 @@ mod tests {
         guest_run(port_ssh, key, &command) == "yes"
     }
 
-    /// Cutting a VM's internet over QMP must leave the ssh link `waypipe` runs
-    /// over alone, and a VM started offline must never have been online.
-    ///
-    /// `IRONLAND_TEST_VM_IMAGE=... IRONLAND_TEST_VM_KEY=... cargo test --lib live_internet -- --ignored --nocapture`
-    /// (the key's `.pub` is handed to the guest the way `launch_in_vm` does).
-    #[test]
-    #[ignore = "boots a real VM"]
-    fn live_internet_can_be_cut_without_losing_the_ssh_link() {
-        let image = std::env::var("IRONLAND_TEST_VM_IMAGE").expect("IRONLAND_TEST_VM_IMAGE");
-        let key = std::env::var("IRONLAND_TEST_VM_KEY").expect("IRONLAND_TEST_VM_KEY");
-        let root = std::env::temp_dir().join(format!("ivn-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
+    /// What a fake Tor was asked for: `(user, password, request)` of each
+    /// connection, the request being the SOCKS5 CONNECT message.
+    type Asked = Arc<std::sync::Mutex<Vec<(String, String, Vec<u8>)>>>;
+
+    fn read_n(stream: &mut TcpStream, n: usize) -> io::Result<Vec<u8>> {
+        let mut buf = vec![0u8; n];
+        stream.read_exact(&mut buf)?;
+        Ok(buf)
+    }
+
+    /// One client of the fake Tor: the SOCKS5 handshake, then an echo.
+    fn serve_fake_tor(mut stream: TcpStream, log: Asked) -> io::Result<()> {
+        use std::io::Write;
+        read_n(&mut stream, 3)?;
+        stream.write_all(&[5, 2])?;
+        let head = read_n(&mut stream, 2)?;
+        let user = read_n(&mut stream, head[1] as usize)?;
+        let plen = read_n(&mut stream, 1)?;
+        let pass = read_n(&mut stream, plen[0] as usize)?;
+        stream.write_all(&[1, 0])?;
+        let mut request = read_n(&mut stream, 4)?;
+        let rest = if request[3] == 1 {
+            6
+        } else {
+            let len = read_n(&mut stream, 1)?;
+            request.push(len[0]);
+            len[0] as usize + 2
+        };
+        request.extend(read_n(&mut stream, rest)?);
+        log.lock().unwrap().push((
+            String::from_utf8_lossy(&user).into_owned(),
+            String::from_utf8_lossy(&pass).into_owned(),
+            request,
+        ));
+        stream.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])?;
+        let mut buf = [0u8; 4096];
+        loop {
+            match stream.read(&mut buf)? {
+                0 => return Ok(()),
+                n => stream.write_all(&buf[..n])?,
+            }
+        }
+    }
+
+    /// A SOCKS5 server standing in for Tor: records what it is asked for and
+    /// echoes whatever it is sent. Returns its port.
+    fn fake_tor() -> (u16, Asked) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let asked: Asked = Arc::default();
+        let log = asked.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let log = log.clone();
+                std::thread::spawn(move || {
+                    let _ = serve_fake_tor(stream, log);
+                });
+            }
+        });
+        (port, asked)
+    }
+
+    /// Opens a connection from the guest to `target` (a name or an address)
+    /// and port, sends a line and returns what comes back, or "failed".
+    fn guest_echo(port_ssh: u16, key: &str, target: &str, port: u16) -> String {
+        let command = format!(
+            "timeout 20 bash -c 'exec 3<>/dev/tcp/{target}/{port} && echo ping >&3 && read -t 10 line <&3 && echo \"$line\"' 2>/dev/null || echo failed"
+        );
+        guest_run(port_ssh, key, &command)
+    }
+
+    /// The guest's default route, for waiting until a mode has taken effect.
+    fn wait_for_route_via(port: u16, key: &str, gateway: &str) {
+        for _ in 0..60 {
+            if guest_run(port, key, "ip -4 route show default").contains(gateway) {
+                return;
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        eprintln!("DIAG links:\n{}", guest_run(port, key, "ip -o link; ip -4 -o addr; journalctl -b --no-pager 2>&1 | grep -iE 'ens4|dhcp|networkd' | tail -30"));
+        panic!("the guest never got its default route via {gateway}");
+    }
+
+    /// A VM's QEMU command line for the live tests, with a gateway serving
+    /// its Tor card; the VM is paused at start when `paused`.
+    struct LiveVm {
+        qemu: Child,
+        port: u16,
+        qmp: PathBuf,
+        gateway: Gateway,
+    }
+
+    impl Drop for LiveVm {
+        fn drop(&mut self) {
+            let _ = self.qemu.kill();
+            let _ = self.qemu.wait();
+        }
+    }
+
+    fn live_settings(key: &str) -> VmSettings {
         let mut settings = VmSettings {
             memory_mb: 1024,
-            ssh_key: Some(key.clone()),
+            ssh_key: Some(key.to_string()),
             ..VmSettings::default()
         };
         let keys = authorized_keys(&settings, Vec::new);
         assert!(!keys.is_empty(), "no public key next to {key}");
         settings.extra_qemu_args.extend(authorized_keys_args(&keys));
+        settings
+    }
 
-        // A host service for the guest to reach through the NAT.
+    fn start_live_vm(
+        root: &Path,
+        name: &str,
+        settings: &VmSettings,
+        disk: impl FnOnce(&Path, &Path, &Path) -> Vec<String>,
+        tor: TorEndpoint,
+        paused: bool,
+    ) -> LiveVm {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _ = settings;
+        let port = free_loopback_port().unwrap();
+        let (qmp, socket) = (dir.join("qmp.sock"), dir.join("tor.sock"));
+        let gateway = Gateway::spawn(1, &socket, tor).unwrap();
+        let mut args = disk(&qmp, &socket, &dir.join("serial.log"));
+        // `disk` builds the arguments for port 0; the real port goes in here.
+        for arg in &mut args {
+            *arg = arg.replace("hostfwd=tcp:127.0.0.1:0-:22", &format!("hostfwd=tcp:127.0.0.1:{port}-:22"));
+        }
+        if paused {
+            args.push("-S".into());
+        }
+        let qemu = spawn_qemu(&args, &dir).unwrap();
+        LiveVm {
+            qemu,
+            port,
+            qmp,
+            gateway,
+        }
+    }
+
+    /// A VM through all three network modes, against a real guest.
+    ///
+    /// * online: the guest reaches the host through QEMU's NAT;
+    /// * Tor: it can't, but everything it connects to arrives at the "Tor"
+    ///   (a fake SOCKS server) - names as names, addresses as addresses - and
+    ///   a new identity resets its connections and changes the credentials;
+    /// * offline: nothing gets out at all;
+    /// * and through every one of them the ssh link stays up.
+    ///
+    /// `IRONLAND_TEST_VM_IMAGE=... IRONLAND_TEST_VM_KEY=... cargo test --lib live_network -- --ignored --nocapture`
+    /// (the key's `.pub` is handed to the guest the way `launch_in_vm` does).
+    #[test]
+    #[ignore = "boots a real VM"]
+    fn live_network_modes_online_tor_offline() {
+        let image = std::env::var("IRONLAND_TEST_VM_IMAGE").expect("IRONLAND_TEST_VM_IMAGE");
+        let key = std::env::var("IRONLAND_TEST_VM_KEY").expect("IRONLAND_TEST_VM_KEY");
+        let root = std::env::temp_dir().join(format!("ivn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let settings = live_settings(&key);
+
+        // A host service for the guest to reach through the NAT, and a Tor.
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let host_port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || for _ in listener.incoming() {});
+        let (tor_port, asked) = fake_tor();
+        let tor = TorEndpoint::default();
+        tor.set(Some(tor_port));
 
-        let boot = |name: &str, paused: bool| {
-            let dir = root.join(name);
-            std::fs::create_dir_all(&dir).unwrap();
-            let port = free_loopback_port().unwrap();
-            let qmp = dir.join("qmp.sock");
-            let mut args = qemu_args(
+        let disk = |qmp: &Path, socket: &Path, serial: &Path| {
+            qemu_args(
                 &settings,
                 1,
                 DiskMode::Snapshot {
                     image: Path::new(&image),
-                    qmp: &qmp,
+                    qmp,
+                    gateway: socket,
                 },
-                port,
-                &dir.join("serial.log"),
-            );
-            if paused {
-                args.push("-S".into());
-            }
-            let qemu = spawn_qemu(&args, &dir).unwrap();
-            (qemu, port, qmp)
+                0,
+                serial,
+            )
         };
 
-        // 1. Online: the default route is the internet NIC's, the host is reachable.
-        let (mut qemu, port, qmp) = boot("online", false);
-        wait_for_ssh(port);
-        println!("routes:\n{}", guest_run(port, &key, "ip -4 route; ip -o -4 addr"));
-        let default = guest_run(port, &key, "ip -4 route show default");
-        assert!(default.contains(GUEST_INTERNET_GATEWAY), "default route: {default}");
-        assert!(guest_reaches_host(port, &key, host_port), "online guest cannot reach the host");
+        // 1. Online: the default route is the internet card's.
+        let vm = start_live_vm(&root, "online", &settings, disk, tor.clone(), false);
+        wait_for_ssh(vm.port);
+        wait_for_route_via(vm.port, &key, GUEST_INTERNET_GATEWAY);
+        println!("routes:\n{}", guest_run(vm.port, &key, "ip -4 route; ip -o -4 addr"));
+        assert!(guest_reaches_host(vm.port, &key, host_port), "online guest cannot reach the host");
 
-        // 2. Cut: ssh keeps working, the host (and with it the internet) is gone.
-        vm_state::set_internet_over_socket(&qmp, false, false).unwrap();
-        std::thread::sleep(Duration::from_secs(2));
-        assert_eq!(guest_run(port, &key, "echo still-here"), "still-here");
+        // 2. Tor: direct traffic is gone, what the guest connects to goes to Tor.
+        vm_state::set_network_over_socket(&vm.qmp, NetMode::Tor, false).unwrap();
+        wait_for_route_via(vm.port, &key, "10.0.4.2");
+        assert_eq!(guest_run(vm.port, &key, "echo still-here"), "still-here");
+        println!("tor routes:\n{}", guest_run(vm.port, &key, "ip -4 route; cat /etc/resolv.conf"));
         assert!(
-            !guest_reaches_host(port, &key, host_port),
-            "guest still reaches the host with its internet cut"
+            !guest_reaches_host(vm.port, &key, host_port),
+            "guest still reaches the host in Tor mode"
         );
-        println!("after cut:\n{}", guest_run(port, &key, "ip -4 route; ip -o link"));
+        assert_eq!(guest_echo(vm.port, &key, "example.test", 8080), "ping");
+        assert_eq!(guest_echo(vm.port, &key, "93.184.216.34", 80), "ping");
+        {
+            let asked = asked.lock().unwrap();
+            assert_eq!(asked.len(), 2, "{asked:?}");
+            let (user, pass, by_name) = &asked[0];
+            assert_eq!(user, "ironland-vm1");
+            assert_eq!(pass, "identity-1");
+            let mut want = vec![5, 1, 0, 3, 12];
+            want.extend_from_slice(b"example.test");
+            want.extend_from_slice(&8080u16.to_be_bytes());
+            assert_eq!(by_name, &want, "a name must reach Tor as a name");
+            assert_eq!(asked[1].2, [5, 1, 0, 1, 93, 184, 216, 34, 0, 80]);
+        }
+        // A connection to the host's NAT address, or any local one, gets nowhere.
+        assert_eq!(guest_echo(vm.port, &key, "192.168.1.1", 22), "failed");
+        assert_eq!(asked.lock().unwrap().len(), 2, "a local address reached Tor");
 
-        // 3. Restore: the guest comes back online.
-        vm_state::set_internet_over_socket(&qmp, true, false).unwrap();
+        // 3. A new identity: open connections reset, new ones log in anew.
+        vm.gateway.new_identity();
+        assert_eq!(guest_echo(vm.port, &key, "example.test", 8080), "ping");
+        assert_eq!(asked.lock().unwrap().last().unwrap().1, "identity-2");
+
+        // 4. Offline: nothing gets out, ssh is the only way in.
+        vm_state::set_network_over_socket(&vm.qmp, NetMode::Offline, false).unwrap();
+        std::thread::sleep(Duration::from_secs(3));
+        assert_eq!(guest_run(vm.port, &key, "echo still-here"), "still-here");
+        assert!(!guest_reaches_host(vm.port, &key, host_port));
+        let before = asked.lock().unwrap().len();
+        assert_eq!(guest_echo(vm.port, &key, "example.test", 8080), "failed");
+        assert_eq!(asked.lock().unwrap().len(), before, "offline reached Tor");
+
+        // 5. And back online.
+        vm_state::set_network_over_socket(&vm.qmp, NetMode::Online, false).unwrap();
         let mut back = false;
         for _ in 0..30 {
-            if guest_reaches_host(port, &key, host_port) {
+            if guest_reaches_host(vm.port, &key, host_port) {
                 back = true;
                 break;
             }
             std::thread::sleep(Duration::from_secs(1));
         }
         assert!(back, "guest never got its internet back");
-        let _ = qemu.kill();
-        let _ = qemu.wait();
+        drop(vm);
 
-        // 4. Started offline: paused, link cut, resumed. Never online.
-        let (mut qemu, port, qmp) = boot("offline", true);
-        vm_state::set_internet_over_socket(&qmp, false, true).unwrap();
-        wait_for_ssh(port);
-        assert_eq!(guest_run(port, &key, "echo offline-start"), "offline-start");
-        assert!(
-            !guest_reaches_host(port, &key, host_port),
-            "a VM started offline reached the host"
-        );
-        let _ = qemu.kill();
-        let _ = qemu.wait();
+        // 6. Started in Tor mode: paused, links set, resumed - never online.
+        let vm = start_live_vm(&root, "tor-start", &settings, disk, tor, true);
+        vm_state::set_network_over_socket(&vm.qmp, NetMode::Tor, true).unwrap();
+        wait_for_ssh(vm.port);
+        wait_for_route_via(vm.port, &key, "10.0.4.2");
+        assert!(!guest_reaches_host(vm.port, &key, host_port), "a VM started in Tor mode reached the host");
+        assert_eq!(guest_echo(vm.port, &key, "example.test", 8080), "ping");
+        drop(vm);
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A persistent VM whose internet was switched off is saved offline and
-    /// comes back offline: restored paused (`-S -loadvm`), link cut, resumed.
-    /// Its memory (a process started before the save) and disk survive, and
-    /// the internet can be switched back on afterwards.
+    /// The whole path with the real thing: guest -> gateway -> the host's own
+    /// `tor` (started by `TorService`) -> the internet, asking
+    /// check.torproject.org whether the connection came through Tor. Needs a
+    /// `tor` on `PATH` (or `IRONLAND_TEST_TOR`) and internet access.
+    #[test]
+    #[ignore = "boots a real VM and a real Tor"]
+    fn live_real_tor_end_to_end() {
+        let image = std::env::var("IRONLAND_TEST_VM_IMAGE").expect("IRONLAND_TEST_VM_IMAGE");
+        let key = std::env::var("IRONLAND_TEST_VM_KEY").expect("IRONLAND_TEST_VM_KEY");
+        let tor_binary = std::env::var("IRONLAND_TEST_TOR").unwrap_or_else(|_| "tor".into());
+        let root = std::env::temp_dir().join(format!("ivr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let settings = live_settings(&key);
+
+        let endpoint = TorEndpoint::default();
+        let mut service = TorService::new(endpoint.clone());
+        service
+            .ensure_running(&tor_binary, &root.join("tor-data"))
+            .unwrap();
+        let started = Instant::now();
+        while service.status().bootstrap < 100 {
+            let status = service.status();
+            assert!(status.running, "tor died: {:?}", status.problem);
+            assert!(
+                started.elapsed() < Duration::from_secs(240),
+                "tor did not bootstrap: {status:?}"
+            );
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        println!("tor bootstrapped after {:?}", started.elapsed());
+
+        let disk = |qmp: &Path, socket: &Path, serial: &Path| {
+            qemu_args(
+                &settings,
+                1,
+                DiskMode::Snapshot {
+                    image: Path::new(&image),
+                    qmp,
+                    gateway: socket,
+                },
+                0,
+                serial,
+            )
+        };
+        let vm = start_live_vm(&root, "vm", &settings, disk, endpoint, true);
+        vm_state::set_network_over_socket(&vm.qmp, NetMode::Tor, true).unwrap();
+        wait_for_ssh(vm.port);
+        wait_for_route_via(vm.port, &key, "10.0.4.2");
+
+        // A plain HTTP request to `host`; the head of what comes back.
+        let ask = |host: &str| {
+            guest_run(
+                vm.port,
+                &key,
+                &format!(
+                    "timeout 120 bash -c 'exec 3<>/dev/tcp/{host}/80; printf \"GET / HTTP/1.0\\r\\nHost: {host}\\r\\n\\r\\n\" >&3; cat <&3' 2>&1 | tr -d '\\r' | head -c 300"
+                ),
+            )
+        };
+        // A name Tor's exit resolves and connects to...
+        let clearnet = ask("check.torproject.org");
+        println!("clearnet:\n{clearnet}\n");
+        assert!(clearnet.starts_with("HTTP/1."), "no answer: {clearnet}");
+        // ...and one only Tor can reach: no direct path could have got there.
+        let onion = "duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion";
+        let hidden = ask(onion);
+        println!("onion:\n{hidden}\n");
+        assert!(hidden.starts_with("HTTP/1."), "the onion service is not reachable: {hidden}");
+
+        // Fresh circuits: it still works, on new connections.
+        vm.gateway.new_identity();
+        let again = ask(onion);
+        println!("onion, new identity:\n{again}\n");
+        assert!(again.starts_with("HTTP/1."), "{again}");
+        service.stop();
+        drop(vm);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A persistent VM left in Tor mode is saved that way and comes back that
+    /// way: restored paused (`-S -loadvm`), links set, resumed. Its memory (a
+    /// process started before the save) and disk survive, and it can be put
+    /// back online afterwards.
     #[test]
     #[ignore = "boots a real VM"]
-    fn live_persistent_vm_without_internet_restores_without_internet() {
+    fn live_persistent_vm_in_tor_mode_restores_in_tor_mode() {
         let image = std::env::var("IRONLAND_TEST_VM_IMAGE").expect("IRONLAND_TEST_VM_IMAGE");
         let key = std::env::var("IRONLAND_TEST_VM_KEY").expect("IRONLAND_TEST_VM_KEY");
         let image = Path::new(&image);
         let root = std::env::temp_dir().join(format!("ivp-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        let mut settings = VmSettings {
-            memory_mb: 1024,
-            ssh_key: Some(key.clone()),
-            ..VmSettings::default()
-        };
-        let keys = authorized_keys(&settings, Vec::new);
-        assert!(!keys.is_empty(), "no public key next to {key}");
-        settings.extra_qemu_args.extend(authorized_keys_args(&keys));
+        let settings = live_settings(&key);
 
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let host_port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || for _ in listener.incoming() {});
+        let (tor_port, asked) = fake_tor();
+        let tor = TorEndpoint::default();
+        tor.set(Some(tor_port));
 
-        let boot = |expect_restore: bool, paused: bool| {
+        let boot = |name: &str, expect_restore: bool, paused: bool| {
             let prepared = vm_state::prepare(&root.join("state"), image, &settings).unwrap();
             assert_eq!(prepared.load_state, expect_restore);
-            let port = free_loopback_port().unwrap();
-            let (qmp, qga) = (root.join("qmp.sock"), root.join("qga.sock"));
-            let mut args = qemu_args(
-                &settings,
-                1,
-                DiskMode::Persistent {
-                    overlay: &prepared.overlay,
-                    qmp: &qmp,
-                    qga: &qga,
-                    load_state: prepared.load_state,
-                },
-                port,
-                &root.join("serial.log"),
-            );
-            if paused {
-                args.push("-S".into());
-            }
-            let qemu = spawn_qemu(&args, &root).unwrap();
-            (prepared, qemu, port, qmp)
+            let qga = root.join("qga.sock");
+            let disk = |qmp: &Path, socket: &Path, serial: &Path| {
+                qemu_args(
+                    &settings,
+                    1,
+                    DiskMode::Persistent {
+                        overlay: &prepared.overlay,
+                        qmp,
+                        gateway: socket,
+                        qga: &qga,
+                        load_state: prepared.load_state,
+                    },
+                    0,
+                    serial,
+                )
+            };
+            let vm = start_live_vm(&root, name, &settings, disk, tor.clone(), paused);
+            (prepared, vm)
         };
 
-        // 1. Cold boot, leave a file and a process behind, then cut the internet
+        // 1. Cold boot, leave a file and a process behind, go into Tor mode
         //    and record that in the metadata, as the overview does.
-        let (mut prepared, mut qemu, port, qmp) = boot(false, false);
-        wait_for_ssh(port);
-        guest_run(port, &key, "echo persisted > ~/marker");
+        let (mut prepared, vm) = boot("first", false, false);
+        wait_for_ssh(vm.port);
+        guest_run(vm.port, &key, "echo persisted > ~/marker");
         let pid = guest_run(
-            port,
+            vm.port,
             &key,
             "setsid sleep 100000 </dev/null >/dev/null 2>&1 & echo $!",
         );
-        assert!(guest_reaches_host(port, &key, host_port));
-        vm_state::set_internet_over_socket(&qmp, false, false).unwrap();
-        vm_state::set_network_enabled(&mut prepared.meta, &prepared.meta_path, false).unwrap();
-        std::thread::sleep(Duration::from_secs(2));
-        assert!(!guest_reaches_host(port, &key, host_port));
+        assert!(guest_reaches_host(vm.port, &key, host_port));
+        vm_state::set_network_over_socket(&vm.qmp, NetMode::Tor, false).unwrap();
+        vm_state::set_network_mode(&mut prepared.meta, &prepared.meta_path, NetMode::Tor).unwrap();
+        wait_for_route_via(vm.port, &key, "10.0.4.2");
+        assert!(!guest_reaches_host(vm.port, &key, host_port));
 
-        // 2. Save and quit; the save keeps the recorded network setting.
-        vm_state::save_state_over_socket(&qmp).unwrap();
-        assert!(qemu.wait().unwrap().success());
+        // 2. Save and quit; the save keeps the recorded mode.
+        vm_state::save_state_over_socket(&vm.qmp).unwrap();
+        let mut vm = vm;
+        assert!(vm.qemu.wait().unwrap().success());
         vm_state::mark_saved(&prepared.meta, &prepared.meta_path, &settings).unwrap();
+        drop(vm);
 
-        // 3. Restore paused, cut the link before the guest runs, resume.
-        let (prepared, mut qemu, port, qmp) = boot(true, true);
-        assert!(!prepared.meta.network_enabled, "the setting was lost");
-        vm_state::set_internet_over_socket(&qmp, false, true).unwrap();
-        wait_for_ssh(port);
-        assert_eq!(guest_run(port, &key, "cat ~/marker"), "persisted");
+        // 3. Restore paused, set the links before the guest runs, resume.
+        let (prepared, vm) = boot("second", true, true);
+        assert_eq!(prepared.meta.network, NetMode::Tor, "the mode was lost");
+        vm_state::set_network_over_socket(&vm.qmp, NetMode::Tor, true).unwrap();
+        wait_for_ssh(vm.port);
+        assert_eq!(guest_run(vm.port, &key, "cat ~/marker"), "persisted");
         assert_eq!(
-            guest_run(port, &key, &format!("kill -0 {pid} && echo alive")),
+            guest_run(vm.port, &key, &format!("kill -0 {pid} && echo alive")),
             "alive"
         );
         assert!(
-            !guest_reaches_host(port, &key, host_port),
-            "the restored VM reached the host although its internet was off"
+            !guest_reaches_host(vm.port, &key, host_port),
+            "the restored VM reached the host although it was in Tor mode"
         );
+        assert_eq!(guest_echo(vm.port, &key, "example.test", 8080), "ping");
+        assert!(!asked.lock().unwrap().is_empty());
 
-        // 4. Switching it back on works.
-        vm_state::set_internet_over_socket(&qmp, true, false).unwrap();
+        // 4. Back online.
+        vm_state::set_network_over_socket(&vm.qmp, NetMode::Online, false).unwrap();
         let mut back = false;
         for _ in 0..30 {
-            if guest_reaches_host(port, &key, host_port) {
+            if guest_reaches_host(vm.port, &key, host_port) {
                 back = true;
                 break;
             }
             std::thread::sleep(Duration::from_secs(1));
         }
-        assert!(back, "internet did not come back after being switched on");
-        let _ = qemu.kill();
-        let _ = qemu.wait();
+        assert!(back, "internet did not come back after switching online");
+        drop(vm);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -2655,6 +3155,9 @@ mod tests {
         };
         let prepared = vm_state::prepare(&root.join("state"), image, &settings).unwrap();
         let (qmp, qga) = (root.join("qmp.sock"), root.join("qga.sock"));
+        let tor_socket = root.join("tor.sock");
+        // Both QEMUs connect their Tor card to it as they start.
+        let _gateway = Gateway::spawn(1, &tor_socket, TorEndpoint::default()).unwrap();
         let args = |settings: &VmSettings, load_state: bool| {
             qemu_args(
                 settings,
@@ -2662,6 +3165,7 @@ mod tests {
                 DiskMode::Persistent {
                     overlay: &prepared.overlay,
                     qmp: &qmp,
+                    gateway: &tor_socket,
                     qga: &qga,
                     load_state,
                 },

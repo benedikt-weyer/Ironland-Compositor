@@ -46,6 +46,10 @@ pub(crate) enum KeyAction {
     VmOverviewMove(i32),
     /// Switch the selected VM's internet on or off
     VmOverviewToggleInternet,
+    /// Put the selected VM into a network mode
+    VmOverviewMode(crate::shell::vm_state::NetMode),
+    /// Fresh Tor circuits for the selected VM
+    VmOverviewNewIdentity,
     /// Lock the screen until the user authenticates with PAM again
     LockScreen,
     /// Append a character to the launcher's search query
@@ -115,6 +119,10 @@ pub(super) fn vm_overview_key_action(keysym: Keysym) -> KeyAction {
         Keysym::Return | Keysym::KP_Enter | Keysym::n | Keysym::N | Keysym::space => {
             KeyAction::VmOverviewToggleInternet
         }
+        Keysym::o | Keysym::O => KeyAction::VmOverviewMode(crate::shell::vm_state::NetMode::Online),
+        Keysym::t | Keysym::T => KeyAction::VmOverviewMode(crate::shell::vm_state::NetMode::Tor),
+        Keysym::x | Keysym::X => KeyAction::VmOverviewMode(crate::shell::vm_state::NetMode::Offline),
+        Keysym::i | Keysym::I => KeyAction::VmOverviewNewIdentity,
         _ => KeyAction::None,
     }
 }

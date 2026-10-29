@@ -1,31 +1,48 @@
 //! VM overview: an overlay (`super+o` by default) listing the VMs that are
-//! running with their resource use and how they reach the internet, the
+//! running with their resource use and how they reach the outside world, the
 //! persistent VMs' state on disk, and every program that can be started in a
-//! VM. The internet of a running VM can be switched off (and on again) from
-//! here; for a persistent VM the choice is kept in its metadata (see
-//! [`crate::shell::vm_state::PersistMeta::network_enabled`]) and applies the
-//! next time it starts.
+//! VM.
+//!
+//! Each running VM is in one of three network modes, chosen here with the
+//! buttons (or `O`/`T`/`X`, or `N` to flip between online and offline):
+//! *online* (through the host's network), *Tor* (only through the host's Tor
+//! client, by way of the VM's transparent gateway) and *offline*. In Tor mode
+//! a fourth button, "new Tor identity", resets the VM's connections and gives
+//! it fresh circuits. For a persistent VM the mode is kept in its metadata
+//! (see [`crate::shell::vm_state::PersistMeta::network`]) and applies the next
+//! time it starts.
 //!
 //! The data comes from `AnvilState::refresh_vm_overview` (`crate::shell::vm`),
 //! once a second while the overlay is open. Everything in this file is pure:
-//! [`layout`] turns the data into lines of text, [`VmOverviewState`] rasterizes
-//! them into a `MemoryRenderBuffer` the way the launcher does. Like the
-//! launcher, the overlay grabs the keyboard while it is visible.
+//! [`layout`] turns the data into lines of text and buttons, and
+//! [`VmOverviewState`] rasterizes them into a `MemoryRenderBuffer` the way the
+//! launcher does and answers where a click landed. Like the launcher, the
+//! overlay grabs the keyboard while it is visible, and it grabs the pointer.
 
 use std::{collections::HashMap, net::Ipv4Addr, time::Duration};
 
 use smithay::{
     backend::{allocator::Fourcc, renderer::element::memory::MemoryRenderBuffer},
-    utils::{Logical, Size, Transform},
+    utils::{Logical, Point, Size, Transform},
 };
 
-use crate::font::{Canvas, GLYPH_HEIGHT, GLYPH_WIDTH};
+use crate::{
+    font::{Canvas, GLYPH_HEIGHT, GLYPH_WIDTH},
+    shell::{vm_state::NetMode, vm_tor::TorStatus},
+};
 
 /// Overlay width in logical pixels.
 const WIDTH: i32 = 1040;
 const PADDING: i32 = 12;
 const FONT_SCALE: i32 = 2;
 const LINE_HEIGHT: i32 = 22;
+/// A line of buttons is taller than a line of text.
+const BUTTON_LINE_HEIGHT: i32 = 36;
+const BUTTON_HEIGHT: i32 = 28;
+const BUTTON_PADDING: i32 = 14;
+const BUTTON_GAP: i32 = 10;
+/// Indent of the button row, in pixels (two characters).
+const BUTTON_INDENT: i32 = 2 * (GLYPH_WIDTH as i32 + 1) * FONT_SCALE;
 /// Characters that fit on one line.
 const LINE_CHARS: usize =
     ((WIDTH - 2 * PADDING) / ((GLYPH_WIDTH as i32 + 1) * FONT_SCALE)) as usize;
@@ -43,9 +60,11 @@ const fn rgba(r: u8, g: u8, b: u8, a: u8) -> [u8; 4] {
 const COLOR_BACKGROUND: [u8; 4] = rgba(30, 34, 40, 255);
 const COLOR_HEADER_BG: [u8; 4] = rgba(52, 60, 70, 255);
 const COLOR_SELECTED_BG: [u8; 4] = rgba(40, 90, 120, 255);
+const COLOR_BUTTON_ACTIVE: [u8; 4] = rgba(60, 130, 170, 255);
 const COLOR_TEXT: [u8; 4] = rgba(235, 230, 225, 255);
 const COLOR_MUTED: [u8; 4] = rgba(150, 140, 130, 255);
 const COLOR_ONLINE: [u8; 4] = rgba(130, 205, 130, 255);
+const COLOR_TOR: [u8; 4] = rgba(190, 150, 230, 255);
 const COLOR_OFFLINE: [u8; 4] = rgba(240, 150, 100, 255);
 const COLOR_ERROR: [u8; 4] = rgba(235, 120, 110, 255);
 
@@ -65,15 +84,43 @@ pub enum Phase {
     Saving,
 }
 
-/// A running VM's connection to the internet.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A VM in Tor mode, as the overview shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TorLink {
+    /// The host's Tor client is running.
+    pub running: bool,
+    /// Percent of Tor's start-up done; 100 once it can build circuits.
+    pub bootstrap: u8,
+    /// The last thing Tor complained about.
+    pub problem: Option<String>,
+    /// Connections the VM has open through Tor.
+    pub flows: u32,
+    /// Starts at 1; each "new Tor identity" adds one.
+    pub identity: u32,
+}
+
+/// A running VM's connection to the outside world.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Link {
     Online,
     Offline,
-    /// The change to `online` has been asked for and is not done yet.
+    Tor(TorLink),
+    /// The change to `to` has been asked for and is not done yet.
     Switching {
-        online: bool,
+        to: NetMode,
     },
+}
+
+impl Link {
+    /// The mode this link is in or going to.
+    fn mode(&self) -> NetMode {
+        match self {
+            Link::Online => NetMode::Online,
+            Link::Offline => NetMode::Offline,
+            Link::Tor(_) => NetMode::Tor,
+            Link::Switching { to } => *to,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -101,9 +148,8 @@ pub struct PersistedEntry {
     pub disk_bytes: u64,
     /// The overlay holds a saved state to resume from.
     pub has_state: bool,
-    /// Whether the VM gets the internet when it starts; `None` for state
-    /// without readable metadata.
-    pub internet: Option<bool>,
+    /// The mode the VM starts in; `None` for state without readable metadata.
+    pub network: Option<NetMode>,
     /// Kept aside after the program's image was replaced.
     pub stale: bool,
     pub running: bool,
@@ -132,6 +178,8 @@ pub struct VmOverviewData {
     pub persisted: Vec<PersistedEntry>,
     pub programs: Vec<ProgramEntry>,
     pub route: HostRoute,
+    /// The host's Tor client.
+    pub tor: TorStatus,
     pub max_instances: u32,
 }
 
@@ -227,6 +275,7 @@ enum Style {
     Text,
     Muted,
     Online,
+    Tor,
     Offline,
     Error,
 }
@@ -237,10 +286,28 @@ impl Style {
             Style::Title | Style::Header | Style::Text => COLOR_TEXT,
             Style::Muted => COLOR_MUTED,
             Style::Online => COLOR_ONLINE,
+            Style::Tor => COLOR_TOR,
             Style::Offline => COLOR_OFFLINE,
             Style::Error => COLOR_ERROR,
         }
     }
+}
+
+/// What a button does to the selected VM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Action {
+    Mode(NetMode),
+    /// Fresh Tor circuits (only in Tor mode).
+    NewIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Button {
+    label: String,
+    action: Action,
+    /// The mode the VM is in (or going to).
+    active: bool,
+    enabled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -249,6 +316,10 @@ struct Line {
     style: Style,
     /// Part of the selected VM.
     selected: bool,
+    /// The running VM the line belongs to, so a click on it selects it.
+    vm: Option<u64>,
+    /// A row of buttons instead of text.
+    buttons: Vec<Button>,
 }
 
 impl Line {
@@ -257,12 +328,73 @@ impl Line {
             text: clip(&text.into(), LINE_CHARS),
             style,
             selected: false,
+            vm: None,
+            buttons: Vec::new(),
         }
     }
 
     fn blank() -> Self {
         Self::new(Style::Text, "")
     }
+
+    fn height(&self) -> i32 {
+        if self.buttons.is_empty() {
+            LINE_HEIGHT
+        } else {
+            BUTTON_LINE_HEIGHT
+        }
+    }
+}
+
+/// A rectangle in the overlay's own coordinates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Rect {
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+}
+
+impl Rect {
+    fn contains(&self, p: Point<i32, Logical>) -> bool {
+        (self.x..self.x + self.w).contains(&p.x) && (self.y..self.y + self.h).contains(&p.y)
+    }
+}
+
+/// Top of each line, in the overlay's coordinates.
+fn line_tops(lines: &[Line]) -> Vec<i32> {
+    let mut y = PADDING;
+    lines
+        .iter()
+        .map(|line| {
+            let top = y;
+            y += line.height();
+            top
+        })
+        .collect()
+}
+
+fn total_height(lines: &[Line]) -> i32 {
+    2 * PADDING + lines.iter().map(Line::height).sum::<i32>()
+}
+
+/// Where each button of `line` (whose top is `top`) is drawn.
+fn button_rects(line: &Line, top: i32) -> Vec<(Rect, &Button)> {
+    let mut x = PADDING + BUTTON_INDENT;
+    line.buttons
+        .iter()
+        .map(|button| {
+            let w = Canvas::text_width(&button.label, FONT_SCALE) + 2 * BUTTON_PADDING;
+            let rect = Rect {
+                x,
+                y: top + (line.height() - BUTTON_HEIGHT) / 2,
+                w,
+                h: BUTTON_HEIGHT,
+            };
+            x += w + BUTTON_GAP;
+            (rect, button)
+        })
+        .collect()
 }
 
 fn running_line(vm: &RunningVm, selected: bool) -> Line {
@@ -293,14 +425,15 @@ fn running_line(vm: &RunningVm, selected: bool) -> Line {
     );
     Line {
         selected,
+        vm: Some(vm.id),
         ..Line::new(Style::Text, text)
     }
 }
 
-/// The line under a running VM saying how it reaches the internet.
+/// The line under a running VM saying how it reaches the outside world.
 fn route_line(vm: &RunningVm, route: &HostRoute, selected: bool) -> Line {
     let ssh = format!(":{}", vm.ssh_port);
-    let (style, text) = match vm.link {
+    let (style, text) = match &vm.link {
         Link::Online => {
             let uplink = match (&route.uplink, route.gateway) {
                 (Some(iface), Some(gateway)) => format!("{iface} VIA {gateway}"),
@@ -319,14 +452,65 @@ fn route_line(vm: &RunningVm, route: &HostRoute, selected: bool) -> Line {
             Style::Offline,
             format!("    NET OFFLINE: INTERNET LINK CUT, ONLY SSH {ssh} IS LEFT"),
         ),
-        Link::Switching { online } => (
+        Link::Tor(tor) if !tor.running => (
+            Style::Error,
+            format!(
+                "    NET TOR: TOR IS NOT RUNNING{}",
+                tor.problem
+                    .as_deref()
+                    .map(|p| format!(" ({p})"))
+                    .unwrap_or_default()
+            ),
+        ),
+        Link::Tor(tor) => {
+            let (style, state) = if tor.bootstrap >= 100 {
+                (Style::Tor, "TOR".to_string())
+            } else {
+                (Style::Muted, format!("TOR (STARTING {}%)", tor.bootstrap))
+            };
+            (
+                style,
+                format!(
+                    "    NET TOR: {} > GATEWAY > {state}   ID {}   {} CONN   SSH {ssh}",
+                    crate::shell::vm_gateway::GUEST_IP,
+                    tor.identity,
+                    tor.flows
+                ),
+            )
+        }
+        Link::Switching { to } => (
             Style::Muted,
-            format!("    NET SWITCHING {}...", if online { "ON" } else { "OFF" }),
+            format!(
+                "    NET SWITCHING TO {}...",
+                to.label().to_ascii_uppercase()
+            ),
         ),
     };
     Line {
         selected,
+        vm: Some(vm.id),
         ..Line::new(style, text)
+    }
+}
+
+/// The row of buttons for the selected VM.
+fn button_line(vm: &RunningVm) -> Line {
+    let current = vm.link.mode();
+    let in_tor = matches!(vm.link, Link::Tor(_));
+    let button = |label: &str, action: Action, enabled: bool| Button {
+        label: label.to_string(),
+        action,
+        active: action == Action::Mode(current),
+        enabled,
+    };
+    Line {
+        buttons: vec![
+            button("O  ONLINE", Action::Mode(NetMode::Online), true),
+            button("T  TOR", Action::Mode(NetMode::Tor), true),
+            button("X  OFFLINE", Action::Mode(NetMode::Offline), true),
+            button("I  NEW TOR IDENTITY", Action::NewIdentity, in_tor),
+        ],
+        ..Line::blank()
     }
 }
 
@@ -338,9 +522,10 @@ fn persisted_line(entry: &PersistedEntry) -> Line {
     } else {
         "DISK ONLY"
     };
-    let net = match entry.internet {
-        Some(true) => "NET ON",
-        Some(false) => "NET OFF",
+    let net = match entry.network {
+        Some(NetMode::Online) => "NET ON",
+        Some(NetMode::Tor) => "NET TOR",
+        Some(NetMode::Offline) => "NET OFF",
         None => "NET ?",
     };
     let text = format!(
@@ -351,17 +536,37 @@ fn persisted_line(entry: &PersistedEntry) -> Line {
         net,
         if entry.running { "   RUNNING" } else { "" },
     );
-    let style = if entry.internet == Some(false) {
-        Style::Offline
-    } else {
-        Style::Text
+    let style = match entry.network {
+        Some(NetMode::Offline) => Style::Offline,
+        Some(NetMode::Tor) => Style::Tor,
+        _ => Style::Text,
     };
     Line::new(style, text)
 }
 
+/// The line about the host's Tor client, if it is or was in use.
+fn tor_line(tor: &TorStatus) -> Option<Line> {
+    if tor.running {
+        let state = if tor.bootstrap >= 100 {
+            "READY".to_string()
+        } else {
+            format!("STARTING, {}%", tor.bootstrap)
+        };
+        Some(Line::new(
+            Style::Muted,
+            format!("HOST TOR: RUNNING, {state}"),
+        ))
+    } else {
+        tor.problem
+            .as_ref()
+            .map(|problem| Line::new(Style::Error, format!("HOST TOR: NOT RUNNING ({problem})")))
+    }
+}
+
 /// Everything the overlay says, top to bottom. `selected` is the index of the
-/// highlighted running VM and `status` replaces the key hints at the bottom.
-fn layout(data: &VmOverviewData, selected: usize, status: Option<&str>) -> Vec<Line> {
+/// highlighted running VM; `status` replaces the key hints at the bottom, as
+/// an error or (`true`) a plain notice.
+fn layout(data: &VmOverviewData, selected: usize, status: Option<(&str, bool)>) -> Vec<Line> {
     let mut lines = Vec::new();
     let max = data.max_instances.max(1);
     lines.push(Line::new(
@@ -375,8 +580,9 @@ fn layout(data: &VmOverviewData, selected: usize, status: Option<&str>) -> Vec<L
     };
     lines.push(Line::new(
         Style::Muted,
-        format!("HOST UPLINK: {uplink}. VMS REACH IT THROUGH QEMU'S NAT."),
+        format!("HOST UPLINK: {uplink}. ONLINE VMS REACH IT THROUGH QEMU'S NAT."),
     ));
+    lines.extend(tor_line(&data.tor));
 
     lines.push(Line::blank());
     lines.push(Line::new(Style::Header, "RUNNING VMS"));
@@ -389,6 +595,13 @@ fn layout(data: &VmOverviewData, selected: usize, status: Option<&str>) -> Vec<L
     for (i, vm) in data.running.iter().enumerate() {
         lines.push(running_line(vm, i == selected));
         lines.push(route_line(vm, &data.route, i == selected));
+    }
+    if let Some(vm) = data.running.get(selected) {
+        lines.push(Line::new(
+            Style::Muted,
+            format!("  NETWORK OF {}:", clip(&vm.name.to_ascii_uppercase(), 40)),
+        ));
+        lines.push(button_line(vm));
     }
 
     lines.push(Line::blank());
@@ -463,11 +676,12 @@ fn layout(data: &VmOverviewData, selected: usize, status: Option<&str>) -> Vec<L
 
     lines.push(Line::blank());
     lines.push(match status {
-        Some(message) => Line::new(Style::Error, message),
+        Some((message, true)) => Line::new(Style::Tor, message),
+        Some((message, false)) => Line::new(Style::Error, message),
         None if data.running.is_empty() => Line::new(Style::Muted, "ESC: CLOSE"),
         None => Line::new(
             Style::Muted,
-            "UP/DOWN: SELECT   N OR ENTER: INTERNET ON/OFF   ESC: CLOSE",
+            "UP/DOWN: SELECT   O/T/X: ONLINE/TOR/OFFLINE   I: NEW IDENTITY   ESC: CLOSE",
         ),
     });
     lines
@@ -477,14 +691,28 @@ fn layout(data: &VmOverviewData, selected: usize, status: Option<&str>) -> Vec<L
 // State
 // ---------------------------------------------------------------------------
 
+/// What a click on the overlay hit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hit {
+    /// A running VM's rows.
+    Select(u64),
+    /// A button (only enabled ones are reported).
+    Button(Action),
+    /// The panel, but nothing in it.
+    Panel,
+    /// Outside the panel.
+    Outside,
+}
+
 #[derive(Debug, Default)]
 pub struct VmOverviewState {
     visible: bool,
     data: VmOverviewData,
     /// The VM the selection follows as the list changes.
     selected_id: Option<u64>,
-    /// Shown in place of the key hints until the next key.
-    status: Option<String>,
+    /// Shown in place of the key hints until the next key: the message, and
+    /// whether it is a notice rather than an error.
+    status: Option<(String, bool)>,
     /// Display names by program id (desktop entry id without `.desktop`),
     /// looked up once when the overlay opens.
     names: HashMap<String, String>,
@@ -531,8 +759,15 @@ impl VmOverviewState {
         self.dirty = true;
     }
 
+    /// Shows an error in place of the key hints.
     pub fn set_status(&mut self, message: impl Into<String>) {
-        self.status = Some(message.into());
+        self.status = Some((message.into(), false));
+        self.dirty = true;
+    }
+
+    /// Shows a plain message in place of the key hints.
+    pub fn set_notice(&mut self, message: impl Into<String>) {
+        self.status = Some((message.into(), true));
         self.dirty = true;
     }
 
@@ -560,42 +795,102 @@ impl VmOverviewState {
         self.dirty = true;
     }
 
+    /// Selects the running VM `id`, if it is running.
+    pub fn select(&mut self, id: u64) {
+        if self.data.running.iter().any(|vm| vm.id == id) {
+            self.clear_status();
+            self.selected_id = Some(id);
+            self.dirty = true;
+        }
+    }
+
     pub fn selected(&self) -> Option<&RunningVm> {
         self.data.running.get(self.selected_index())
     }
 
     fn lines(&self) -> Vec<Line> {
-        layout(&self.data, self.selected_index(), self.status.as_deref())
+        layout(
+            &self.data,
+            self.selected_index(),
+            self.status
+                .as_ref()
+                .map(|(m, notice)| (m.as_str(), *notice)),
+        )
     }
 
     /// The logical size of the overlay, so callers can center it on the output.
     pub fn logical_size(&self) -> Size<i32, Logical> {
-        Size::from((WIDTH, self.lines().len() as i32 * LINE_HEIGHT + 2 * PADDING))
+        Size::from((WIDTH, total_height(&self.lines())))
+    }
+
+    /// What a click at `at` (relative to the overlay's top-left corner) hit.
+    pub fn hit_test(&self, at: Point<i32, Logical>) -> Hit {
+        let lines = self.lines();
+        let size = Size::<i32, Logical>::from((WIDTH, total_height(&lines)));
+        if at.x < 0 || at.y < 0 || at.x >= size.w || at.y >= size.h {
+            return Hit::Outside;
+        }
+        for (line, top) in lines.iter().zip(line_tops(&lines)) {
+            for (rect, button) in button_rects(line, top) {
+                if rect.contains(at) {
+                    return if button.enabled {
+                        Hit::Button(button.action)
+                    } else {
+                        Hit::Panel
+                    };
+                }
+            }
+            if let Some(id) = line.vm
+                && (top..top + line.height()).contains(&at.y)
+            {
+                return Hit::Select(id);
+            }
+        }
+        Hit::Panel
     }
 
     fn rasterize(&self) -> Canvas {
         let lines = self.lines();
-        let size =
-            Size::<i32, Logical>::from((WIDTH, lines.len() as i32 * LINE_HEIGHT + 2 * PADDING));
-        let mut canvas = Canvas::new(size.w as usize, size.h as usize, COLOR_BACKGROUND);
-        for (i, line) in lines.iter().enumerate() {
-            let y = PADDING + i as i32 * LINE_HEIGHT;
+        let width = WIDTH;
+        let height = total_height(&lines);
+        let mut canvas = Canvas::new(width as usize, height as usize, COLOR_BACKGROUND);
+        let text_y = |top: i32, h: i32| top + (h - GLYPH_HEIGHT as i32 * FONT_SCALE) / 2;
+        for (line, top) in lines.iter().zip(line_tops(&lines)) {
             match line.style {
                 Style::Header | Style::Title => {
-                    canvas.fill_rect(0, y, size.w, LINE_HEIGHT, COLOR_HEADER_BG)
+                    canvas.fill_rect(0, top, width, line.height(), COLOR_HEADER_BG)
                 }
                 _ if line.selected => {
-                    canvas.fill_rect(0, y, size.w, LINE_HEIGHT, COLOR_SELECTED_BG)
+                    canvas.fill_rect(0, top, width, line.height(), COLOR_SELECTED_BG)
                 }
                 _ => {}
             }
             canvas.draw_text(
                 PADDING,
-                y + (LINE_HEIGHT - GLYPH_HEIGHT as i32 * FONT_SCALE) / 2,
+                text_y(top, line.height()),
                 &line.text,
                 FONT_SCALE,
                 line.style.color(),
             );
+            for (rect, button) in button_rects(line, top) {
+                let background = if button.active {
+                    COLOR_BUTTON_ACTIVE
+                } else {
+                    COLOR_HEADER_BG
+                };
+                canvas.fill_rect(rect.x, rect.y, rect.w, rect.h, background);
+                canvas.draw_text(
+                    rect.x + BUTTON_PADDING,
+                    text_y(rect.y, rect.h),
+                    &button.label,
+                    FONT_SCALE,
+                    if button.enabled {
+                        COLOR_TEXT
+                    } else {
+                        COLOR_MUTED
+                    },
+                );
+            }
         }
         canvas
     }
@@ -640,6 +935,16 @@ mod tests {
         }
     }
 
+    fn tor_link(bootstrap: u8) -> Link {
+        Link::Tor(TorLink {
+            running: true,
+            bootstrap,
+            problem: None,
+            flows: 5,
+            identity: 3,
+        })
+    }
+
     fn route() -> HostRoute {
         HostRoute {
             uplink: Some("wlp3s0".into()),
@@ -657,7 +962,7 @@ mod tests {
                 app: "Firefox".into(),
                 disk_bytes: 1_800_000_000,
                 has_state: true,
-                internet: Some(true),
+                network: Some(NetMode::Online),
                 stale: false,
                 running: true,
             }],
@@ -674,6 +979,7 @@ mod tests {
                 },
             ],
             route: route(),
+            tor: TorStatus::default(),
             max_instances: 8,
         }
     }
@@ -747,6 +1053,66 @@ mod tests {
     }
 
     #[test]
+    fn a_vm_in_tor_mode_shows_its_path_identity_and_connections() {
+        let mut d = data();
+        d.running[0].link = tor_link(100);
+        let all = text(&layout(&d, 0, None));
+        assert!(
+            all.contains("NET TOR: 10.0.4.15 > GATEWAY > TOR   ID 3   5 CONN   SSH :43211"),
+            "{all}"
+        );
+        d.running[0].link = tor_link(40);
+        let all = text(&layout(&d, 0, None));
+        assert!(all.contains("TOR (STARTING 40%)"), "{all}");
+    }
+
+    #[test]
+    fn a_vm_in_tor_mode_without_a_running_tor_says_so() {
+        let mut d = data();
+        d.running[0].link = Link::Tor(TorLink {
+            running: false,
+            bootstrap: 0,
+            problem: Some("tor exited (exit status: 1)".into()),
+            flows: 0,
+            identity: 1,
+        });
+        let line = route_line(&d.running[0], &d.route, true);
+        assert!(line.text.contains("TOR IS NOT RUNNING"), "{}", line.text);
+        assert!(line.text.contains("tor exited"), "{}", line.text);
+        assert_eq!(line.style, Style::Error);
+    }
+
+    #[test]
+    fn a_vm_being_switched_says_where_to() {
+        let mut d = data();
+        d.running[0].link = Link::Switching { to: NetMode::Tor };
+        let all = text(&layout(&d, 0, None));
+        assert!(all.contains("NET SWITCHING TO TOR..."), "{all}");
+    }
+
+    #[test]
+    fn the_host_tor_client_is_mentioned_when_it_runs_or_failed() {
+        let mut d = data();
+        assert!(!text(&layout(&d, 0, None)).contains("HOST TOR"));
+        d.tor = TorStatus {
+            running: true,
+            bootstrap: 100,
+            problem: None,
+        };
+        assert!(text(&layout(&d, 0, None)).contains("HOST TOR: RUNNING, READY"));
+        d.tor.bootstrap = 30;
+        assert!(text(&layout(&d, 0, None)).contains("HOST TOR: RUNNING, STARTING, 30%"));
+        d.tor = TorStatus {
+            running: false,
+            bootstrap: 0,
+            problem: Some("starting tor: not found".into()),
+        };
+        assert!(
+            text(&layout(&d, 0, None)).contains("HOST TOR: NOT RUNNING (starting tor: not found)")
+        );
+    }
+
+    #[test]
     fn the_overview_lists_persisted_state_and_available_programs() {
         let all = text(&layout(&data(), 0, None));
         assert!(all.contains("PERSISTED VMS (1)   1.7G ON DISK"), "{all}");
@@ -756,12 +1122,16 @@ mod tests {
     }
 
     #[test]
-    fn a_persisted_vm_without_internet_says_so() {
+    fn a_persisted_vm_says_which_mode_it_starts_in() {
         let mut entry = data().persisted.remove(0);
-        entry.internet = Some(false);
+        entry.network = Some(NetMode::Offline);
         let line = persisted_line(&entry);
         assert!(line.text.contains("NET OFF"), "{}", line.text);
         assert_eq!(line.style, Style::Offline);
+        entry.network = Some(NetMode::Tor);
+        let line = persisted_line(&entry);
+        assert!(line.text.contains("NET TOR"), "{}", line.text);
+        assert_eq!(line.style, Style::Tor);
     }
 
     #[test]
@@ -781,14 +1151,22 @@ mod tests {
         assert!(all.contains("START ONE FROM THE LAUNCHER"), "{all}");
         assert!(all.contains("PERSISTED VMS (0)"), "{all}");
         assert!(all.contains("NONE (THE HOST IS OFFLINE)"), "{all}");
+        assert!(
+            !layout(&VmOverviewData::default(), 0, None)
+                .iter()
+                .any(|l| !l.buttons.is_empty()),
+            "no VM, nothing to switch"
+        );
     }
 
     #[test]
-    fn a_status_replaces_the_key_hints() {
-        let lines = layout(&data(), 0, Some("COULD NOT SWITCH"));
+    fn a_status_replaces_the_key_hints_as_an_error_or_a_notice() {
+        let lines = layout(&data(), 0, Some(("COULD NOT SWITCH", false)));
         let last = lines.last().unwrap();
         assert_eq!(last.text, "COULD NOT SWITCH");
         assert_eq!(last.style, Style::Error);
+        let lines = layout(&data(), 0, Some(("NEW TOR IDENTITY", true)));
+        assert_eq!(lines.last().unwrap().style, Style::Tor);
     }
 
     #[test]
@@ -815,6 +1193,15 @@ mod tests {
         vm.ssh_port = 65535;
         let line = route_line(&vm, &route, false);
         assert!(line.text.ends_with("SSH :65535"), "{:?}", line.text);
+        vm.link = Link::Tor(TorLink {
+            running: true,
+            bootstrap: 100,
+            problem: None,
+            flows: 256,
+            identity: 99,
+        });
+        let line = route_line(&vm, &route, false);
+        assert!(line.text.ends_with("SSH :65535"), "{:?}", line.text);
     }
 
     #[test]
@@ -826,10 +1213,155 @@ mod tests {
         d.running[0].cpu_percent = 1234.0;
         d.running[0].uptime = Duration::from_secs(99 * 3600);
         d.route.uplink = Some("enx0123456789ab".into());
-        for line in layout(&d, 0, Some(&"X".repeat(200))) {
+        d.tor = TorStatus {
+            running: false,
+            bootstrap: 0,
+            problem: Some("x".repeat(200)),
+        };
+        for line in layout(&d, 0, Some((&"X".repeat(200), false))) {
             assert!(line.text.chars().count() <= LINE_CHARS, "{:?}", line.text);
         }
     }
+
+    // --- buttons and clicks -------------------------------------------------
+
+    fn buttons_of(d: &VmOverviewData, selected: usize) -> Vec<Button> {
+        layout(d, selected, None)
+            .into_iter()
+            .find(|l| !l.buttons.is_empty())
+            .expect("a button row")
+            .buttons
+    }
+
+    #[test]
+    fn the_buttons_show_the_selected_vms_mode() {
+        let mut d = data();
+        d.running[0].link = tor_link(100);
+        let active = |b: &[Button]| -> Vec<Action> {
+            b.iter().filter(|b| b.active).map(|b| b.action).collect()
+        };
+        assert_eq!(active(&buttons_of(&d, 0)), [Action::Mode(NetMode::Tor)]);
+        assert_eq!(active(&buttons_of(&d, 1)), [Action::Mode(NetMode::Offline)]);
+        d.running[1].link = Link::Switching {
+            to: NetMode::Online,
+        };
+        assert_eq!(active(&buttons_of(&d, 1)), [Action::Mode(NetMode::Online)]);
+    }
+
+    #[test]
+    fn new_identity_only_works_in_tor_mode() {
+        let mut d = data();
+        let identity = |b: Vec<Button>| {
+            b.into_iter()
+                .find(|b| b.action == Action::NewIdentity)
+                .unwrap()
+        };
+        assert!(!identity(buttons_of(&d, 0)).enabled);
+        d.running[0].link = tor_link(100);
+        assert!(identity(buttons_of(&d, 0)).enabled);
+        // The mode buttons never are disabled.
+        assert!(
+            buttons_of(&d, 0)
+                .iter()
+                .filter(|b| b.action != Action::NewIdentity)
+                .all(|b| b.enabled)
+        );
+    }
+
+    /// The middle of a button of the selected VM.
+    fn centre_of(state: &VmOverviewState, action: Action) -> Point<i32, Logical> {
+        let lines = state.lines();
+        let tops = line_tops(&lines);
+        for (line, top) in lines.iter().zip(tops) {
+            for (rect, button) in button_rects(line, top) {
+                if button.action == action {
+                    return Point::from((rect.x + rect.w / 2, rect.y + rect.h / 2));
+                }
+            }
+        }
+        panic!("no such button");
+    }
+
+    fn open_state(d: VmOverviewData) -> VmOverviewState {
+        let mut state = VmOverviewState::default();
+        state.open(HashMap::new());
+        state.set_data(d);
+        state
+    }
+
+    #[test]
+    fn a_click_on_a_button_reports_its_action() {
+        let state = open_state(data());
+        for action in [
+            Action::Mode(NetMode::Online),
+            Action::Mode(NetMode::Tor),
+            Action::Mode(NetMode::Offline),
+        ] {
+            assert_eq!(
+                state.hit_test(centre_of(&state, action)),
+                Hit::Button(action)
+            );
+        }
+    }
+
+    #[test]
+    fn a_click_on_a_disabled_button_does_nothing() {
+        let state = open_state(data());
+        assert_eq!(
+            state.hit_test(centre_of(&state, Action::NewIdentity)),
+            Hit::Panel
+        );
+    }
+
+    #[test]
+    fn a_click_on_a_vms_rows_selects_it() {
+        let state = open_state(data());
+        let lines = state.lines();
+        let tops = line_tops(&lines);
+        let row_of = |id: u64| -> Vec<i32> {
+            lines
+                .iter()
+                .zip(&tops)
+                .filter(|(l, _)| l.vm == Some(id))
+                .map(|(_, &top)| top + 3)
+                .collect()
+        };
+        for id in [1, 2] {
+            // Both of its lines count.
+            for y in row_of(id) {
+                assert_eq!(state.hit_test(Point::from((100, y))), Hit::Select(id));
+            }
+        }
+    }
+
+    #[test]
+    fn a_click_elsewhere_is_the_panel_or_outside_it() {
+        let state = open_state(data());
+        // The title bar.
+        assert_eq!(state.hit_test(Point::from((100, PADDING + 3))), Hit::Panel);
+        assert_eq!(state.hit_test(Point::from((-1, 10))), Hit::Outside);
+        assert_eq!(state.hit_test(Point::from((10, -1))), Hit::Outside);
+        let size = state.logical_size();
+        assert_eq!(state.hit_test(Point::from((size.w, 10))), Hit::Outside);
+        assert_eq!(state.hit_test(Point::from((10, size.h))), Hit::Outside);
+    }
+
+    #[test]
+    fn buttons_stay_inside_the_overlay() {
+        let state = open_state(data());
+        let lines = state.lines();
+        for (line, top) in lines.iter().zip(line_tops(&lines)) {
+            for (rect, _) in button_rects(line, top) {
+                assert!(rect.x >= 0 && rect.x + rect.w <= WIDTH, "{rect:?}");
+                assert!(
+                    rect.y >= top && rect.y + rect.h <= top + line.height(),
+                    "{rect:?}"
+                );
+            }
+        }
+    }
+
+    // --- selection ------------------------------------------------------------
 
     #[test]
     fn selection_follows_the_vm_when_the_list_changes() {
@@ -861,6 +1393,15 @@ mod tests {
         assert_eq!(state.selected().unwrap().id, 2);
         state.move_selection(1);
         assert_eq!(state.selected().unwrap().id, 1);
+    }
+
+    #[test]
+    fn selecting_a_vm_that_is_not_running_is_ignored() {
+        let mut state = open_state(data());
+        state.select(2);
+        assert_eq!(state.selected().unwrap().id, 2);
+        state.select(99);
+        assert_eq!(state.selected().unwrap().id, 2);
     }
 
     #[test]
