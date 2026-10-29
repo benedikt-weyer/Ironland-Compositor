@@ -52,10 +52,12 @@
     and destroying the object (or disconnecting) leaves it running.
   </description>
 
-  <interface name="ironland_vm_launcher_v1" version="2">
+  <interface name="ironland_vm_launcher_v1" version="3">
     <description summary="starts applications in virtual machines">
       The manager global. On binding it immediately sends `availability`
-      and, from version 2, the list of programs that can be started.
+      and, from version 2, the list of programs that can be started. From
+      version 3 a launch can also choose how the VM is connected to the
+      network.
     </description>
 
     <enum name="mode">
@@ -74,6 +76,26 @@
         application resumes where it left off, with all its files, in about
         a second instead of a full boot. At most one persistent VM per
         application runs at a time.
+      </entry>
+    </enum>
+
+    <enum name="network">
+      <description summary="how a VM is connected to the network">
+        What a VM can reach, chosen per launch. The mode can be changed
+        later from the compositor's VM overview.
+      </description>
+      <entry name="online" value="0" summary="through the host's network">
+        The guest reaches the internet through the host's own connection.
+      </entry>
+      <entry name="tor" value="1" summary="only through Tor">
+        Everything the guest connects to is relayed through a Tor client
+        the compositor runs on the host, outside the VM: the guest sees an
+        ordinary network and can reach nothing but Tor. The launch is
+        refused (`other`) if Tor cannot be started.
+      </entry>
+      <entry name="offline" value="2" summary="not at all">
+        The guest has no network. (The compositor's own link to it, which
+        carries the guest's windows, is not part of it.)
       </entry>
     </enum>
 
@@ -127,6 +149,21 @@
         list received earlier.
       </description>
     </event>
+
+    <request name="launch_with_network" since="3">
+      <description summary="start an application in a new VM with a network mode">
+        Like `launch`, with the VM's network mode chosen. For a persistent
+        VM the mode is also kept as the mode the application's VM starts in,
+        so it applies to later launches that don't choose one (`launch`
+        leaves a persistent VM in the mode it was last in; a throw-away VM
+        started with `launch` is online).
+      </description>
+      <arg name="id" type="new_id" interface="ironland_vm_launch_v1"/>
+      <arg name="entry" type="string"
+           summary="desktop entry id, with or without the .desktop suffix"/>
+      <arg name="mode" type="uint" enum="mode"/>
+      <arg name="network" type="uint" enum="network"/>
+    </request>
   </interface>
 
   <interface name="ironland_vm_launch_v1" version="1">

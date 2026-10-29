@@ -1092,10 +1092,15 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
     /// With `persistent`, the VM runs on the application's own overlay and
     /// restores the state saved when it last exited cleanly (if any); see the
     /// module doc.
+    ///
+    /// `network` is the VM's mode from the start. `None`: online, or for a
+    /// persistent VM the mode it was last left in. A persistent VM given a
+    /// mode keeps it as its start mode, like a switch in the VM overview.
     pub fn launch_in_vm(
         &mut self,
         entry: &DesktopEntry,
         persistent: bool,
+        network: Option<NetMode>,
     ) -> Result<VmId, VmError> {
         let mut settings = self.config.vm.clone();
         // One program per VM: the program's own image, with only it installed.
@@ -1136,14 +1141,21 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
         {
             return Err(VmError::AlreadyRunning(entry.name.clone()));
         }
-        let prepared = if persistent {
+        let mut prepared = if persistent {
             let dir = vm_state::state_root(&settings).join(&key);
             Some(vm_state::prepare(&dir, &image, &settings).map_err(VmError::State)?)
         } else {
             None
         };
-        // A persistent VM comes back in the mode it was left in.
-        let mode = prepared.as_ref().map_or(NetMode::Online, |p| p.meta.network);
+        if let (Some(p), Some(chosen)) = (prepared.as_mut(), network)
+            && p.meta.network != chosen
+        {
+            vm_state::set_network_mode(&mut p.meta, &p.meta_path, chosen)
+                .map_err(|e| VmError::State(e.to_string()))?;
+        }
+        // Otherwise a persistent VM comes back in the mode it was left in.
+        let mode = network
+            .unwrap_or_else(|| prepared.as_ref().map_or(NetMode::Online, |p| p.meta.network));
         if mode == NetMode::Tor {
             self.vm
                 .tor
@@ -1306,7 +1318,7 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
         let Some(entry) = self.launcher.selected_entry() else {
             return;
         };
-        match self.launch_in_vm(&entry, persistent) {
+        match self.launch_in_vm(&entry, persistent, None) {
             Ok(_) => self.launcher.close(),
             Err(err) => {
                 warn!(app = entry.name, %err, "Could not launch in a VM");

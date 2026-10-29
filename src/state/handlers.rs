@@ -103,10 +103,11 @@ impl<BackendData: Backend + 'static> crate::vm_launch::VmLaunchHandler for Anvil
         &mut self,
         entry_id: &str,
         persistent: bool,
+        network: Option<crate::shell::vm_state::NetMode>,
     ) -> Result<crate::shell::vm::VmId, crate::vm_launch::Refusal> {
         let entry = crate::launcher::find_entry(entry_id)
             .ok_or_else(|| crate::vm_launch::Refusal::unknown_entry(entry_id))?;
-        self.launch_in_vm(&entry, persistent).map_err(|err| {
+        self.launch_in_vm(&entry, persistent, network).map_err(|err| {
             tracing::warn!(app = entry.name, %err, "VM launch requested over the protocol was refused");
             crate::vm_launch::Refusal::from(&err)
         })

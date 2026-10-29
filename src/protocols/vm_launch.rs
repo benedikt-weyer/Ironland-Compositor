@@ -28,10 +28,40 @@ use crate::{
     ClientState,
     ironland_protocols::vm_launch::{
         ironland_vm_launch_v1::{self, Error, FinishReason, IronlandVmLaunchV1},
-        ironland_vm_launcher_v1::{self, IronlandVmLauncherV1, Mode},
+        ironland_vm_launcher_v1::{self, IronlandVmLauncherV1, Mode, Network},
     },
-    shell::vm::{VmError, VmId},
+    shell::{
+        vm::{VmError, VmId},
+        vm_state::NetMode,
+    },
 };
+
+/// Starts the VM a `launch` or `launch_with_network` request asks for and
+/// tells `launch` how it went. The object has to exist whether or not the
+/// launch works: a refusal is reported on it.
+fn start<D: VmLaunchHandler>(
+    state: &mut D,
+    launch: IronlandVmLaunchV1,
+    entry: &str,
+    mode: WEnum<Mode>,
+    network: Option<NetMode>,
+) {
+    let persistent = match mode {
+        WEnum::Value(Mode::Persistent) => true,
+        WEnum::Value(Mode::Throwaway) => false,
+        WEnum::Unknown(_) => {
+            launch.failed(Error::Other, "unknown launch mode".to_string());
+            return;
+        }
+    };
+    match state.vm_launch_entry(entry, persistent, network) {
+        Ok(vm) => {
+            launch.starting(vm as u32);
+            state.vm_watch(vm, Watcher(launch));
+        }
+        Err(refusal) => launch.failed(refusal.error, refusal.message),
+    }
+}
 
 /// Implemented by the compositor state so this module can start VMs without
 /// depending on `AnvilState` (and its `Backend` type parameter) directly.
@@ -41,7 +71,15 @@ pub trait VmLaunchHandler: 'static {
     /// up, i.e. can be launched.
     fn vm_launch_programs(&self) -> Vec<String>;
     /// Starts the desktop entry `entry_id` in a VM.
-    fn vm_launch_entry(&mut self, entry_id: &str, persistent: bool) -> Result<VmId, Refusal>;
+    ///
+    /// `network` is the mode the VM is put in; `None` leaves it to the VM's
+    /// own default (online, or the mode a persistent VM was last left in).
+    fn vm_launch_entry(
+        &mut self,
+        entry_id: &str,
+        persistent: bool,
+        network: Option<NetMode>,
+    ) -> Result<VmId, Refusal>;
     /// Hands `watcher` to the running VM `vm`, to be told how it goes.
     fn vm_watch(&mut self, vm: VmId, watcher: Watcher);
 }
@@ -130,7 +168,7 @@ impl VmLaunchState {
     where
         D: GlobalDispatch<IronlandVmLauncherV1, GlobalData> + 'static,
     {
-        let global = dh.create_global::<D, IronlandVmLauncherV1, _>(2, GlobalData);
+        let global = dh.create_global::<D, IronlandVmLauncherV1, _>(3, GlobalData);
         VmLaunchState {
             global,
             managers: Vec::new(),
@@ -233,24 +271,26 @@ where
         match request {
             ironland_vm_launcher_v1::Request::Destroy => {}
             ironland_vm_launcher_v1::Request::Launch { id, entry, mode } => {
-                // The object must be created whether or not the launch works:
-                // a refusal is reported on it.
                 let launch = data_init.init(id, LaunchData);
-                let persistent = match mode {
-                    WEnum::Value(Mode::Persistent) => true,
-                    WEnum::Value(Mode::Throwaway) => false,
+                start(state, launch, &entry, mode, None);
+            }
+            ironland_vm_launcher_v1::Request::LaunchWithNetwork {
+                id,
+                entry,
+                mode,
+                network,
+            } => {
+                let launch = data_init.init(id, LaunchData);
+                let network = match network {
+                    WEnum::Value(Network::Online) => NetMode::Online,
+                    WEnum::Value(Network::Tor) => NetMode::Tor,
+                    WEnum::Value(Network::Offline) => NetMode::Offline,
                     WEnum::Unknown(_) => {
-                        launch.failed(Error::Other, "unknown launch mode".to_string());
+                        launch.failed(Error::Other, "unknown network mode".to_string());
                         return;
                     }
                 };
-                match state.vm_launch_entry(&entry, persistent) {
-                    Ok(vm) => {
-                        launch.starting(vm as u32);
-                        state.vm_watch(vm, Watcher(launch));
-                    }
-                    Err(refusal) => launch.failed(refusal.error, refusal.message),
-                }
+                start(state, launch, &entry, mode, Some(network));
             }
         }
     }
@@ -372,9 +412,12 @@ mod wire_tests {
     struct TestState {
         vm: VmLaunchState,
         programs: Vec<String>,
-        launches: Arc<Mutex<Vec<(String, bool)>>>,
+        launches: Launches,
         watchers: Vec<Watcher>,
     }
+
+    /// `(entry, persistent, network)` of every launch the server was asked for.
+    type Launches = Arc<Mutex<Vec<(String, bool, Option<NetMode>)>>>;
 
     impl VmLaunchHandler for TestState {
         fn vm_launch_state(&mut self) -> &mut VmLaunchState {
@@ -383,11 +426,16 @@ mod wire_tests {
         fn vm_launch_programs(&self) -> Vec<String> {
             self.programs.clone()
         }
-        fn vm_launch_entry(&mut self, entry_id: &str, persistent: bool) -> Result<VmId, Refusal> {
+        fn vm_launch_entry(
+            &mut self,
+            entry_id: &str,
+            persistent: bool,
+            network: Option<NetMode>,
+        ) -> Result<VmId, Refusal> {
             self.launches
                 .lock()
                 .unwrap()
-                .push((entry_id.to_string(), persistent));
+                .push((entry_id.to_string(), persistent, network));
             match entry_id {
                 "missing" => Err(Refusal::unknown_entry(entry_id)),
                 "busy" => Err(Refusal::from(&VmError::AlreadyRunning("Busy".into()))),
@@ -403,7 +451,7 @@ mod wire_tests {
 
     struct Server {
         commands: mpsc::Sender<Command>,
-        launches: Arc<Mutex<Vec<(String, bool)>>>,
+        launches: Launches,
         thread: Option<JoinHandle<()>>,
     }
 
@@ -547,7 +595,7 @@ mod wire_tests {
     impl Client {
         /// Connects over `stream` and binds the launcher global.
         fn bind(stream: UnixStream) -> Option<Client> {
-            Self::bind_versions(stream, 1..=2)
+            Self::bind_versions(stream, 1..=3)
         }
 
         /// Like [`Self::bind`], but binding a version in `versions` (the
@@ -587,6 +635,21 @@ mod wire_tests {
             self.launcher
                 .launch(entry.to_string(), mode, &self.queue.handle(), ())
         }
+
+        fn launch_with_network(
+            &self,
+            entry: &str,
+            mode: c_launcher::Mode,
+            network: c_launcher::Network,
+        ) -> c_launch::IronlandVmLaunchV1 {
+            self.launcher.launch_with_network(
+                entry.to_string(),
+                mode,
+                network,
+                &self.queue.handle(),
+                (),
+            )
+        }
     }
 
     fn pair() -> (UnixStream, UnixStream) {
@@ -613,7 +676,7 @@ mod wire_tests {
         assert_eq!(client.wait_for_log(5)[4], "starting 7");
         assert_eq!(
             *server.launches.lock().unwrap(),
-            [("org.mozilla.firefox".to_string(), true)]
+            [("org.mozilla.firefox".to_string(), true, None)]
         );
 
         server.send(Command::Running);
@@ -645,7 +708,46 @@ mod wire_tests {
         client.wait_for_log(5);
         assert_eq!(
             *server.launches.lock().unwrap(),
-            [("foot".to_string(), false)]
+            [("foot".to_string(), false, None)]
+        );
+    }
+
+    #[test]
+    fn the_network_mode_is_passed_through_by_name() {
+        let (client_end, server_end) = pair();
+        let server = Server::start(vec![(server_end, ClientState::default())]);
+        let mut client = Client::bind(client_end).unwrap();
+        assert_eq!(client.wait_for_log(4), HELLO);
+        let _a = client.launch_with_network("foot", c_launcher::Mode::Throwaway, c_launcher::Network::Tor);
+        let _b = client.launch_with_network(
+            "Alacritty",
+            c_launcher::Mode::Persistent,
+            c_launcher::Network::Offline,
+        );
+        let _c = client.launch_with_network("htop", c_launcher::Mode::Persistent, c_launcher::Network::Online);
+        let log = client.wait_for_log(7);
+        assert_eq!(log.iter().filter(|l| l.starts_with("starting")).count(), 3, "{log:?}");
+        assert_eq!(
+            *server.launches.lock().unwrap(),
+            [
+                ("foot".to_string(), false, Some(NetMode::Tor)),
+                ("Alacritty".to_string(), true, Some(NetMode::Offline)),
+                ("htop".to_string(), true, Some(NetMode::Online)),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_version_2_client_still_launches_without_a_network_mode() {
+        let (client_end, server_end) = pair();
+        let server = Server::start(vec![(server_end, ClientState::default())]);
+        let mut client = Client::bind_versions(client_end, 1..=2).unwrap();
+        assert_eq!(client.wait_for_log(4), HELLO);
+        let _launch = client.launch("foot", c_launcher::Mode::Persistent);
+        client.wait_for_log(5);
+        assert_eq!(
+            *server.launches.lock().unwrap(),
+            [("foot".to_string(), true, None)]
         );
     }
 
