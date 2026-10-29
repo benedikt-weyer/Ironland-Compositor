@@ -593,7 +593,7 @@ impl WorkspaceTransitionSlot {
 /// both sets in from there. Returns whether it did - on `false` (animation
 /// disabled, nothing to animate, or a fullscreen window is involved), the
 /// caller falls back to the instant [`hide_workspace`]/[`show_workspace`]
-/// pair.
+/// pair. Same when `new_idx` holds a window remembered as fullscreen.
 fn start_transition<B: Backend>(
     state: &mut AnvilState<B>,
     output: &Output,
@@ -616,6 +616,18 @@ fn start_transition<B: Backend>(
         .get::<FullscreenSurface>()
         .and_then(|f| f.get())
         .is_some()
+    {
+        return false;
+    }
+
+    // The same goes for a switch *to* a workspace whose window was
+    // fullscreen when it was hidden: only `show_workspace` re-fullscreens it
+    // (`restore_fullscreen`), and the animated path never calls that.
+    if tiling::TilingState::tree(output, new_idx)
+        .windows()
+        .into_iter()
+        .chain(WorkspaceState::get(output).floating_at(new_idx))
+        .any(|w| w.alive() && *WindowHome::get(&w).fullscreen.borrow())
     {
         return false;
     }
