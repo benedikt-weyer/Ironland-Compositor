@@ -16,6 +16,7 @@ use std::{cell::RefCell, os::unix::io::OwnedFd};
 use smithay::{
     desktop::{Window, space::SpaceElement},
     input::pointer::Focus,
+    output::Output,
     utils::{Logical, Rectangle, SERIAL_COUNTER},
     wayland::{
         compositor::with_states,
@@ -74,18 +75,44 @@ impl<BackendData: Backend> XwmHandler for AnvilState<BackendData> {
 
     fn map_window_request(&mut self, _xwm: XwmId, window: X11Surface) {
         window.set_mapped(true).unwrap();
+        // Games (Wine in particular) set `_NET_WM_STATE_FULLSCREEN` before
+        // mapping; smithay reads that property on the map request, so it
+        // shows up here instead of as a `fullscreen_request`.
+        let wants_fullscreen = window.is_fullscreen();
         let should_tile = tiling::should_tile_x11(&window);
         let window = WindowElement(Window::new_x11_window(window));
-        if should_tile {
+        let output = if should_tile {
+            let output = self
+                .space
+                .output_under(self.pointer.current_location())
+                .next()
+                .or_else(|| self.space.outputs().next())
+                .cloned();
+            // A fullscreen window stays in the tiling tree (so it returns to
+            // its tile when unfullscreened) but must be the output's
+            // fullscreen surface *before* the tree is laid out:
+            // `tiling::apply_layout` leaves that window's size alone instead
+            // of configuring it to its tile and then again to fullscreen.
+            if wants_fullscreen && let Some(output) = &output {
+                output.user_data().insert_if_missing(FullscreenSurface::default);
+                output
+                    .user_data()
+                    .get::<FullscreenSurface>()
+                    .unwrap()
+                    .set(window.clone());
+            }
             tiling::tile_new_window(self, &window, self.pointer.current_location());
-        } else if let Some(output) = place_new_window(&mut self.space, self.pointer.current_location(), &window, true) {
-            workspace::assign_new_window(&window, &output, true);
-        }
-        let bbox = self.space.element_bbox(&window).unwrap();
+            output
+        } else {
+            let output = place_new_window(&mut self.space, self.pointer.current_location(), &window, true);
+            if let Some(output) = &output {
+                workspace::assign_new_window(&window, output, true);
+            }
+            output
+        };
         let Some(xsurface) = window.0.x11_surface() else {
             unreachable!()
         };
-        xsurface.configure(Some(bbox)).unwrap();
         // `top_bar` is the user's global switch for the compositor-drawn
         // window header bar - same gating as the xdg-decoration path in
         // `state.rs`'s `XdgDecorationHandler::request_mode`. X11 windows
@@ -94,6 +121,13 @@ impl<BackendData: Backend> XwmHandler for AnvilState<BackendData> {
         // to decide whether it *wants* SSD, not whether it's allowed to
         // have it.
         window.set_ssd(self.config.top_bar && !xsurface.is_decorated());
+        match output {
+            Some(output) if wants_fullscreen => self.fullscreen_x11(&window, &output),
+            _ => {
+                let bbox = self.space.element_bbox(&window).unwrap();
+                xsurface.configure(Some(bbox)).unwrap();
+            }
+        }
         crate::foreign_toplevel::sync(self);
     }
 
@@ -110,7 +144,20 @@ impl<BackendData: Backend> XwmHandler for AnvilState<BackendData> {
             .find(|e| matches!(e.0.x11_surface(), Some(w) if w == &window))
             .cloned();
         if let Some(elem) = maybe {
-            self.space.unmap_elem(&elem)
+            self.space.unmap_elem(&elem);
+            // An unmapped window must not stay the output's fullscreen
+            // surface, or its last frame keeps being drawn over everything.
+            // (`is_fullscreen` stays set, so a remap fullscreens it again.)
+            let output = self.space.outputs().find(|o| {
+                o.user_data()
+                    .get::<FullscreenSurface>()
+                    .and_then(|f| f.get())
+                    .is_some_and(|f| f == elem)
+            });
+            if let Some(output) = output.cloned() {
+                output.user_data().get::<FullscreenSurface>().unwrap().clear();
+                self.backend_data.reset_buffers(&output);
+            }
         }
         if !window.is_override_redirect() {
             window.set_mapped(false).unwrap();
@@ -126,14 +173,52 @@ impl<BackendData: Backend> XwmHandler for AnvilState<BackendData> {
         &mut self,
         _xwm: XwmId,
         window: X11Surface,
-        _x: Option<i32>,
-        _y: Option<i32>,
+        x: Option<i32>,
+        y: Option<i32>,
         w: Option<u32>,
         h: Option<u32>,
         _reorder: Option<Reorder>,
     ) {
-        // we just set the new size, but don't let windows move themselves around freely
+        // `all_windows` rather than `space.elements()`: a window on another
+        // workspace is unmapped from the space but still isn't free to move.
+        let elem = workspace::all_windows(self)
+            .into_iter()
+            .find(|e| matches!(e.0.x11_surface(), Some(s) if s == &window));
+
+        // The compositor owns the geometry of fullscreen and tiled windows.
+        // Answer with that geometry anyway (rather than staying silent): the
+        // client waits for a ConfigureNotify, and e.g. Wine/DXVK validates
+        // the result of a `Reset` against what it asked for.
+        if let Some(elem) = &elem {
+            if window.is_fullscreen() {
+                let geometry = self
+                    .space
+                    .outputs()
+                    .find(|o| {
+                        o.user_data()
+                            .get::<FullscreenSurface>()
+                            .and_then(|f| f.get())
+                            .is_some_and(|f| &f == elem)
+                    })
+                    .and_then(|o| self.space.output_geometry(o))
+                    .unwrap_or_else(|| window.last_configure());
+                let _ = window.configure(geometry);
+                return;
+            }
+            if tiling::locate(self, elem).is_some() {
+                let _ = window.configure(window.last_configure());
+                return;
+            }
+        }
+
+        // Floating and not-yet-mapped windows place and size themselves.
         let mut geo = window.last_configure();
+        if let Some(x) = x {
+            geo.loc.x = x;
+        }
+        if let Some(y) = y {
+            geo.loc.y = y;
+        }
         if let Some(w) = w {
             geo.size.w = w as i32;
         }
@@ -189,37 +274,28 @@ impl<BackendData: Backend> XwmHandler for AnvilState<BackendData> {
     }
 
     fn fullscreen_request(&mut self, _xwm: XwmId, window: X11Surface) {
-        let fullscreened = if let Some(elem) = self
+        let Some(elem) = self
             .space
             .elements()
             .find(|e| matches!(e.0.x11_surface(), Some(w) if w == &window))
-        {
-            let outputs_for_window = self.space.outputs_for_element(elem);
-            let output = outputs_for_window
-                .first()
-                // The window hasn't been mapped yet, use the primary output instead
-                .or_else(|| self.space.outputs().next())
-                // Assumes that at least one output exists
-                .expect("No outputs found");
-            let geometry = self.space.output_geometry(output).unwrap();
-
-            window.set_fullscreen(true).unwrap();
-            elem.set_ssd(false);
-            window.configure(geometry).unwrap();
-            output.user_data().insert_if_missing(FullscreenSurface::default);
-            output
-                .user_data()
-                .get::<FullscreenSurface>()
-                .unwrap()
-                .set(elem.clone());
-            trace!("Fullscreening: {:?}", elem);
-            true
-        } else {
-            false
+            .cloned()
+        else {
+            // Not mapped yet (or unmapped again): there is no output to
+            // fullscreen on, but record the state - `map_window_request`
+            // fullscreens the window when it maps with it set.
+            let _ = window.set_fullscreen(true);
+            return;
         };
-        if fullscreened {
-            crate::foreign_toplevel::sync(self);
-        }
+        let output = self
+            .space
+            .outputs_for_element(&elem)
+            .first()
+            .cloned()
+            .or_else(|| self.space.outputs().next().cloned())
+            // Assumes that at least one output exists
+            .expect("No outputs found");
+        self.fullscreen_x11(&elem, &output);
+        crate::foreign_toplevel::sync(self);
     }
 
     fn unfullscreen_request(&mut self, _xwm: XwmId, window: X11Surface) {
@@ -246,6 +322,8 @@ impl<BackendData: Backend> XwmHandler for AnvilState<BackendData> {
                 false
             }
         } else {
+            // Not mapped: just drop the recorded state (see `fullscreen_request`).
+            let _ = window.set_fullscreen(false);
             false
         };
         if unfullscreened {
@@ -379,6 +457,24 @@ impl<BackendData: Backend> XwmHandler for AnvilState<BackendData> {
 }
 
 impl<BackendData: Backend> AnvilState<BackendData> {
+    /// Makes `elem` (an X11 window) `output`'s fullscreen surface and
+    /// configures it to cover the output.
+    fn fullscreen_x11(&mut self, elem: &WindowElement, output: &Output) {
+        let (Some(xsurface), Some(geometry)) = (elem.0.x11_surface(), self.space.output_geometry(output)) else {
+            return;
+        };
+        let _ = xsurface.set_fullscreen(true);
+        elem.set_ssd(false);
+        let _ = xsurface.configure(geometry);
+        output.user_data().insert_if_missing(FullscreenSurface::default);
+        output
+            .user_data()
+            .get::<FullscreenSurface>()
+            .unwrap()
+            .set(elem.clone());
+        trace!("Fullscreening: {:?}", elem);
+    }
+
     pub fn maximize_request_x11(&mut self, window: &X11Surface) {
         let Some(elem) = self
             .space
