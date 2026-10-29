@@ -366,6 +366,7 @@ impl AnvilState<UdevData> {
             &mut self.cursor_status,
             self.show_window_preview,
             &mut self.launcher,
+            &mut self.vm_overview,
             &mut self.lock,
             &mut self.permission_prompt,
             overview_buffer,
@@ -530,6 +531,7 @@ pub(super) fn render_surface<'a>(
     cursor_status: &mut CursorImageStatus,
     show_window_preview: bool,
     launcher: &mut LauncherState,
+    vm_overview: &mut crate::vm_overview::VmOverviewState,
     lock: &mut crate::lock::LockState,
     permission_prompt: &mut crate::permission_prompt::PermissionPromptManagerState,
     overview_buffer: Option<MemoryRenderBuffer>,
@@ -768,6 +770,27 @@ pub(super) fn render_surface<'a>(
             renderer,
             location,
             launcher_buffer,
+            None,
+            None,
+            None,
+            Kind::Unspecified,
+        ) {
+            custom_elements.push(CustomRenderElements::Overlay(element));
+        }
+    }
+
+    let vm_overview_size = vm_overview.logical_size();
+    if let Some(vm_overview_buffer) = vm_overview.ensure_buffer() {
+        let location = Point::<i32, Logical>::from((
+            (output_geometry.size.w - vm_overview_size.w) / 2,
+            ((output_geometry.size.h - vm_overview_size.h) / 2).max(0),
+        ))
+        .to_f64()
+        .to_physical(scale);
+        if let Ok(element) = MemoryRenderBufferRenderElement::from_buffer(
+            renderer,
+            location,
+            vm_overview_buffer,
             None,
             None,
             None,

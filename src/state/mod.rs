@@ -279,6 +279,7 @@ pub struct AnvilState<BackendData: Backend + 'static> {
 
     pub show_window_preview: bool,
     pub launcher: crate::drawing::LauncherState,
+    pub vm_overview: crate::vm_overview::VmOverviewState,
     /// Screen lock (see `crate::lock`).
     pub lock: crate::lock::LockState,
     /// QEMU VMs hosting programs started "as virtual" (see `crate::shell::vm`).
@@ -523,6 +524,12 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
                     match event {
                         crate::shell::vm::VmEvent::GuestReady(id) => data.vm_guest_ready(id),
                         crate::shell::vm::VmEvent::SaveFailed(id, why) => data.vm_save_failed(id, why),
+                        crate::shell::vm::VmEvent::InternetSet {
+                            id,
+                            qemu_pid,
+                            online,
+                            result,
+                        } => data.vm_internet_set(id, qemu_pid, online, result),
                     }
                 }
             })
@@ -689,6 +696,7 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             renderdoc: renderdoc::RenderDoc::new().ok(),
             show_window_preview: false,
             launcher: crate::drawing::LauncherState::default(),
+            vm_overview: crate::vm_overview::VmOverviewState::default(),
             lock: crate::lock::LockState::new(lock_result_tx),
             vm,
             overview: Default::default(),
@@ -731,6 +739,7 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
         }
         info!("Locking screen");
         self.launcher.close();
+        self.vm_overview.close();
         self.close_overview();
         self.lock.lock();
 

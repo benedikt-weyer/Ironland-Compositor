@@ -97,6 +97,12 @@ impl<BackendData: Backend> AnvilState<BackendData> {
 
             KeyAction::ToggleOverview => self.toggle_overview(),
 
+            KeyAction::ToggleVmOverview => self.toggle_vm_overview(),
+
+            KeyAction::VmOverviewMove(delta) => self.vm_overview.move_selection(delta),
+
+            KeyAction::VmOverviewToggleInternet => self.vm_overview_toggle_internet(),
+
             KeyAction::LauncherType(c) => {
                 self.launcher.push_char(c);
             }
@@ -469,6 +475,26 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                                     KeyAction::ToggleOverview
                                 }
                                 _ => KeyAction::None,
+                            });
+                        }
+                        suppressed_keys.retain(|k| *k != keysym);
+                        return FilterResult::Intercept(KeyAction::None);
+                    }
+
+                    // The VM overview grabs the keyboard the same way. The
+                    // shortcut that opened it still closes it (it may be
+                    // rebound, so it is looked up rather than hard-coded).
+                    if data.vm_overview.is_visible() {
+                        if let KeyState::Pressed = state {
+                            suppressed_keys.push(keysym);
+                            let toggled = matches!(
+                                process_keyboard_shortcut(&data.keybindings, &[], *modifiers, keysym),
+                                Some(KeyAction::ToggleVmOverview)
+                            );
+                            return FilterResult::Intercept(if toggled {
+                                KeyAction::ToggleVmOverview
+                            } else {
+                                vm_overview_key_action(keysym)
                             });
                         }
                         suppressed_keys.retain(|k| *k != keysym);

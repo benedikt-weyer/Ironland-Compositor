@@ -340,6 +340,17 @@ pub fn run_winit() {
                 .to_physical(scale)
             });
 
+            let vm_overview_buffer = state.vm_overview.ensure_buffer().cloned();
+            let vm_overview_location = vm_overview_buffer.as_ref().map(|_| {
+                let vm_overview_size = state.vm_overview.logical_size();
+                Point::<i32, Logical>::from((
+                    (output_size.w - vm_overview_size.w) / 2,
+                    ((output_size.h - vm_overview_size.h) / 2).max(0),
+                ))
+                .to_f64()
+                .to_physical(scale)
+            });
+
             let locked = state.lock.is_locked();
             let lock_buffer = state.lock.ensure_buffer().cloned();
             let lock_location = lock_buffer.as_ref().map(|_| {
@@ -630,6 +641,20 @@ pub fn run_winit() {
                         renderer,
                         location,
                         launcher_buffer,
+                        None,
+                        None,
+                        None,
+                        Kind::Unspecified,
+                    ) {
+                        elements.push(CustomRenderElements::Overlay(element));
+                    }
+
+                if let (Some(vm_overview_buffer), Some(location)) =
+                    (&vm_overview_buffer, vm_overview_location)
+                    && let Ok(element) = MemoryRenderBufferRenderElement::from_buffer(
+                        renderer,
+                        location,
+                        vm_overview_buffer,
                         None,
                         None,
                         None,

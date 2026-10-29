@@ -118,6 +118,9 @@ impl<BackendData: Backend> AnvilState<BackendData> {
                     | KeyAction::ToggleLauncher
                     | KeyAction::LockScreen
                     | KeyAction::ToggleOverview
+                    | KeyAction::ToggleVmOverview
+                    | KeyAction::VmOverviewMove(_)
+                    | KeyAction::VmOverviewToggleInternet
                     | KeyAction::LauncherType(_)
                     | KeyAction::LauncherBackspace
                     | KeyAction::LauncherUp

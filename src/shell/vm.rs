@@ -77,6 +77,9 @@ use crate::{
     launcher::{self, DesktopEntry},
     state::{AnvilState, Backend, insert_client_with_identity},
     vm_launch::{Finish, Watcher},
+    vm_overview::{
+        self, HostRoute, Link, PersistedEntry, Phase, ProgramEntry, RunningVm, VmOverviewData,
+    },
 };
 
 /// Identifies one running VM for as long as it exists. Never reused within a
@@ -85,6 +88,8 @@ pub type VmId = u64;
 
 /// How often finished/stuck VMs are looked for.
 const REAP_INTERVAL: Duration = Duration::from_secs(1);
+/// How often the open VM overview is refreshed.
+const OVERVIEW_INTERVAL: Duration = Duration::from_secs(1);
 /// How often the probe thread knocks on the guest's SSH port.
 const PROBE_INTERVAL: Duration = Duration::from_millis(500);
 /// Log lines of a failed VM's output included in the compositor log.
@@ -97,6 +102,16 @@ pub enum VmEvent {
     GuestReady(VmId),
     /// Saving a persistent VM's state failed; the VM should be dropped.
     SaveFailed(VmId, String),
+    /// A helper thread finished switching a VM's internet link (see
+    /// [`AnvilState::set_vm_internet`]). `qemu_pid` names the QEMU it talked
+    /// to, so a result from one that has since been replaced (a failed
+    /// restore falls back to a cold boot) can be told from the current one.
+    InternetSet {
+        id: VmId,
+        qemu_pid: u32,
+        online: bool,
+        result: Result<(), String>,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -159,6 +174,9 @@ enum EndReason {
     /// QEMU exited right after starting from a saved state: the state could
     /// not be loaded. Not an end: the guest is cold-booted instead.
     RestoreFailed(ExitStatus),
+    /// A VM that has to start without internet could not have its link taken
+    /// down, so it was never let run.
+    NetworkFailed(String),
 }
 
 impl std::fmt::Display for EndReason {
@@ -172,6 +190,9 @@ impl std::fmt::Display for EndReason {
             EndReason::SaveFailed(why) => write!(f, "saving the state failed: {why}"),
             EndReason::SaveTimedOut => write!(f, "saving the state took too long"),
             EndReason::RestoreFailed(status) => write!(f, "restoring the state failed ({status})"),
+            EndReason::NetworkFailed(why) => {
+                write!(f, "could not cut the internet link before starting: {why}")
+            }
         }
     }
 }
@@ -186,7 +207,8 @@ impl EndReason {
             EndReason::QemuExited(_)
             | EndReason::WaypipeFailed(_)
             | EndReason::SaveFailed(_)
-            | EndReason::RestoreFailed(_) => Finish::Failed,
+            | EndReason::RestoreFailed(_)
+            | EndReason::NetworkFailed(_) => Finish::Failed,
         }
     }
 
@@ -243,6 +265,32 @@ struct VmInstance {
     persist: Option<PersistState>,
     /// Protocol clients following this VM (see `crate::vm_launch`).
     watchers: Vec<Watcher>,
+    started: Instant,
+    /// Monitor socket every VM has (a persistent one saves its state through
+    /// it, any one switches its internet link through it).
+    qmp: PathBuf,
+    internet: Internet,
+    usage: Usage,
+}
+
+/// Whether a VM can reach the internet: the state of its internet NIC's link
+/// (see [`qemu_args`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Internet {
+    online: bool,
+    /// A switch to this state is under way on a helper thread.
+    pending: Option<bool>,
+    /// Started with the CPUs stopped (`-S`) until the link is down; the guest
+    /// has not run yet.
+    held: bool,
+}
+
+/// CPU use of the VM's QEMU process, from two samples of its CPU time.
+#[derive(Debug, Default)]
+struct Usage {
+    previous: Option<(Instant, u64)>,
+    /// Percent of one core (200 = two cores busy).
+    cpu_percent: f32,
 }
 
 /// All running VMs, plus the plumbing they share.
@@ -358,6 +406,52 @@ impl VmManager {
     }
 }
 
+impl VmManager {
+    /// The running VMs as the VM overview shows them, oldest first, with
+    /// their resource use sampled now.
+    fn running(&mut self, now: Instant, memory_mb: u32) -> Vec<RunningVm> {
+        let mut running: Vec<RunningVm> = self
+            .instances
+            .iter_mut()
+            .map(|(&id, vm)| {
+                vm.sample_cpu(now);
+                RunningVm {
+                    id,
+                    name: vm.name.clone(),
+                    persistent: vm.persist.is_some(),
+                    phase: if vm.persist.as_ref().is_some_and(|p| p.saving_until.is_some()) {
+                        Phase::Saving
+                    } else if vm.client_connected {
+                        Phase::Running
+                    } else {
+                        Phase::Booting
+                    },
+                    uptime: now.saturating_duration_since(vm.started),
+                    cpu_percent: vm.usage.cpu_percent,
+                    rss_bytes: process_rss_bytes(vm.qemu.id()),
+                    memory_mb,
+                    link: match vm.internet.pending {
+                        Some(online) => Link::Switching { online },
+                        None if vm.internet.online => Link::Online,
+                        None => Link::Offline,
+                    },
+                    ssh_port: vm.ssh_port,
+                }
+            })
+            .collect();
+        running.sort_by_key(|vm| vm.id);
+        running
+    }
+
+    /// Persistent keys with a VM running.
+    fn running_persist_keys(&self) -> Vec<&str> {
+        self.instances
+            .values()
+            .filter_map(|vm| vm.persist.as_ref().map(|p| p.key.as_str()))
+            .collect()
+    }
+}
+
 impl Drop for VmManager {
     fn drop(&mut self) {
         for (_, vm) in self.instances.drain() {
@@ -366,7 +460,55 @@ impl Drop for VmManager {
     }
 }
 
+/// CPU time (user + system, in clock ticks) from the text of `/proc/<pid>/stat`.
+/// The command name in it may hold spaces and parentheses, so the fields are
+/// counted from the last `)`.
+fn parse_cpu_ticks(stat: &str) -> Option<u64> {
+    let after_name = &stat[stat.rfind(')')? + 1..];
+    let mut fields = after_name.split_whitespace();
+    // `state` is the first field after the name; `utime` and `stime` are the
+    // 12th and 13th.
+    let utime: u64 = fields.nth(11)?.parse().ok()?;
+    let stime: u64 = fields.next()?.parse().ok()?;
+    Some(utime + stime)
+}
+
+/// Resident set size in pages, from the text of `/proc/<pid>/statm`.
+fn parse_rss_pages(statm: &str) -> Option<u64> {
+    statm.split_whitespace().nth(1)?.parse().ok()
+}
+
+fn process_cpu_ticks(pid: u32) -> Option<u64> {
+    parse_cpu_ticks(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
+}
+
+fn process_rss_bytes(pid: u32) -> u64 {
+    std::fs::read_to_string(format!("/proc/{pid}/statm"))
+        .ok()
+        .and_then(|statm| parse_rss_pages(&statm))
+        .map_or(0, |pages| pages * rustix::param::page_size() as u64)
+}
+
 impl VmInstance {
+    /// Updates [`Usage::cpu_percent`] from the CPU time QEMU used since the
+    /// previous sample.
+    fn sample_cpu(&mut self, now: Instant) {
+        let Some(ticks) = process_cpu_ticks(self.qemu.id()) else {
+            return;
+        };
+        if let Some((at, before)) = self.usage.previous {
+            let secs = now.saturating_duration_since(at).as_secs_f32();
+            if secs > 0.2 {
+                let used = ticks.saturating_sub(before) as f32
+                    / rustix::param::clock_ticks_per_second() as f32;
+                self.usage.cpu_percent = used / secs * 100.0;
+                self.usage.previous = Some((now, ticks));
+            }
+        } else {
+            self.usage.previous = Some((now, ticks));
+        }
+    }
+
     /// Stops everything belonging to this VM. Safe to call on one whose
     /// processes already exited.
     fn kill(mut self) {
@@ -533,11 +675,16 @@ pub fn authorized_keys_args(keys: &[String]) -> Vec<String> {
 /// What a VM boots from.
 pub enum DiskMode<'a> {
     /// A throw-away snapshot of the base image.
-    Snapshot { image: &'a Path },
+    Snapshot {
+        image: &'a Path,
+        /// Monitor socket QEMU listens on, for switching the internet link.
+        qmp: &'a Path,
+    },
     /// A persistent per-application overlay (see [`vm_state`]).
     Persistent {
         overlay: &'a Path,
-        /// Monitor socket QEMU listens on, for saving the state.
+        /// Monitor socket QEMU listens on, for saving the state and
+        /// switching the internet link.
         qmp: &'a Path,
         /// Guest-agent socket QEMU listens on, for setting the clock.
         qga: &'a Path,
@@ -545,6 +692,14 @@ pub enum DiskMode<'a> {
         load_state: bool,
     },
 }
+
+/// Subnet of the guest's ssh-only NIC (see [`qemu_args`]); the internet NIC
+/// keeps QEMU's default 10.0.2.0/24.
+const MGMT_NET: &str = "10.0.3.0/24";
+/// The guest's address on the internet NIC and the gateway (QEMU's NAT, which
+/// reaches the internet through the host) it talks to.
+pub const GUEST_INTERNET_ADDR: &str = "10.0.2.15";
+pub const GUEST_INTERNET_GATEWAY: &str = "10.0.2.2";
 
 /// Arguments for `qemu-system-x86_64`: a headless guest with guest port 22
 /// reachable on `127.0.0.1:ssh_port` and its serial console written to
@@ -576,23 +731,19 @@ pub fn qemu_args(
         // `snapshot=on` keeps every guest write in a temporary overlay that
         // is thrown away on exit: the image stays pristine and any number of
         // VMs can boot from it at once.
-        DiskMode::Snapshot { image } => push(&[
+        DiskMode::Snapshot { image, .. } => push(&[
             "-drive",
             &format!("file={},if=virtio,snapshot=on", image.display()),
         ]),
         DiskMode::Persistent {
             overlay,
-            qmp,
             qga,
             load_state,
+            ..
         } => {
             push(&[
                 "-drive",
                 &format!("file={},if=virtio,format=qcow2", overlay.display()),
-            ]);
-            push(&[
-                "-qmp",
-                &format!("unix:{},server=on,wait=off", qmp.display()),
             ]);
             push(&[
                 "-chardev",
@@ -607,9 +758,35 @@ pub fn qemu_args(
             }
         }
     }
+    let (DiskMode::Snapshot { qmp, .. } | DiskMode::Persistent { qmp, .. }) = &disk;
     push(&[
-        "-nic",
-        &format!("user,model=virtio-net-pci,hostfwd=tcp:127.0.0.1:{ssh_port}-:22"),
+        "-qmp",
+        &format!("unix:{},server=on,wait=off", qmp.display()),
+    ]);
+    // Two NICs, so the internet can be cut without cutting the compositor off
+    // from the guest: taking a NIC's link down (QMP `set_link`) stops all
+    // traffic through it, including the ssh session `waypipe` runs over.
+    //
+    // * `inet` (first, so the guest prefers it for its default route): NAT
+    //   onto the host's network. This is the one the VM overview switches.
+    // * `mgmt`: `restrict=on` lets the guest reach nothing outside; only the
+    //   forwarded ssh port works. A separate subnet keeps the two apart.
+    push(&[
+        "-netdev",
+        &format!("user,id={}", vm_state::INTERNET_NETDEV),
+        "-device",
+        &format!(
+            "virtio-net-pci,netdev={},id=nic_inet",
+            vm_state::INTERNET_NETDEV
+        ),
+    ]);
+    push(&[
+        "-netdev",
+        &format!(
+            "user,id=mgmt,net={MGMT_NET},restrict=on,hostfwd=tcp:127.0.0.1:{ssh_port}-:22"
+        ),
+        "-device",
+        "virtio-net-pci,netdev=mgmt,id=nic_mgmt",
     ]);
     push(&["-device", "virtio-rng-pci"]);
     push(&["-display", "none"]);
@@ -787,6 +964,41 @@ fn spawn_probe(
     }
 }
 
+/// Switches the internet link of the QEMU `qemu_pid` listening on `qmp` on a
+/// helper thread (the monitor can take a moment to answer) and reports the
+/// outcome as [`VmEvent::InternetSet`]. With `resume`, also lets a QEMU that
+/// was started paused (`-S`) run.
+fn spawn_set_internet(
+    id: VmId,
+    qemu_pid: u32,
+    qmp: &Path,
+    online: bool,
+    resume: bool,
+    events: Sender<VmEvent>,
+) {
+    let qmp = qmp.to_path_buf();
+    let reply = events.clone();
+    let spawned = std::thread::Builder::new()
+        .name(format!("vm-net-{id}"))
+        .spawn(move || {
+            let result = vm_state::set_internet_over_socket(&qmp, online, resume);
+            let _ = reply.send(VmEvent::InternetSet {
+                id,
+                qemu_pid,
+                online,
+                result,
+            });
+        });
+    if let Err(err) = spawned {
+        let _ = events.send(VmEvent::InternetSet {
+            id,
+            qemu_pid,
+            online,
+            result: Err(err.to_string()),
+        });
+    }
+}
+
 /// The last few lines of `path`, for putting a failed VM's output in the log.
 fn log_tail(path: &Path) -> String {
     let Ok(text) = std::fs::read_to_string(path) else {
@@ -920,13 +1132,24 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             None => qemu_args(
                 &settings,
                 id,
-                DiskMode::Snapshot { image: &image },
+                DiskMode::Snapshot {
+                    image: &image,
+                    qmp: &qmp,
+                },
                 ssh_port,
                 &serial_log,
             ),
         };
         let load_state = prepared.as_ref().is_some_and(|p| p.load_state);
-        let (args, cold_args) = (args_for(load_state), args_for(false));
+        let (mut args, mut cold_args) = (args_for(load_state), args_for(false));
+        // A VM whose internet was switched off starts with its CPUs stopped,
+        // so the link can be taken down before the guest runs a single
+        // instruction (see `start_offline`).
+        let online = prepared.as_ref().is_none_or(|p| p.meta.network_enabled);
+        if !online {
+            args.push("-S".into());
+            cold_args.push("-S".into());
+        }
         let qemu = match spawn_qemu(&args, &dir) {
             Ok(child) => child,
             Err(err) => {
@@ -955,13 +1178,17 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             ?image,
             persistent,
             restoring = load_state,
+            online,
             "Started VM"
         );
+        if !online {
+            spawn_set_internet(id, qemu.id(), &qmp, false, true, self.vm.events.clone());
+        }
         let persist = prepared.map(|p| PersistState {
             key,
             meta_path: p.meta_path,
             meta: p.meta,
-            qmp,
+            qmp: qmp.clone(),
             saving_until: None,
             cold_args,
             loaded_state: load_state,
@@ -983,6 +1210,14 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
                 ready_seen: false,
                 persist,
                 watchers: Vec::new(),
+                started: Instant::now(),
+                qmp,
+                internet: Internet {
+                    online,
+                    pending: (!online).then_some(false),
+                    held: !online,
+                },
+                usage: Usage::default(),
             },
         );
         self.ensure_vm_reaper();
@@ -1003,6 +1238,133 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
                 self.launcher.set_status(err.short());
             }
         }
+    }
+
+    /// Opens the VM overview (see [`crate::vm_overview`]), refreshed every
+    /// second for as long as it is open.
+    pub fn open_vm_overview(&mut self) {
+        self.launcher.close();
+        let names = self
+            .config
+            .vm
+            .all_programs()
+            .into_keys()
+            .map(|id| {
+                let name = launcher::find_entry(&id).map_or_else(|| id.clone(), |e| e.name);
+                (id, name)
+            })
+            .collect();
+        self.vm_overview.open(names);
+        self.refresh_vm_overview();
+        if std::mem::replace(&mut self.vm_overview.timer_running, true) {
+            return;
+        }
+        let inserted = self
+            .handle
+            .insert_source(Timer::from_duration(OVERVIEW_INTERVAL), |_, _, data| {
+                if data.vm_overview.is_visible() {
+                    data.refresh_vm_overview();
+                    TimeoutAction::ToDuration(OVERVIEW_INTERVAL)
+                } else {
+                    data.vm_overview.timer_running = false;
+                    TimeoutAction::Drop
+                }
+            });
+        if let Err(err) = inserted {
+            self.vm_overview.timer_running = false;
+            error!(%err, "Failed to start the VM overview refresh timer");
+        }
+    }
+
+    pub fn toggle_vm_overview(&mut self) {
+        if self.vm_overview.is_visible() {
+            self.vm_overview.close();
+        } else {
+            self.open_vm_overview();
+        }
+    }
+
+    /// Gathers what the VM overview shows: running VMs with their resource
+    /// use, the state persistent VMs keep on disk, and the programs that can
+    /// be started in a VM.
+    pub fn refresh_vm_overview(&mut self) {
+        if !self.vm_overview.is_visible() {
+            return;
+        }
+        let settings = &self.config.vm;
+        let running = self.vm.running(Instant::now(), settings.memory_mb);
+        let programs = settings.all_programs();
+        let names = self.vm_overview.names();
+        let name_of = |id: &str| names.get(id).cloned().unwrap_or_else(|| id.to_string());
+
+        // The state directory of a program is named after its desktop entry
+        // id, with or without the `.desktop` suffix it came with.
+        let app_of_key = |key: &str| {
+            let key = key.split(".stale-").next().unwrap_or(key);
+            programs
+                .keys()
+                .find(|id| {
+                    vm_state::persist_key(id) == key
+                        || vm_state::persist_key(&format!("{id}.desktop")) == key
+                })
+                .map_or_else(|| key.to_string(), |id| name_of(id))
+        };
+        let live_keys = self.vm.running_persist_keys();
+        let persisted = vm_state::list_persisted(settings)
+            .into_iter()
+            .map(|p| PersistedEntry {
+                app: app_of_key(&p.key),
+                disk_bytes: p.disk_bytes,
+                has_state: p.meta.as_ref().is_some_and(|m| m.has_state),
+                internet: p.meta.as_ref().map(|m| m.network_enabled),
+                stale: p.is_stale(),
+                running: live_keys.contains(&p.key.as_str()),
+            })
+            .collect();
+        let programs = programs
+            .iter()
+            .map(|(id, image)| ProgramEntry {
+                name: name_of(id),
+                image_bytes: std::fs::metadata(expand_tilde(image)).map_or(0, |m| m.len()),
+                running: running.iter().filter(|vm| vm.name == name_of(id)).count(),
+            })
+            .collect();
+        let route = std::fs::read_to_string("/proc/net/route")
+            .map(|text| vm_overview::parse_default_route(&text))
+            .unwrap_or_else(|_| HostRoute::default());
+
+        let data = VmOverviewData {
+            running,
+            persisted,
+            programs,
+            route,
+            max_instances: settings.max_instances,
+        };
+        self.vm_overview.set_data(data);
+    }
+
+    /// VM overview action: switches the selected VM's internet on or off.
+    pub fn vm_overview_toggle_internet(&mut self) {
+        let Some(vm) = self.vm_overview.selected() else {
+            return;
+        };
+        let (id, name) = (vm.id, vm.name.clone());
+        let online = match vm.link {
+            Link::Online => false,
+            Link::Offline => true,
+            Link::Switching { .. } => {
+                self.vm_overview.set_status("The network is still switching");
+                return;
+            }
+        };
+        match self.set_vm_internet(id, online) {
+            Ok(()) => self.vm_overview.clear_status(),
+            Err(why) => {
+                warn!(id, app = name, %why, "Could not switch the VM's internet");
+                self.vm_overview.set_status(why);
+            }
+        }
+        self.refresh_vm_overview();
     }
 
     /// Starts `waypipe` for a VM whose guest just answered on SSH.
@@ -1044,6 +1406,69 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
     /// saved state, if any, is untouched, so the next launch still restores it.)
     pub fn vm_save_failed(&mut self, id: VmId, why: String) {
         self.end_vm(id, EndReason::SaveFailed(why));
+    }
+
+    /// Switches the internet of the running VM `id` on or off, which is what
+    /// the VM overview's toggle does. The link changes on a helper thread; the
+    /// outcome arrives as [`VmEvent::InternetSet`]. For a persistent VM the
+    /// new state is also written to its metadata then, so it holds the next
+    /// time the VM starts.
+    pub fn set_vm_internet(&mut self, id: VmId, online: bool) -> Result<(), String> {
+        let events = self.vm.events.clone();
+        let vm = self.vm.instances.get_mut(&id).ok_or("That VM is gone")?;
+        if vm.persist.as_ref().is_some_and(|p| p.saving_until.is_some()) {
+            return Err("The VM is saving its state".into());
+        }
+        if vm.internet.pending.is_some() {
+            return Err("The network is still switching".into());
+        }
+        if vm.internet.online == online {
+            return Ok(());
+        }
+        vm.internet.pending = Some(online);
+        spawn_set_internet(id, vm.qemu.id(), &vm.qmp, online, false, events);
+        Ok(())
+    }
+
+    /// A helper thread finished switching a VM's internet link.
+    pub fn vm_internet_set(
+        &mut self,
+        id: VmId,
+        qemu_pid: u32,
+        online: bool,
+        result: Result<(), String>,
+    ) {
+        let Some(vm) = self.vm.instances.get_mut(&id) else {
+            return;
+        };
+        if vm.qemu.id() != qemu_pid {
+            return;
+        }
+        let held = std::mem::replace(&mut vm.internet.held, false);
+        vm.internet.pending = None;
+        match result {
+            Ok(()) => {
+                vm.internet.online = online;
+                info!(id, app = vm.name, online, "Switched the VM's internet");
+                if let Some(persist) = vm.persist.as_mut()
+                    && let Err(err) =
+                        vm_state::set_network_enabled(&mut persist.meta, &persist.meta_path, online)
+                {
+                    warn!(id, %err, "Switched the VM's internet but could not record it; it will not hold after a restart");
+                    self.vm_overview.set_status("Could not save the setting (see log)");
+                }
+            }
+            Err(why) if held => {
+                // The guest never ran; better to stop it than to let it
+                // loose with a network the user turned off.
+                self.end_vm(id, EndReason::NetworkFailed(why));
+            }
+            Err(why) => {
+                warn!(id, app = vm.name, online, %why, "Could not switch the VM's internet");
+                self.vm_overview.set_status("Could not switch the network (see log)");
+            }
+        }
+        self.refresh_vm_overview();
     }
 
     /// Reaps VMs that finished or got stuck. Run from a timer that exists only
@@ -1125,6 +1550,11 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             Ok(child) => {
                 vm.qemu = child;
                 persist.loaded_state = false;
+                // The new QEMU waits for its link to be cut as well (its
+                // arguments carry `-S`), and the first one's helper is gone.
+                if vm.internet.held {
+                    spawn_set_internet(id, vm.qemu.id(), &vm.qmp, false, true, self.vm.events.clone());
+                }
             }
             Err(err) => {
                 error!(id, %err, "Failed to restart qemu");
@@ -1200,6 +1630,7 @@ mod tests {
     fn snapshot() -> DiskMode<'static> {
         DiskMode::Snapshot {
             image: Path::new("/i"),
+            qmp: Path::new("/q"),
         }
     }
 
@@ -1259,6 +1690,7 @@ mod tests {
             7,
             DiskMode::Snapshot {
                 image: Path::new("/img/guest.qcow2"),
+                qmp: Path::new("/run/s.qmp"),
             },
             2222,
             Path::new("/run/s.log"),
@@ -1278,6 +1710,35 @@ mod tests {
         assert!(joined.contains("-m 2048"));
         assert!(joined.contains("-smp 2"));
         assert!(joined.contains("-name ironland-vm-7"));
+    }
+
+    #[test]
+    fn qemu_args_give_the_guest_an_internet_nic_and_a_restricted_ssh_nic() {
+        let args = qemu_args(&settings(), 1, snapshot(), 2222, Path::new("/l"));
+        let joined = args.join(" ");
+        // The internet NIC comes first: the guest prefers the first NIC for
+        // its default route, so the ssh-only one never carries internet
+        // traffic while the first is up.
+        let inet = joined.find("netdev=inet,id=nic_inet").expect(&joined);
+        let mgmt = joined.find("netdev=mgmt,id=nic_mgmt").expect(&joined);
+        assert!(inet < mgmt, "{joined}");
+        assert!(joined.contains("-netdev user,id=inet "), "{joined}");
+        // The ssh forward lives on the restricted NIC, so cutting the
+        // internet NIC's link leaves the compositor's way in intact.
+        assert!(
+            joined.contains("user,id=mgmt,net=10.0.3.0/24,restrict=on,hostfwd=tcp:127.0.0.1:2222-:22"),
+            "{joined}"
+        );
+        assert!(!joined.contains("id=inet,hostfwd"), "{joined}");
+    }
+
+    #[test]
+    fn every_vm_gets_a_monitor_socket_for_switching_its_link() {
+        let args = qemu_args(&settings(), 1, snapshot(), 1, Path::new("/l"));
+        assert!(
+            args.join(" ").contains("-qmp unix:/q,server=on,wait=off"),
+            "{args:?}"
+        );
     }
 
     #[test]
@@ -1361,6 +1822,58 @@ mod tests {
         assert!(!ssh_ready(closed));
     }
 
+    // --- resource use ----------------------------------------------------
+
+    #[test]
+    fn cpu_ticks_are_user_plus_system_time() {
+        let stat = "123 (qemu-system-x86) S 1 123 123 0 -1 4194560 1000 0 0 0 250 50 0 0 20 0 5 0 99 1 2";
+        assert_eq!(parse_cpu_ticks(stat), Some(300));
+    }
+
+    #[test]
+    fn cpu_ticks_survive_odd_command_names() {
+        let stat = "123 (a) b (c)) S 1 123 123 0 -1 4194560 1000 0 0 0 7 3 0 0 20 0 5 0 99 1 2";
+        assert_eq!(parse_cpu_ticks(stat), Some(10));
+        assert_eq!(parse_cpu_ticks("garbage"), None);
+        assert_eq!(parse_cpu_ticks("1 (x) S 1 2"), None);
+    }
+
+    #[test]
+    fn resident_pages_are_the_second_statm_field() {
+        assert_eq!(parse_rss_pages("5000 1234 99 1 0 4000 0"), Some(1234));
+        assert_eq!(parse_rss_pages("5000"), None);
+    }
+
+    #[test]
+    fn a_vms_cpu_use_is_measured_between_samples() {
+        let mut vm = instance(sleeper(), None, far_future(), true);
+        let t0 = Instant::now();
+        vm.sample_cpu(t0);
+        assert!(vm.usage.previous.is_some());
+        // A sleeping process uses (almost) no CPU.
+        vm.sample_cpu(t0 + Duration::from_secs(1));
+        assert!(vm.usage.cpu_percent < 50.0, "{}", vm.usage.cpu_percent);
+    }
+
+    #[test]
+    fn running_vms_report_their_internet_link() {
+        let mut vm = instance(sleeper(), None, far_future(), true);
+        vm.internet.online = false;
+        let mut manager = manager_with(vm);
+        let running = manager.running(Instant::now(), 2048);
+        assert_eq!(running.len(), 1);
+        assert_eq!(running[0].link, Link::Offline);
+        assert_eq!(running[0].phase, Phase::Running);
+        assert!(!running[0].persistent);
+        assert!(running[0].rss_bytes > 0);
+
+        manager.instances.get_mut(&1).unwrap().internet.pending = Some(true);
+        assert_eq!(
+            manager.running(Instant::now(), 2048)[0].link,
+            Link::Switching { online: true }
+        );
+    }
+
     // --- lifecycle -------------------------------------------------------
 
     /// A real calloop registration token (they can't be constructed directly).
@@ -1410,6 +1923,14 @@ mod tests {
             ready_seen: true,
             persist: None,
             watchers: Vec::new(),
+            started: Instant::now(),
+            qmp: PathBuf::from("/nonexistent/qmp.sock"),
+            internet: Internet {
+                online: true,
+                pending: None,
+                held: false,
+            },
+            usage: Usage::default(),
         }
     }
 
@@ -1595,6 +2116,7 @@ mod tests {
                 image_mtime: 1,
                 machine: String::new(),
                 has_state: false,
+                network_enabled: true,
             },
             qmp: PathBuf::from("/nonexistent/qmp.sock"),
             saving_until,
@@ -1818,6 +2340,9 @@ mod tests {
             ..VmSettings::default()
         };
         settings.ssh_key = Some(key.clone());
+        // Images log in with the key handed over at boot, as `launch_in_vm` does.
+        let keys = authorized_keys(&settings, Vec::new);
+        settings.extra_qemu_args.extend(authorized_keys_args(&keys));
 
         let boot = |load_state_expected: bool| {
             let prepared = vm_state::prepare(&root.join("state"), image, &settings).unwrap();
@@ -1898,6 +2423,214 @@ mod tests {
             "clock should match the host after syncing"
         );
 
+        let _ = qemu.kill();
+        let _ = qemu.wait();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Whether the guest can open a TCP connection to the host's loopback
+    /// port `port` through QEMU's NAT (the gateway address stands for the
+    /// host), i.e. whether its internet works. Reaching it is a stand-in for
+    /// reaching the internet that needs no internet.
+    fn guest_reaches_host(port_ssh: u16, key: &str, host_port: u16) -> bool {
+        let command = format!(
+            "timeout 5 bash -c 'echo > /dev/tcp/{GUEST_INTERNET_GATEWAY}/{host_port}' 2>/dev/null && echo yes || echo no"
+        );
+        guest_run(port_ssh, key, &command) == "yes"
+    }
+
+    /// Cutting a VM's internet over QMP must leave the ssh link `waypipe` runs
+    /// over alone, and a VM started offline must never have been online.
+    ///
+    /// `IRONLAND_TEST_VM_IMAGE=... IRONLAND_TEST_VM_KEY=... cargo test --lib live_internet -- --ignored --nocapture`
+    /// (the key's `.pub` is handed to the guest the way `launch_in_vm` does).
+    #[test]
+    #[ignore = "boots a real VM"]
+    fn live_internet_can_be_cut_without_losing_the_ssh_link() {
+        let image = std::env::var("IRONLAND_TEST_VM_IMAGE").expect("IRONLAND_TEST_VM_IMAGE");
+        let key = std::env::var("IRONLAND_TEST_VM_KEY").expect("IRONLAND_TEST_VM_KEY");
+        let root = std::env::temp_dir().join(format!("ivn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut settings = VmSettings {
+            memory_mb: 1024,
+            ssh_key: Some(key.clone()),
+            ..VmSettings::default()
+        };
+        let keys = authorized_keys(&settings, Vec::new);
+        assert!(!keys.is_empty(), "no public key next to {key}");
+        settings.extra_qemu_args.extend(authorized_keys_args(&keys));
+
+        // A host service for the guest to reach through the NAT.
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let host_port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || for _ in listener.incoming() {});
+
+        let boot = |name: &str, paused: bool| {
+            let dir = root.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            let port = free_loopback_port().unwrap();
+            let qmp = dir.join("qmp.sock");
+            let mut args = qemu_args(
+                &settings,
+                1,
+                DiskMode::Snapshot {
+                    image: Path::new(&image),
+                    qmp: &qmp,
+                },
+                port,
+                &dir.join("serial.log"),
+            );
+            if paused {
+                args.push("-S".into());
+            }
+            let qemu = spawn_qemu(&args, &dir).unwrap();
+            (qemu, port, qmp)
+        };
+
+        // 1. Online: the default route is the internet NIC's, the host is reachable.
+        let (mut qemu, port, qmp) = boot("online", false);
+        wait_for_ssh(port);
+        println!("routes:\n{}", guest_run(port, &key, "ip -4 route; ip -o -4 addr"));
+        let default = guest_run(port, &key, "ip -4 route show default");
+        assert!(default.contains(GUEST_INTERNET_GATEWAY), "default route: {default}");
+        assert!(guest_reaches_host(port, &key, host_port), "online guest cannot reach the host");
+
+        // 2. Cut: ssh keeps working, the host (and with it the internet) is gone.
+        vm_state::set_internet_over_socket(&qmp, false, false).unwrap();
+        std::thread::sleep(Duration::from_secs(2));
+        assert_eq!(guest_run(port, &key, "echo still-here"), "still-here");
+        assert!(
+            !guest_reaches_host(port, &key, host_port),
+            "guest still reaches the host with its internet cut"
+        );
+        println!("after cut:\n{}", guest_run(port, &key, "ip -4 route; ip -o link"));
+
+        // 3. Restore: the guest comes back online.
+        vm_state::set_internet_over_socket(&qmp, true, false).unwrap();
+        let mut back = false;
+        for _ in 0..30 {
+            if guest_reaches_host(port, &key, host_port) {
+                back = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        assert!(back, "guest never got its internet back");
+        let _ = qemu.kill();
+        let _ = qemu.wait();
+
+        // 4. Started offline: paused, link cut, resumed. Never online.
+        let (mut qemu, port, qmp) = boot("offline", true);
+        vm_state::set_internet_over_socket(&qmp, false, true).unwrap();
+        wait_for_ssh(port);
+        assert_eq!(guest_run(port, &key, "echo offline-start"), "offline-start");
+        assert!(
+            !guest_reaches_host(port, &key, host_port),
+            "a VM started offline reached the host"
+        );
+        let _ = qemu.kill();
+        let _ = qemu.wait();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A persistent VM whose internet was switched off is saved offline and
+    /// comes back offline: restored paused (`-S -loadvm`), link cut, resumed.
+    /// Its memory (a process started before the save) and disk survive, and
+    /// the internet can be switched back on afterwards.
+    #[test]
+    #[ignore = "boots a real VM"]
+    fn live_persistent_vm_without_internet_restores_without_internet() {
+        let image = std::env::var("IRONLAND_TEST_VM_IMAGE").expect("IRONLAND_TEST_VM_IMAGE");
+        let key = std::env::var("IRONLAND_TEST_VM_KEY").expect("IRONLAND_TEST_VM_KEY");
+        let image = Path::new(&image);
+        let root = std::env::temp_dir().join(format!("ivp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut settings = VmSettings {
+            memory_mb: 1024,
+            ssh_key: Some(key.clone()),
+            ..VmSettings::default()
+        };
+        let keys = authorized_keys(&settings, Vec::new);
+        assert!(!keys.is_empty(), "no public key next to {key}");
+        settings.extra_qemu_args.extend(authorized_keys_args(&keys));
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let host_port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || for _ in listener.incoming() {});
+
+        let boot = |expect_restore: bool, paused: bool| {
+            let prepared = vm_state::prepare(&root.join("state"), image, &settings).unwrap();
+            assert_eq!(prepared.load_state, expect_restore);
+            let port = free_loopback_port().unwrap();
+            let (qmp, qga) = (root.join("qmp.sock"), root.join("qga.sock"));
+            let mut args = qemu_args(
+                &settings,
+                1,
+                DiskMode::Persistent {
+                    overlay: &prepared.overlay,
+                    qmp: &qmp,
+                    qga: &qga,
+                    load_state: prepared.load_state,
+                },
+                port,
+                &root.join("serial.log"),
+            );
+            if paused {
+                args.push("-S".into());
+            }
+            let qemu = spawn_qemu(&args, &root).unwrap();
+            (prepared, qemu, port, qmp)
+        };
+
+        // 1. Cold boot, leave a file and a process behind, then cut the internet
+        //    and record that in the metadata, as the overview does.
+        let (mut prepared, mut qemu, port, qmp) = boot(false, false);
+        wait_for_ssh(port);
+        guest_run(port, &key, "echo persisted > ~/marker");
+        let pid = guest_run(
+            port,
+            &key,
+            "setsid sleep 100000 </dev/null >/dev/null 2>&1 & echo $!",
+        );
+        assert!(guest_reaches_host(port, &key, host_port));
+        vm_state::set_internet_over_socket(&qmp, false, false).unwrap();
+        vm_state::set_network_enabled(&mut prepared.meta, &prepared.meta_path, false).unwrap();
+        std::thread::sleep(Duration::from_secs(2));
+        assert!(!guest_reaches_host(port, &key, host_port));
+
+        // 2. Save and quit; the save keeps the recorded network setting.
+        vm_state::save_state_over_socket(&qmp).unwrap();
+        assert!(qemu.wait().unwrap().success());
+        vm_state::mark_saved(&prepared.meta, &prepared.meta_path, &settings).unwrap();
+
+        // 3. Restore paused, cut the link before the guest runs, resume.
+        let (prepared, mut qemu, port, qmp) = boot(true, true);
+        assert!(!prepared.meta.network_enabled, "the setting was lost");
+        vm_state::set_internet_over_socket(&qmp, false, true).unwrap();
+        wait_for_ssh(port);
+        assert_eq!(guest_run(port, &key, "cat ~/marker"), "persisted");
+        assert_eq!(
+            guest_run(port, &key, &format!("kill -0 {pid} && echo alive")),
+            "alive"
+        );
+        assert!(
+            !guest_reaches_host(port, &key, host_port),
+            "the restored VM reached the host although its internet was off"
+        );
+
+        // 4. Switching it back on works.
+        vm_state::set_internet_over_socket(&qmp, true, false).unwrap();
+        let mut back = false;
+        for _ in 0..30 {
+            if guest_reaches_host(port, &key, host_port) {
+                back = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        assert!(back, "internet did not come back after being switched on");
         let _ = qemu.kill();
         let _ = qemu.wait();
         let _ = std::fs::remove_dir_all(&root);

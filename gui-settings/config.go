@@ -321,6 +321,7 @@ var knownActions = []string{
 	"toggle_decorations",
 	"lock_screen",
 	"toggle_overview",
+	"toggle_vm_overview",
 }
 
 // actionLabels gives each action a human-readable name for the GUI.
@@ -362,6 +363,7 @@ var actionLabels = map[string]string{
 	"toggle_decorations":          "Toggle window decorations",
 	"lock_screen":                 "Lock screen",
 	"toggle_overview":             "Toggle workspace overview",
+	"toggle_vm_overview":          "Toggle VM overview",
 }
 
 // advertisedEvent describes one named shortcut a client can register via

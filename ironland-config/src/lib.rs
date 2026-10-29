@@ -809,6 +809,8 @@ pub fn default_shortcuts() -> HashMap<String, Vec<String>> {
         ("lock_screen", vec!["super+l"]),
         // Opens/closes the workspace overview.
         ("toggle_overview", vec!["super+space"]),
+        // Opens/closes the VM overview (running VMs, persisted state, network).
+        ("toggle_vm_overview", vec!["super+o"]),
     ]
     .into_iter()
     .map(|(name, keys)| {
@@ -951,6 +953,7 @@ pub fn known_actions() -> Vec<&'static str> {
         "toggle_decorations",
         "lock_screen",
         "toggle_overview",
+        "toggle_vm_overview",
     ]
     .to_vec()
 }

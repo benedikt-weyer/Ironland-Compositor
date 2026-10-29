@@ -57,6 +57,16 @@ pub struct PersistMeta {
     pub machine: String,
     /// Whether the overlay holds a saved state ([`STATE_TAG`]) to load.
     pub has_state: bool,
+    /// Whether the VM may reach the internet. Turned off from the VM overview
+    /// and kept here so it still applies the next time the VM starts - also
+    /// after a reboot of the computer. Absent in files from before the
+    /// setting existed, which means "online".
+    #[serde(default = "network_enabled_default")]
+    pub network_enabled: bool,
+}
+
+fn network_enabled_default() -> bool {
+    true
 }
 
 /// What [`prepare`] found or made.
@@ -106,11 +116,16 @@ pub fn state_root(settings: &VmSettings) -> PathBuf {
     data_home.join("ironland-compositor/vm/persistent")
 }
 
+/// Version of the guest's network devices (see `qemu_args`): one NIC for the
+/// internet and one for the compositor's own ssh link. Part of the machine
+/// fingerprint because a saved state only loads into the same devices.
+const NETWORK_LAYOUT: u32 = 2;
+
 /// The settings a saved state is tied to: it can only be loaded into a
 /// machine configured identically.
 pub fn machine_fingerprint(settings: &VmSettings) -> String {
     format!(
-        "mem={};cpus={};kvm={};extra={:?}",
+        "net={NETWORK_LAYOUT};mem={};cpus={};kvm={};extra={:?}",
         settings.memory_mb,
         settings.cpus.max(1),
         settings.kvm,
@@ -231,6 +246,7 @@ pub fn prepare(dir: &Path, image: &Path, settings: &VmSettings) -> Result<Prepar
         image_mtime: mtime,
         machine: fingerprint,
         has_state: false,
+        network_enabled: true,
     };
     write_meta(&meta_path, &meta).map_err(|e| format!("writing {}: {e}", meta_path.display()))?;
     Ok(Prepared {
@@ -254,6 +270,71 @@ pub fn mark_saved(
         ..prepared_meta.clone()
     };
     write_meta(meta_path, &meta)
+}
+
+/// Stores whether the VM described by `meta` may reach the internet, for its
+/// next start (and for a save at the end of this run).
+pub fn set_network_enabled(
+    meta: &mut PersistMeta,
+    meta_path: &Path,
+    enabled: bool,
+) -> io::Result<()> {
+    meta.network_enabled = enabled;
+    write_meta(meta_path, meta)
+}
+
+/// One directory under [`state_root`], as the VM overview lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedVm {
+    /// Directory name: [`persist_key`] of the application, plus
+    /// `.stale-<time>` for state moved aside after its image was replaced.
+    pub key: String,
+    /// Space the directory takes on disk (allocated blocks, so a sparse
+    /// overlay counts what it really uses).
+    pub disk_bytes: u64,
+    /// `None` when `meta.json` is missing or unreadable.
+    pub meta: Option<PersistMeta>,
+}
+
+impl PersistedVm {
+    /// Set aside by [`prepare`] because the base image was replaced.
+    pub fn is_stale(&self) -> bool {
+        self.key.contains(".stale-")
+    }
+}
+
+/// Bytes `path` and everything below it occupy on disk.
+pub fn disk_usage(path: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return 0;
+    };
+    let mut total = meta.blocks() * 512;
+    if meta.is_dir()
+        && let Ok(entries) = fs::read_dir(path)
+    {
+        total += entries.flatten().map(|e| disk_usage(&e.path())).sum::<u64>();
+    }
+    total
+}
+
+/// Every persistent VM's state directory under [`state_root`], sorted by name.
+pub fn list_persisted(settings: &VmSettings) -> Vec<PersistedVm> {
+    let root = state_root(settings);
+    let Ok(entries) = fs::read_dir(&root) else {
+        return Vec::new();
+    };
+    let mut found: Vec<PersistedVm> = entries
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|e| PersistedVm {
+            key: e.file_name().to_string_lossy().into_owned(),
+            disk_bytes: disk_usage(&e.path()),
+            meta: read_meta(&e.path().join("meta.json")),
+        })
+        .collect();
+    found.sort_by(|a, b| a.key.cmp(&b.key));
+    found
 }
 
 // ---------------------------------------------------------------------------
@@ -394,6 +475,67 @@ fn connect_with_retries(path: &Path) -> Result<UnixStream, String> {
 /// quit. Blocks for as long as the save takes; call from a helper thread.
 pub fn save_state_over_socket(path: &Path) -> Result<(), String> {
     qmp_save_and_quit(connect_with_retries(path)?)
+}
+
+/// Opens a QMP session on `stream`: reads the greeting and leaves capability
+/// negotiation mode. Returns the two halves for further commands.
+fn qmp_session(stream: UnixStream) -> Result<(UnixStream, BufReader<UnixStream>), String> {
+    let writer = stream.try_clone().map_err(|e| e.to_string())?;
+    let mut reader = BufReader::new(stream);
+    // The greeting only comes once QEMU has finished loading a saved state,
+    // which can take a while.
+    reader
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_secs(60)))
+        .map_err(|e| e.to_string())?;
+    read_reply_or_greeting(&mut reader)?;
+    let mut writer = writer;
+    send(&mut writer, &json!({"execute": "qmp_capabilities"}))?;
+    let reply = read_reply(&mut reader)?;
+    match error_text(&reply) {
+        Some(err) => Err(err),
+        None => Ok((writer, reader)),
+    }
+}
+
+/// Runs one QMP command and returns its error text, if it failed.
+fn qmp_command(
+    writer: &mut UnixStream,
+    reader: &mut BufReader<UnixStream>,
+    command: &Value,
+) -> Result<(), String> {
+    send(writer, command)?;
+    match error_text(&read_reply(reader)?) {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
+}
+
+/// Id of the host-side network backend that gives the guest its internet
+/// (`-netdev user,id=inet`, see `vm::qemu_args`). Taking its link down cuts
+/// the guest off without touching the ssh link, which runs over a second
+/// device.
+pub const INTERNET_NETDEV: &str = "inet";
+
+fn set_link_command(up: bool) -> Value {
+    json!({"execute": "set_link", "arguments": {"name": INTERNET_NETDEV, "up": up}})
+}
+
+/// Brings the guest's internet link up or down over the QMP socket at `path`.
+/// With `resume`, also starts a guest that was launched paused (`-S`), so a
+/// VM that must start offline never runs with the link up. Blocks; call from
+/// a helper thread.
+pub fn set_internet_over_socket(path: &Path, up: bool, resume: bool) -> Result<(), String> {
+    let (mut writer, mut reader) = qmp_session(connect_with_retries(path)?)?;
+    reader
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .map_err(|e| e.to_string())?;
+    qmp_command(&mut writer, &mut reader, &set_link_command(up))?;
+    if resume {
+        qmp_command(&mut writer, &mut reader, &json!({"execute": "cont"}))?;
+    }
+    Ok(())
 }
 
 /// Sets the guest's clock to the host's through the QEMU guest agent on the
@@ -716,5 +858,189 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(6));
         silent.join().unwrap();
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    // --- internet switch and persisted state ------------------------------
+
+    /// Plays QEMU's monitor on a socket at `path` for one client: answers
+    /// every command with success and returns the commands it received.
+    fn fake_monitor(path: &Path) -> std::thread::JoinHandle<Vec<Value>> {
+        let listener = std::os::unix::net::UnixListener::bind(path).unwrap();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut writer = stream.try_clone().unwrap();
+            let mut reader = BufReader::new(stream);
+            writer
+                .write_all(b"{\"QMP\": {\"version\": {}, \"capabilities\": []}}\n")
+                .unwrap();
+            let mut seen = Vec::new();
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap() == 0 {
+                    return seen;
+                }
+                seen.push(serde_json::from_str(&line).unwrap());
+                writer.write_all(b"{\"return\": {}}\n").unwrap();
+            }
+        })
+    }
+
+    #[test]
+    fn cutting_the_internet_takes_the_internet_netdev_down() {
+        let dir = scratch("net-down");
+        let path = dir.join("qmp.sock");
+        let monitor = fake_monitor(&path);
+        set_internet_over_socket(&path, false, false).unwrap();
+        let seen = monitor.join().unwrap();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert_eq!(seen[0]["execute"], "qmp_capabilities");
+        assert_eq!(seen[1]["execute"], "set_link");
+        assert_eq!(seen[1]["arguments"]["name"], INTERNET_NETDEV);
+        assert_eq!(seen[1]["arguments"]["up"], false);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_vm_started_paused_is_resumed_only_after_its_link_is_set() {
+        let dir = scratch("net-resume");
+        let path = dir.join("qmp.sock");
+        let monitor = fake_monitor(&path);
+        set_internet_over_socket(&path, false, true).unwrap();
+        let commands: Vec<String> = monitor
+            .join()
+            .unwrap()
+            .iter()
+            .map(|c| c["execute"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(commands, ["qmp_capabilities", "set_link", "cont"]);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_monitor_that_refuses_the_link_change_is_an_error() {
+        let dir = scratch("net-refused");
+        let path = dir.join("qmp.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let monitor = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut writer = stream.try_clone().unwrap();
+            let mut reader = BufReader::new(stream);
+            writer.write_all(b"{\"QMP\": {}}\n").unwrap();
+            for reply in [
+                "{\"return\": {}}\n",
+                "{\"error\": {\"class\": \"DeviceNotFound\", \"desc\": \"Device 'inet' not found\"}}\n",
+            ] {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                writer.write_all(reply.as_bytes()).unwrap();
+            }
+        });
+        let err = set_internet_over_socket(&path, false, true).unwrap_err();
+        assert!(err.contains("not found"), "{err}");
+        monitor.join().unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn metadata_from_before_the_network_setting_means_online() {
+        let old = r#"{"image":"/i","image_len":1,"image_mtime":2,"machine":"m","has_state":true}"#;
+        let meta: PersistMeta = serde_json::from_str(old).unwrap();
+        assert!(meta.network_enabled);
+    }
+
+    #[test]
+    fn a_vm_without_internet_stays_that_way_across_restarts_and_saves() {
+        let dir = scratch("net-persist");
+        let image = dir.join("base.raw");
+        fs::write(&image, b"not qcow2").unwrap();
+        // `qemu-img` makes the overlay; a stand-in is enough for `prepare`
+        // to treat the directory as existing state.
+        let state = dir.join("app");
+        fs::create_dir_all(&state).unwrap();
+        fs::write(state.join("disk.qcow2"), b"overlay").unwrap();
+        let (len, mtime) = image_identity(&image).unwrap();
+        let mut meta = PersistMeta {
+            image: image.display().to_string(),
+            image_len: len,
+            image_mtime: mtime,
+            machine: machine_fingerprint(&settings()),
+            has_state: false,
+            network_enabled: true,
+        };
+        let meta_path = state.join("meta.json");
+        write_meta(&meta_path, &meta).unwrap();
+
+        set_network_enabled(&mut meta, &meta_path, false).unwrap();
+
+        // The next launch reads it back...
+        let prepared = prepare(&state, &image, &settings()).unwrap();
+        assert!(!prepared.meta.network_enabled);
+        // ...and so does the one after a save at the end of this run.
+        mark_saved(&meta, &meta_path, &settings()).unwrap();
+        let prepared = prepare(&state, &image, &settings()).unwrap();
+        assert!(prepared.load_state);
+        assert!(!prepared.meta.network_enabled);
+
+        set_network_enabled(&mut meta, &meta_path, true).unwrap();
+        assert!(prepare(&state, &image, &settings()).unwrap().meta.network_enabled);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_network_layout_is_part_of_the_machine() {
+        assert!(machine_fingerprint(&settings()).starts_with("net=2;"));
+    }
+
+    #[test]
+    fn disk_usage_counts_what_files_occupy_not_their_apparent_size() {
+        let dir = scratch("usage");
+        fs::write(dir.join("small"), vec![1u8; 10_000]).unwrap();
+        let sparse = fs::File::create(dir.join("sparse")).unwrap();
+        sparse.set_len(1 << 30).unwrap();
+        let used = disk_usage(&dir);
+        assert!(used >= 10_000, "{used}");
+        assert!(used < 1 << 24, "a sparse 1 GiB file counted as {used}");
+        assert_eq!(disk_usage(&dir.join("missing")), 0);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn persisted_vms_are_listed_with_their_metadata_and_size() {
+        let dir = scratch("list");
+        let mut s = settings();
+        s.state_dir = Some(dir.display().to_string());
+        let app = dir.join("firefox.desktop");
+        fs::create_dir_all(&app).unwrap();
+        fs::write(app.join("disk.qcow2"), vec![1u8; 20_000]).unwrap();
+        let meta = PersistMeta {
+            image: "/i".into(),
+            image_len: 1,
+            image_mtime: 2,
+            machine: "m".into(),
+            has_state: true,
+            network_enabled: false,
+        };
+        write_meta(&app.join("meta.json"), &meta).unwrap();
+        // No metadata, and one set aside after an image change.
+        fs::create_dir_all(dir.join("broken")).unwrap();
+        fs::create_dir_all(dir.join("firefox.desktop.stale-17")).unwrap();
+        fs::write(dir.join("not-a-vm"), b"x").unwrap();
+
+        let listed = list_persisted(&s);
+        let keys: Vec<_> = listed.iter().map(|p| p.key.as_str()).collect();
+        assert_eq!(keys, ["broken", "firefox.desktop", "firefox.desktop.stale-17"]);
+        assert_eq!(listed[0].meta, None);
+        assert_eq!(listed[1].meta.as_ref(), Some(&meta));
+        assert!(listed[1].disk_bytes >= 20_000);
+        assert!(!listed[1].is_stale());
+        assert!(listed[2].is_stale());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_missing_state_directory_lists_nothing() {
+        let mut s = settings();
+        s.state_dir = Some("/nonexistent/ironland-vms".into());
+        assert!(list_persisted(&s).is_empty());
     }
 }

@@ -40,6 +40,12 @@ pub(crate) enum KeyAction {
     ToggleLauncher,
     /// Open or close the workspace overview
     ToggleOverview,
+    /// Open or close the VM overview
+    ToggleVmOverview,
+    /// Move the VM overview's selection down (positive) or up
+    VmOverviewMove(i32),
+    /// Switch the selected VM's internet on or off
+    VmOverviewToggleInternet,
     /// Lock the screen until the user authenticates with PAM again
     LockScreen,
     /// Append a character to the launcher's search query
@@ -99,6 +105,20 @@ pub(super) fn launcher_key_action(keysym: Keysym) -> KeyAction {
     }
 }
 
+/// Translates a key press into a VM overview action while the overlay is
+/// open. Everything else is swallowed (`KeyAction::None`).
+pub(super) fn vm_overview_key_action(keysym: Keysym) -> KeyAction {
+    match keysym {
+        Keysym::Escape | Keysym::q | Keysym::Q => KeyAction::ToggleVmOverview,
+        Keysym::Up | Keysym::k => KeyAction::VmOverviewMove(-1),
+        Keysym::Down | Keysym::j => KeyAction::VmOverviewMove(1),
+        Keysym::Return | Keysym::KP_Enter | Keysym::n | Keysym::N | Keysym::space => {
+            KeyAction::VmOverviewToggleInternet
+        }
+        _ => KeyAction::None,
+    }
+}
+
 /// The output workspace navigation/movement should act on: the output
 /// backing the currently focused window if there is one, else whichever
 /// output the pointer is over, else the first output.
@@ -137,6 +157,7 @@ pub(super) fn action_for_name(
         "toggle_launcher" => KeyAction::ToggleLauncher,
         "lock_screen" => KeyAction::LockScreen,
         "toggle_overview" => KeyAction::ToggleOverview,
+        "toggle_vm_overview" => KeyAction::ToggleVmOverview,
         "open_browser" => KeyAction::Run(browser.to_string()),
         "open_file_manager" => KeyAction::Run(file_manager.to_string()),
         "toggle_floating" => KeyAction::ToggleFloating,
