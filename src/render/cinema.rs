@@ -244,7 +244,6 @@ where
         read_rows(
             renderer,
             framebuffer,
-            size.h,
             Rectangle::new((x, y).into(), (w, h).into()),
         )
     };
@@ -262,52 +261,26 @@ where
 /// Reads `region` (picture coordinates, origin top left) of the bound
 /// framebuffer as tightly packed BGRA rows, top row first.
 ///
-/// Smithay's GLES readback addresses rows from the bottom of the frame and
-/// returns them bottom-first (`TextureMapping::flipped`), so the region is
-/// mirrored on the way in and the rows are reversed on the way out. Should a
-/// renderer report the opposite, the read is repeated the other way around.
+/// The frame is composited into an offscreen buffer with `Transform::Normal`,
+/// which Smithay's GLES renderer lays out with the picture's top row at GL
+/// row 0, so the readback is already in picture order. The mapping's
+/// `flipped()` says nothing about that (`GlesMapping` hard-codes `true`, which
+/// only suits window surfaces), and honouring it mirrors the glow vertically;
+/// `screencopy::fulfill` ignores it too.
 fn read_rows<R>(
     renderer: &mut R,
     framebuffer: &R::Framebuffer<'_>,
-    frame_height: i32,
     region: Rectangle<i32, BufferCoord>,
 ) -> Option<Vec<u8>>
 where
     R: Renderer + ExportMem,
 {
-    let mut bottom_first = true;
-    for _ in 0..2 {
-        let y = if bottom_first {
-            frame_height - region.loc.y - region.size.h
-        } else {
-            region.loc.y
-        };
-        let area = Rectangle::new((region.loc.x, y).into(), region.size);
-        let mapping = renderer
-            .copy_framebuffer(framebuffer, area, Fourcc::Argb8888)
-            .ok()?;
-        if mapping.flipped() != bottom_first {
-            bottom_first = mapping.flipped();
-            continue;
-        }
-        let bytes = renderer.map_texture(&mapping).ok()?;
-        let stride = region.size.w as usize * 4;
-        let rows = region.size.h as usize;
-        if bytes.len() < stride * rows {
-            return None;
-        }
-        return Some(if bottom_first {
-            bytes[..stride * rows]
-                .chunks_exact(stride)
-                .rev()
-                .flatten()
-                .copied()
-                .collect()
-        } else {
-            bytes[..stride * rows].to_vec()
-        });
-    }
-    None
+    let mapping = renderer
+        .copy_framebuffer(framebuffer, region, Fourcc::Argb8888)
+        .ok()?;
+    let bytes = renderer.map_texture(&mapping).ok()?;
+    let len = region.size.w as usize * 4 * region.size.h as usize;
+    (bytes.len() >= len).then(|| bytes[..len].to_vec())
 }
 
 /// A rasterized glow image: opaque BGRA pixels (black where nothing
