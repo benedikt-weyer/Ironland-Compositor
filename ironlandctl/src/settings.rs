@@ -75,6 +75,8 @@ pub enum SettingKey {
     PerformanceFpsOverlayIntervalMs,
     #[value(name = "cinema.edge_sample_px")]
     CinemaEdgeSamplePx,
+    #[value(name = "cinema.edge_depth_px")]
+    CinemaEdgeDepthPx,
     #[value(name = "cinema.sample_rate_hz")]
     CinemaSampleRateHz,
     #[value(name = "key_tracker.enabled")]
@@ -159,6 +161,7 @@ impl SettingKey {
             PerformanceStutterLog,
             PerformanceFpsOverlayIntervalMs,
             CinemaEdgeSamplePx,
+            CinemaEdgeDepthPx,
             CinemaSampleRateHz,
             KeyTrackerEnabled,
             KeyTrackerKeys,
@@ -219,6 +222,7 @@ impl SettingKey {
             PerformanceStutterLog => "performance.stutter_log",
             PerformanceFpsOverlayIntervalMs => "performance.fps_overlay_interval_ms",
             CinemaEdgeSamplePx => "cinema.edge_sample_px",
+            CinemaEdgeDepthPx => "cinema.edge_depth_px",
             CinemaSampleRateHz => "cinema.sample_rate_hz",
             KeyTrackerEnabled => "key_tracker.enabled",
             KeyTrackerKeys => "key_tracker.keys",
@@ -286,6 +290,7 @@ pub fn get(full: &FullConfig, key: SettingKey) -> String {
         PerformanceStutterLog => cfg.performance.stutter_log.to_string(),
         PerformanceFpsOverlayIntervalMs => cfg.performance.fps_overlay_interval_ms.to_string(),
         CinemaEdgeSamplePx => cfg.cinema.edge_sample_px.to_string(),
+        CinemaEdgeDepthPx => cfg.cinema.edge_depth_px.to_string(),
         CinemaSampleRateHz => cfg.cinema.sample_rate_hz.to_string(),
         KeyTrackerEnabled => cfg.key_tracker.enabled.to_string(),
         KeyTrackerKeys => cfg.key_tracker.keys.join(","),
@@ -397,6 +402,7 @@ fn table_and_leaf(key: SettingKey) -> (&'static [&'static str], &'static str) {
         PerformanceStutterLog => (&["performance"], "stutter_log"),
         PerformanceFpsOverlayIntervalMs => (&["performance"], "fps_overlay_interval_ms"),
         CinemaEdgeSamplePx => (&["cinema"], "edge_sample_px"),
+        CinemaEdgeDepthPx => (&["cinema"], "edge_depth_px"),
         CinemaSampleRateHz => (&["cinema"], "sample_rate_hz"),
         KeyTrackerEnabled => (&["key_tracker"], "enabled"),
         KeyTrackerKeys => (&["key_tracker"], "keys"),
@@ -590,6 +596,13 @@ pub fn set(doc: &mut DocumentMut, key: SettingKey, raw: &str) -> Result<()> {
             let px = parse_u32(raw)?;
             if !(1..=512).contains(&px) {
                 bail!("edge sample width must be 1..=512 pixels, got {px}");
+            }
+            table[leaf] = value(i64::from(px));
+        }
+        CinemaEdgeDepthPx => {
+            let px = parse_u32(raw)?;
+            if px > 256 {
+                bail!("edge depth must be 0 (automatic) to 256 pixels, got {px}");
             }
             table[leaf] = value(i64::from(px));
         }

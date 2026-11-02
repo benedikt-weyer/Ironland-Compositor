@@ -55,6 +55,9 @@ use crate::{
 /// Bounds of `cinema.edge_sample_px`: pixels of the lit output's edge per
 /// color kept along it.
 const EDGE_SAMPLE_PX: std::ops::RangeInclusive<u32> = 1..=512;
+/// Bounds of `cinema.edge_depth_px`: how many pixels inwards the colors are
+/// taken from.
+const EDGE_DEPTH_PX: std::ops::RangeInclusive<u32> = 1..=256;
 /// Bounds of the time the glow takes to slide to a new sample: the time
 /// since the previous sample, so it arrives just as the next one is due,
 /// but never so long that the glow trails after a pause in the picture.
@@ -187,15 +190,22 @@ pub struct BorderStrips {
     right: Vec<u8>,
 }
 
-/// Thickness of the border strips for a frame of `size`.
-fn strip_depth(size: Size<i32, BufferCoord>) -> i32 {
-    (size.w.min(size.h) / 64).clamp(4, 24)
+/// Thickness of the border strips for a frame of `size`: `requested`
+/// pixels (`cinema.edge_depth_px`), or with 0 a 64th of the shorter side
+/// within 4..=24. Never more than a quarter of the shorter side.
+fn strip_depth(size: Size<i32, BufferCoord>, requested: u32) -> i32 {
+    let shorter = size.w.min(size.h);
+    let depth = match requested {
+        0 => (shorter / 64).clamp(4, 24),
+        px => px.min(*EDGE_DEPTH_PX.end()) as i32,
+    };
+    depth.min(shorter / 4).max(1)
 }
 
 /// The four strips of a frame of `size` as `(x, y, w, h)` in picture
 /// coordinates (origin top left): top, bottom, left, right.
-fn strip_rects(size: Size<i32, BufferCoord>) -> [(i32, i32, i32, i32); 4] {
-    let depth = strip_depth(size);
+fn strip_rects(size: Size<i32, BufferCoord>, depth_px: u32) -> [(i32, i32, i32, i32); 4] {
+    let depth = strip_depth(size, depth_px);
     [
         (0, 0, size.w, depth),
         (0, size.h - depth, size.w, depth),
@@ -204,12 +214,14 @@ fn strip_rects(size: Size<i32, BufferCoord>) -> [(i32, i32, i32, i32); 4] {
     ]
 }
 
-/// Reads the border strips of the frame bound as `framebuffer` (of `size`)
-/// back from the GPU. `None` if any read fails.
+/// Reads the border strips of the frame bound as `framebuffer` (of `size`),
+/// `depth_px` deep (0: automatic, see [`strip_depth`]), back from the GPU.
+/// `None` if any read fails.
 pub fn read_border_strips<R>(
     renderer: &mut R,
     framebuffer: &R::Framebuffer<'_>,
     size: Size<i32, BufferCoord>,
+    depth_px: u32,
 ) -> Option<BorderStrips>
 where
     R: Renderer + ExportMem,
@@ -217,7 +229,7 @@ where
     if size.w < 8 || size.h < 8 {
         return None;
     }
-    let [top, bottom, left, right] = strip_rects(size);
+    let [top, bottom, left, right] = strip_rects(size, depth_px);
     let mut read = |(x, y, w, h): (i32, i32, i32, i32)| {
         read_rows(
             renderer,
@@ -228,7 +240,7 @@ where
     Some(BorderStrips {
         width: size.w as usize,
         height: size.h as usize,
-        depth: strip_depth(size) as usize,
+        depth: strip_depth(size, depth_px) as usize,
         top: read(top)?,
         bottom: read(bottom)?,
         left: read(left)?,
@@ -648,12 +660,47 @@ mod tests {
     }
 
     #[test]
+    fn the_strip_depth_is_automatic_or_as_asked_within_limits() {
+        let size = |w, h| -> Size<i32, BufferCoord> { (w, h).into() };
+        // Automatic: a 64th of the shorter side, 4 to 24.
+        assert_eq!(strip_depth(size(1920, 1080), 0), 16);
+        assert_eq!(strip_depth(size(2560, 1440), 0), 22);
+        assert_eq!(strip_depth(size(3840, 2160), 0), 24);
+        assert_eq!(strip_depth(size(640, 360), 0), 5);
+        assert_eq!(strip_depth(size(160, 100), 0), 4);
+        // Asked for: exactly that, whatever the size ...
+        assert_eq!(strip_depth(size(1920, 1080), 1), 1);
+        assert_eq!(strip_depth(size(1920, 1080), 3), 3);
+        assert_eq!(strip_depth(size(3840, 2160), 100), 100);
+        // ... but at most 256 and a quarter of the shorter side.
+        assert_eq!(strip_depth(size(7680, 4320), 10_000), 256);
+        assert_eq!(strip_depth(size(1920, 1080), 256), 256);
+        assert_eq!(strip_depth(size(1920, 1080), 400), 256);
+        assert_eq!(strip_depth(size(1280, 720), 256), 180);
+        assert_eq!(strip_depth(size(40, 40), 30), 10);
+    }
+
+    #[test]
+    fn the_strips_follow_the_asked_depth() {
+        let size: Size<i32, BufferCoord> = (1920, 1080).into();
+        assert_eq!(
+            strip_rects(size, 3),
+            [
+                (0, 0, 1920, 3),
+                (0, 1077, 1920, 3),
+                (0, 0, 3, 1080),
+                (1917, 0, 3, 1080)
+            ]
+        );
+    }
+
+    #[test]
     fn strip_rects_cover_the_edges_in_picture_coordinates() {
         let size: Size<i32, BufferCoord> = (1920, 1080).into();
-        let depth = strip_depth(size);
+        let depth = strip_depth(size, 0);
         assert_eq!(depth, 16);
         assert_eq!(
-            strip_rects(size),
+            strip_rects(size, 0),
             [
                 (0, 0, 1920, 16),
                 (0, 1064, 1920, 16),

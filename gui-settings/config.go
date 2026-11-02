@@ -184,6 +184,9 @@ type CinemaSettings struct {
 	// EdgeSamplePx is the width in pixels of the lit output's edge covered by
 	// one color of cinema mode's glow.
 	EdgeSamplePx uint32 `json:"edge_sample_px"`
+	// EdgeDepthPx is how many pixels inwards of the edge the colors are
+	// taken from (0 = automatic).
+	EdgeDepthPx uint32 `json:"edge_depth_px"`
 	// SampleRateHz is how often at most the lit output's border is sampled
 	// (0 = every frame with changes).
 	SampleRateHz uint32 `json:"sample_rate_hz"`

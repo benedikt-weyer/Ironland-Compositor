@@ -564,6 +564,15 @@ pub struct CinemaSettings {
     /// exactly (and flickers more with fine detail); beyond a few pixels
     /// it makes no visible difference. Clamped to 1..=512 when used.
     pub edge_sample_px: u32,
+    /// How far, in pixels of the lit output, the colors are taken from
+    /// inwards of its edges: each is the average of a block this deep (and
+    /// `edge_sample_px` wide), so anything thinner than this is diluted.
+    /// Smaller sees thin things right at the border (a window border, a
+    /// subtitle bar) more strongly but is noisier; larger is calmer and
+    /// follows the picture's overall edge colors. `0` picks it from the
+    /// output size (1/64 of the shorter side, 4 to 24 pixels). Clamped to
+    /// 1..=256 (and to a quarter of the shorter side) when used.
+    pub edge_depth_px: u32,
     /// How many times a second, at most, the lit output's border is sampled
     /// (only frames with changes are). Higher follows the picture more
     /// closely but costs more GPU time per second, since each sample reads
@@ -575,6 +584,7 @@ impl Default for CinemaSettings {
     fn default() -> Self {
         Self {
             edge_sample_px: 10,
+            edge_depth_px: 0,
             sample_rate_hz: 25,
         }
     }
@@ -1538,9 +1548,13 @@ mod tests {
         assert_eq!(raw.cinema, CinemaSettings::default());
         assert_eq!(raw.cinema.edge_sample_px, 10);
         assert_eq!(raw.cinema.sample_rate_hz, 25);
+        assert_eq!(raw.cinema.edge_depth_px, 0);
 
-        let raw: RawConfig =
-            toml::from_str("[cinema]\nedge_sample_px = 4\nsample_rate_hz = 60\n").unwrap();
+        let raw: RawConfig = toml::from_str(
+            "[cinema]\nedge_sample_px = 4\nsample_rate_hz = 60\nedge_depth_px = 8\n",
+        )
+        .unwrap();
+        assert_eq!(raw.cinema.edge_depth_px, 8);
         assert_eq!(raw.cinema.edge_sample_px, 4);
         assert_eq!(raw.cinema.sample_rate_hz, 60);
     }

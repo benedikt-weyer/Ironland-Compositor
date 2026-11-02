@@ -388,6 +388,7 @@ impl AnvilState<UdevData> {
             drop_indicator_cache,
             tint,
             cinema_frame,
+            self.config.cinema.edge_depth_px,
             &self.config.performance,
             &*perf_stats,
             fps_overlay_cache,
@@ -560,6 +561,7 @@ pub(super) fn render_surface<'a>(
     drop_indicator_cache: &mut crate::border::BorderCache,
     tint: Option<smithay::backend::renderer::element::solid::SolidColorRenderElement>,
     cinema: crate::cinema::CinemaFrame,
+    cinema_edge_depth_px: u32,
     performance: &crate::config::PerformanceSettings,
     perf_stats: &crate::perf_overlay::FrameStats,
     fps_overlay_cache: &mut crate::perf_overlay::OverlayCache,
@@ -963,7 +965,7 @@ pub(super) fn render_surface<'a>(
     // colors were read yet.
     let border_strips = sample_border
         .filter(|&force| force || !render_frame_result.is_empty)
-        .and_then(|_| sample_udev_border(&render_frame_result, renderer, output));
+        .and_then(|_| sample_udev_border(&render_frame_result, renderer, output, cinema_edge_depth_px));
 
     let (rendered, states) = (!render_frame_result.is_empty, render_frame_result.states);
 
@@ -1077,6 +1079,7 @@ pub(super) fn sample_udev_border<'a, B, F, E>(
     render_frame_result: &smithay::backend::drm::compositor::RenderFrameResult<'_, B, F, E>,
     renderer: &mut UdevRenderer<'a>,
     output: &Output,
+    edge_depth_px: u32,
 ) -> Option<crate::cinema::BorderStrips>
 where
     B: smithay::backend::allocator::Buffer + smithay::backend::allocator::dmabuf::AsDmabuf,
@@ -1113,5 +1116,5 @@ where
     // The strips are read right after, so the composite has to be done.
     let _ = sync.wait();
 
-    crate::cinema::read_border_strips(renderer, &fb, size)
+    crate::cinema::read_border_strips(renderer, &fb, size, edge_depth_px)
 }
