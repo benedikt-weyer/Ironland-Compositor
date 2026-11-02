@@ -73,6 +73,10 @@ pub enum SettingKey {
     PerformanceStutterLog,
     #[value(name = "performance.fps_overlay_interval_ms")]
     PerformanceFpsOverlayIntervalMs,
+    #[value(name = "cinema.edge_sample_px")]
+    CinemaEdgeSamplePx,
+    #[value(name = "cinema.sample_rate_hz")]
+    CinemaSampleRateHz,
     #[value(name = "key_tracker.enabled")]
     KeyTrackerEnabled,
     #[value(name = "key_tracker.keys")]
@@ -154,6 +158,8 @@ impl SettingKey {
             PerformanceStutterThresholdMs,
             PerformanceStutterLog,
             PerformanceFpsOverlayIntervalMs,
+            CinemaEdgeSamplePx,
+            CinemaSampleRateHz,
             KeyTrackerEnabled,
             KeyTrackerKeys,
             KeyTrackerPosition,
@@ -212,6 +218,8 @@ impl SettingKey {
             PerformanceStutterThresholdMs => "performance.stutter_threshold_ms",
             PerformanceStutterLog => "performance.stutter_log",
             PerformanceFpsOverlayIntervalMs => "performance.fps_overlay_interval_ms",
+            CinemaEdgeSamplePx => "cinema.edge_sample_px",
+            CinemaSampleRateHz => "cinema.sample_rate_hz",
             KeyTrackerEnabled => "key_tracker.enabled",
             KeyTrackerKeys => "key_tracker.keys",
             KeyTrackerPosition => "key_tracker.position",
@@ -277,6 +285,8 @@ pub fn get(full: &FullConfig, key: SettingKey) -> String {
         PerformanceStutterThresholdMs => cfg.performance.stutter_threshold_ms.to_string(),
         PerformanceStutterLog => cfg.performance.stutter_log.to_string(),
         PerformanceFpsOverlayIntervalMs => cfg.performance.fps_overlay_interval_ms.to_string(),
+        CinemaEdgeSamplePx => cfg.cinema.edge_sample_px.to_string(),
+        CinemaSampleRateHz => cfg.cinema.sample_rate_hz.to_string(),
         KeyTrackerEnabled => cfg.key_tracker.enabled.to_string(),
         KeyTrackerKeys => cfg.key_tracker.keys.join(","),
         KeyTrackerPosition => overlay_position_str(cfg.key_tracker.position).to_string(),
@@ -386,6 +396,8 @@ fn table_and_leaf(key: SettingKey) -> (&'static [&'static str], &'static str) {
         PerformanceStutterThresholdMs => (&["performance"], "stutter_threshold_ms"),
         PerformanceStutterLog => (&["performance"], "stutter_log"),
         PerformanceFpsOverlayIntervalMs => (&["performance"], "fps_overlay_interval_ms"),
+        CinemaEdgeSamplePx => (&["cinema"], "edge_sample_px"),
+        CinemaSampleRateHz => (&["cinema"], "sample_rate_hz"),
         KeyTrackerEnabled => (&["key_tracker"], "enabled"),
         KeyTrackerKeys => (&["key_tracker"], "keys"),
         KeyTrackerPosition => (&["key_tracker"], "position"),
@@ -573,6 +585,20 @@ pub fn set(doc: &mut DocumentMut, key: SettingKey, raw: &str) -> Result<()> {
         }
         PerformanceFpsOverlayIntervalMs => {
             table[leaf] = value(i64::from(parse_u32(raw)?));
+        }
+        CinemaEdgeSamplePx => {
+            let px = parse_u32(raw)?;
+            if !(1..=512).contains(&px) {
+                bail!("edge sample width must be 1..=512 pixels, got {px}");
+            }
+            table[leaf] = value(i64::from(px));
+        }
+        CinemaSampleRateHz => {
+            let hz = parse_u32(raw)?;
+            if hz > 240 {
+                bail!("sample rate must be 0 (every frame) to 240 Hz, got {hz}");
+            }
+            table[leaf] = value(i64::from(hz));
         }
         WindowAnimationsDurationMs => {
             let duration = parse_u32(raw)?;

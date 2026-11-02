@@ -179,6 +179,16 @@ type PerformanceSettings struct {
 	FPSOverlayIntervalMs uint32 `json:"fps_overlay_interval_ms"`
 }
 
+// CinemaSettings mirrors `ironland_config::CinemaSettings`.
+type CinemaSettings struct {
+	// EdgeSamplePx is the width in pixels of the lit output's edge covered by
+	// one color of cinema mode's glow.
+	EdgeSamplePx uint32 `json:"edge_sample_px"`
+	// SampleRateHz is how often at most the lit output's border is sampled
+	// (0 = every frame with changes).
+	SampleRateHz uint32 `json:"sample_rate_hz"`
+}
+
 // WindowAnimationSettings mirrors `ironland_config::WindowAnimationSettings`.
 type WindowAnimationSettings struct {
 	Enabled    bool   `json:"enabled"`
@@ -223,6 +233,7 @@ type Config struct {
 	Session     SessionSettings           `json:"session"`
 	VM          VMSettings                `json:"vm"`
 	Performance PerformanceSettings       `json:"performance"`
+	Cinema      CinemaSettings            `json:"cinema"` // no GUI control yet; carried through so saving doesn't drop it
 	KeyTracker  KeyTrackerSettings        `json:"key_tracker"`
 	Appearance  AppearanceSettings        `json:"appearance"`
 	Shortcuts   map[string][]string       `json:"shortcuts"`

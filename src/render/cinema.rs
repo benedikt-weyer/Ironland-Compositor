@@ -9,14 +9,13 @@
 //!   [`CinemaRender::submit`], which boils them down to a row of colors per
 //!   side ([`BorderColors`]).
 //! - Every other output gets a [`Cover`]: an opaque, fully black quad, or -
-//!   with a glow - a small CPU-rasterized image ([`rasterize_glow`]) that
-//!   the GPU scales up to the output (bilinear, so the gradient is smooth).
-//!   For each pixel it takes the color at the nearest point on the lit
-//!   output's border and fades it with the distance from that border, so a
-//!   monitor to the right of the lit one lights up along its left edge in the
-//!   colors of the lit one's right edge, and one diagonally across only gets
-//!   the corner's color. The picture position of outputs is whatever the
-//!   output layout says, gaps included.
+//!   with a glow - a pixel shader ([`glow`]) in which every color along the
+//!   lit output's border is a point light, spreading out in all directions
+//!   and mixing with its neighbours, so a monitor to the right of the lit
+//!   one lights up along its left edge in the colors of the lit one's right
+//!   edge, a bright spot lights a soft disc, and one diagonally across only
+//!   gets the corner's glow. The picture position of outputs is whatever
+//!   the output layout says, gaps included.
 //!
 //! The cover is inserted behind everything the caller draws itself (cursor,
 //! overlays) and in front of windows and layer surfaces, so the pointer stays
@@ -26,21 +25,26 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+mod glow;
+
+pub use glow::GlowRenderElement;
+use glow::{GlowCover, Lights};
+
 use smithay::{
     backend::{
         allocator::Fourcc,
         renderer::{
-            Color32F, ExportMem, ImportAll, ImportMem, Renderer, TextureMapping,
+            Color32F, ExportMem, ImportAll, ImportMem, Renderer,
             element::{
-                Kind,
-                memory::{MemoryRenderBuffer, MemoryRenderBufferRenderElement},
+                Id, Kind,
                 solid::{SolidColorBuffer, SolidColorRenderElement},
             },
+            utils::CommitCounter,
         },
     },
     desktop::Space,
     output::Output,
-    utils::{Buffer as BufferCoord, Logical, Rectangle, Size, Transform},
+    utils::{Buffer as BufferCoord, Logical, Rectangle, Size},
 };
 
 use crate::{
@@ -48,15 +52,15 @@ use crate::{
     shell::WindowElement,
 };
 
-/// Colors kept along each side of the lit output.
-const EDGE_SAMPLES: usize = 48;
-/// How often the lit output's border is read back while a glow is on.
-const SAMPLE_INTERVAL: Duration = Duration::from_millis(125);
-/// Time constant of the glow following the sampled colors, so the 10 Hz
-/// samples blend into continuous motion.
-const COLOR_SMOOTHING: Duration = Duration::from_millis(120);
-/// Logical pixels of a dark output covered by one texel of the glow image.
-const LOGICAL_PIXELS_PER_TEXEL: f64 = 12.0;
+/// Bounds of `cinema.edge_sample_px`: pixels of the lit output's edge per
+/// color kept along it.
+const EDGE_SAMPLE_PX: std::ops::RangeInclusive<u32> = 1..=512;
+/// Bounds of the time the glow takes to slide to a new sample: the time
+/// since the previous sample, so it arrives just as the next one is due,
+/// but never so long that the glow trails after a pause in the picture.
+const BLEND: (Duration, Duration) = (Duration::from_millis(1), Duration::from_millis(80));
+/// How long the first colors take to fade in from black.
+const FADE_IN: Duration = Duration::from_millis(250);
 /// How far the glow reaches into the dark outputs (logical pixels) at the
 /// weakest and strongest setting.
 const REACH: (f64, f64) = (250.0, 900.0);
@@ -75,13 +79,14 @@ pub struct BorderColors {
 }
 
 impl BorderColors {
-    fn black() -> Self {
-        let side = vec![[0.0; 3]; EDGE_SAMPLES];
+    /// All black, with as many colors per side as `like`.
+    fn black_like(like: &BorderColors) -> Self {
+        let black = |side: &Vec<[f32; 3]>| vec![[0.0; 3]; side.len()];
         BorderColors {
-            top: side.clone(),
-            bottom: side.clone(),
-            left: side.clone(),
-            right: side,
+            top: black(&like.top),
+            bottom: black(&like.bottom),
+            left: black(&like.left),
+            right: black(&like.right),
         }
     }
 
@@ -98,85 +103,58 @@ impl BorderColors {
         ]
     }
 
-    /// Averages the strips into [`EDGE_SAMPLES`] colors per side.
-    pub fn from_strips(strips: &BorderStrips) -> Self {
+    /// Averages the strips into one color per `sample_px` pixels along each
+    /// side (clamped to [`EDGE_SAMPLE_PX`]).
+    pub fn from_strips(strips: &BorderStrips, sample_px: u32) -> Self {
         let (w, h, depth) = (strips.width, strips.height, strips.depth);
+        let px = sample_px.clamp(*EDGE_SAMPLE_PX.start(), *EDGE_SAMPLE_PX.end()) as usize;
         BorderColors {
-            top: average_cells(&strips.top, w, depth, true),
-            bottom: average_cells(&strips.bottom, w, depth, true),
-            left: average_cells(&strips.left, depth, h, false),
-            right: average_cells(&strips.right, depth, h, false),
+            top: average_cells(&strips.top, w, depth, true, px),
+            bottom: average_cells(&strips.bottom, w, depth, true, px),
+            left: average_cells(&strips.left, depth, h, false, px),
+            right: average_cells(&strips.right, depth, h, false, px),
         }
     }
 
-    /// Moves every color a fraction `k` (0..=1) of the way to `target`,
-    /// snapping once it is within one 8-bit step. Returns whether anything
-    /// changed.
-    fn approach(&mut self, target: &BorderColors, k: f32) -> bool {
-        let mut changed = false;
-        for (side, goal) in self.sides_mut().into_iter().zip(target.sides()) {
+    /// The colors a fraction `t` (0..=1) of the way from `self` to `to`.
+    /// (A different number of colors per side, from a changed output size
+    /// or setting, can't be blended: it is `to` at once.)
+    fn lerp(&self, to: &BorderColors, t: f32) -> BorderColors {
+        let same_shape = self
+            .sides()
+            .into_iter()
+            .zip(to.sides())
+            .all(|(a, b)| a.len() == b.len());
+        if !same_shape {
+            return to.clone();
+        }
+        let mut out = self.clone();
+        for (side, goal) in out.sides_mut().into_iter().zip(to.sides()) {
             for (color, goal) in side.iter_mut().zip(goal.iter()) {
                 for (c, g) in color.iter_mut().zip(goal) {
-                    let next = if (*g - *c).abs() < 0.5 / 255.0 {
-                        *g
-                    } else {
-                        *c + (*g - *c) * k
-                    };
-                    changed |= next != *c;
-                    *c = next;
+                    *c += (*g - *c) * t;
                 }
             }
         }
-        changed
-    }
-
-    /// Color of the border at `point`, a position on the lit output's edge
-    /// in 0..=1 on both axes. At a corner the colors of both edges meet.
-    fn at(&self, point: (f64, f64), tolerance: (f64, f64)) -> [f32; 3] {
-        let (u, v) = (point.0 as f32, point.1 as f32);
-        let mut sum = [0.0f32; 3];
-        let mut count = 0.0f32;
-        let mut add = |color: [f32; 3]| {
-            for (s, c) in sum.iter_mut().zip(color) {
-                *s += c;
-            }
-            count += 1.0;
-        };
-        if point.0 <= tolerance.0 {
-            add(side_color(&self.left, v));
-        }
-        if point.0 >= 1.0 - tolerance.0 {
-            add(side_color(&self.right, v));
-        }
-        if point.1 <= tolerance.1 {
-            add(side_color(&self.top, u));
-        }
-        if point.1 >= 1.0 - tolerance.1 {
-            add(side_color(&self.bottom, u));
-        }
-        if count == 0.0 {
-            return [0.0; 3];
-        }
-        sum.map(|s| s / count)
+        out
     }
 }
 
-/// The color at `t` (0..=1) along a side, interpolating between the cells.
-fn side_color(side: &[[f32; 3]], t: f32) -> [f32; 3] {
-    let at = (t * side.len() as f32 - 0.5).clamp(0.0, (side.len() - 1) as f32);
-    let (lo, frac) = (at.floor() as usize, at.fract());
-    let hi = (lo + 1).min(side.len() - 1);
-    [0, 1, 2].map(|i| side[lo][i] + (side[hi][i] - side[lo][i]) * frac)
-}
-
-/// Averages BGRA `pixels` (`width` x `height`, tightly packed) into
-/// [`EDGE_SAMPLES`] cells along the x axis, or the y axis if not `horizontal`.
-fn average_cells(pixels: &[u8], width: usize, height: usize, horizontal: bool) -> Vec<[f32; 3]> {
+/// Averages BGRA `pixels` (`width` x `height`, tightly packed) into cells of
+/// about `cell_px` pixels along the x axis, or the y axis if not `horizontal`.
+fn average_cells(
+    pixels: &[u8],
+    width: usize,
+    height: usize,
+    horizontal: bool,
+    cell_px: usize,
+) -> Vec<[f32; 3]> {
     let along = if horizontal { width } else { height };
-    (0..EDGE_SAMPLES)
+    let cells = along.div_ceil(cell_px).max(1);
+    (0..cells)
         .map(|cell| {
-            let from = cell * along / EDGE_SAMPLES;
-            let to = ((cell + 1) * along / EDGE_SAMPLES).max(from + 1).min(along);
+            let from = cell * along / cells;
+            let to = ((cell + 1) * along / cells).max(from + 1).min(along);
             let mut sum = [0.0f32; 3];
             let mut count = 0.0f32;
             for a in from..to {
@@ -283,84 +261,6 @@ where
     (bytes.len() >= len).then(|| bytes[..len].to_vec())
 }
 
-/// A rasterized glow image: opaque BGRA pixels (black where nothing
-/// glows).
-#[derive(Debug, PartialEq)]
-pub struct GlowImage {
-    pub pixels: Vec<u8>,
-    pub width: usize,
-    pub height: usize,
-}
-
-/// Rasterizes the glow cast on the output at `dark` by the border of the one
-/// at `lit` (both in the global logical layout), at `glow` strength 0..=1.
-pub fn rasterize_glow(
-    lit: Rectangle<i32, Logical>,
-    dark: Rectangle<i32, Logical>,
-    colors: &BorderColors,
-    glow: f32,
-) -> GlowImage {
-    let width = ((dark.size.w as f64 / LOGICAL_PIXELS_PER_TEXEL).ceil() as usize).max(2);
-    let height = ((dark.size.h as f64 / LOGICAL_PIXELS_PER_TEXEL).ceil() as usize).max(2);
-    let reach = REACH.0 + (REACH.1 - REACH.0) * glow as f64;
-    let gain = GAIN.0 + (GAIN.1 - GAIN.0) * glow;
-
-    let (x0, y0) = (lit.loc.x as f64, lit.loc.y as f64);
-    let (x1, y1) = (x0 + lit.size.w as f64, y0 + lit.size.h as f64);
-    // Half a pixel of the lit output, in its 0..=1 coordinates.
-    let tolerance = (
-        0.5 / lit.size.w.max(1) as f64,
-        0.5 / lit.size.h.max(1) as f64,
-    );
-
-    let mut pixels = vec![0u8; width * height * 4];
-    for row in 0..height {
-        for col in 0..width {
-            let px = dark.loc.x as f64 + (col as f64 + 0.5) / width as f64 * dark.size.w as f64;
-            let py = dark.loc.y as f64 + (row as f64 + 0.5) / height as f64 * dark.size.h as f64;
-
-            // The nearest point on the lit output's border, and how far off.
-            let (qx, qy, distance) = if (x0..x1).contains(&px) && (y0..y1).contains(&py) {
-                // Overlapping layouts: light from the closest edge.
-                let nearest = (px - x0).min(x1 - px).min(py - y0).min(y1 - py);
-                if px - x0 == nearest {
-                    (x0, py, 0.0)
-                } else if x1 - px == nearest {
-                    (x1, py, 0.0)
-                } else if py - y0 == nearest {
-                    (px, y0, 0.0)
-                } else {
-                    (px, y1, 0.0)
-                }
-            } else {
-                let (qx, qy) = (px.clamp(x0, x1), py.clamp(y0, y1));
-                (qx, qy, (px - qx).hypot(py - qy))
-            };
-
-            let falloff = (1.0 - distance / reach).max(0.0);
-            if falloff == 0.0 {
-                continue;
-            }
-            let falloff = (falloff * falloff) as f32;
-            let point = ((qx - x0) / (x1 - x0), (qy - y0) / (y1 - y0));
-            let [r, g, b] = colors.at(point, tolerance);
-            let to_byte = |c: f32| (c * gain * falloff).clamp(0.0, 1.0).mul_add(255.0, 0.5) as u8;
-            let at = (row * width + col) * 4;
-            pixels[at] = to_byte(b);
-            pixels[at + 1] = to_byte(g);
-            pixels[at + 2] = to_byte(r);
-        }
-    }
-    for px in pixels.chunks_exact_mut(4) {
-        px[3] = 255;
-    }
-    GlowImage {
-        pixels,
-        width,
-        height,
-    }
-}
-
 /// What to draw on an output this frame.
 #[derive(Debug)]
 pub enum CinemaFrame {
@@ -382,8 +282,7 @@ pub struct Cover {
     level: f32,
     size: Size<i32, Logical>,
     solid: SolidColorRenderElement,
-    /// The glow image and its size in texels.
-    glow: Option<(MemoryRenderBuffer, Size<i32, Logical>)>,
+    glow: Option<GlowCover>,
 }
 
 impl Cover {
@@ -393,37 +292,43 @@ impl Cover {
         R: Renderer + ImportAll + ImportMem + GlesCapable,
         R::TextureId: Clone + Send + 'static,
     {
-        if let Some((buffer, texels)) = &self.glow
-            && let Ok(element) = MemoryRenderBufferRenderElement::from_buffer(
-                renderer,
-                (0.0, 0.0),
-                buffer,
-                Some(self.level),
-                Some(Rectangle::from_size(texels.to_f64())),
-                Some(self.size),
-                Kind::Unspecified,
-            )
-        {
-            return CustomRenderElements::Overlay(element);
+        if let Some(glow) = self.glow {
+            match glow::glow_program(renderer.gles_renderer()) {
+                Ok(program) => {
+                    return CustomRenderElements::Glow(
+                        glow.element(program, self.size, self.level),
+                    );
+                }
+                Err(err) => {
+                    static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+                    WARN_ONCE.call_once(|| {
+                        tracing::warn!(?err, "cinema: glow shader failed to compile, no glow");
+                    });
+                }
+            }
         }
         CustomRenderElements::Tint(self.solid)
     }
 }
 
-/// A glow image uploaded for one dark output, with what it was made from.
-#[derive(Debug)]
-struct GlowBuffer {
-    key: GlowKey,
-    buffer: MemoryRenderBuffer,
-    texels: Size<i32, Logical>,
-}
-
-#[derive(Debug, PartialEq)]
+/// What a dark output's glow element was made from.
+#[derive(Debug, Clone, PartialEq)]
 struct GlowKey {
     colors_generation: u64,
     lit: Rectangle<i32, Logical>,
     dark: Rectangle<i32, Logical>,
     glow: u32,
+    level: u32,
+}
+
+/// A dark output's glow: the lights, and the identity its element keeps
+/// across frames (so the damage tracker sees "unchanged" while the key is).
+#[derive(Debug)]
+struct GlowState {
+    key: GlowKey,
+    lights: Lights,
+    id: Id,
+    commit: CommitCounter,
 }
 
 /// Cinema mode's state on the render side: the sampled border colors and the
@@ -432,26 +337,38 @@ struct GlowKey {
 pub struct CinemaRender {
     /// The colors the glow shows right now.
     displayed: Option<BorderColors>,
-    /// The latest sampled colors, which `displayed` follows.
+    /// The latest sampled colors, which `displayed` slides to.
     target: Option<BorderColors>,
+    /// What `displayed` was when `target` came in, where the slide starts.
+    from: Option<BorderColors>,
+    /// When `target` came in, and how long the slide to it takes.
+    blend: Option<(Instant, Duration)>,
+    last_submit: Option<Instant>,
     /// Bumped whenever `displayed` changes.
     generation: u64,
     last_sample: Option<Instant>,
-    last_tick: Option<Instant>,
     solid: HashMap<String, SolidColorBuffer>,
-    glow: HashMap<String, GlowBuffer>,
+    glow: HashMap<String, GlowState>,
 }
 
 impl CinemaRender {
     /// What `output` should show this frame, given the protocol's current
     /// state (`None` when cinema mode is off).
+    ///
+    /// The lit output's border is asked for at most `sample_rate_hz` times a
+    /// second (`0`: whenever it changed).
     pub fn frame(
         &mut self,
         cinema: Option<&Cinema>,
         space: &Space<WindowElement>,
         output: &Output,
+        sample_rate_hz: u32,
     ) -> CinemaFrame {
-        self.frame_at(cinema, space, output, Instant::now())
+        let interval = match sample_rate_hz {
+            0 => Duration::ZERO,
+            hz => Duration::from_secs_f64(1.0 / f64::from(hz)),
+        };
+        self.frame_at(cinema, space, output, interval, Instant::now())
     }
 
     fn frame_at(
@@ -459,6 +376,7 @@ impl CinemaRender {
         cinema: Option<&Cinema>,
         space: &Space<WindowElement>,
         output: &Output,
+        sample_interval: Duration,
         now: Instant,
     ) -> CinemaFrame {
         let Some(cinema) = cinema else {
@@ -479,11 +397,14 @@ impl CinemaRender {
         self.tick(now);
 
         if output.name() == cinema.lit_output {
+            // A little early counts as due: frames arrive a few microseconds
+            // off their nominal time, and a rate equal to the refresh rate
+            // should sample every frame, not most of them.
+            let wait = sample_interval - sample_interval / 8;
             let due = self
                 .last_sample
-                .is_none_or(|at| now.saturating_duration_since(at) >= SAMPLE_INTERVAL);
+                .is_none_or(|at| now.saturating_duration_since(at) >= wait);
             if cinema.glow > 0.0 && due {
-                self.last_sample = Some(now);
                 return CinemaFrame::Lit {
                     force: self.displayed.is_none(),
                 };
@@ -517,29 +438,25 @@ impl CinemaRender {
                     lit,
                     dark,
                     glow: (cinema.glow * 1000.0).round() as u32,
+                    level: (cinema.level * 1000.0).round() as u32,
                 };
                 if self.glow.get(&name).is_none_or(|g| g.key != key) {
-                    let image = rasterize_glow(lit, dark, colors, cinema.glow);
-                    let size = (image.width as i32, image.height as i32);
-                    let buffer = MemoryRenderBuffer::from_slice(
-                        &image.pixels,
-                        Fourcc::Argb8888,
-                        size,
-                        1,
-                        Transform::Normal,
-                        Some(vec![Rectangle::from_size(size.into())]),
-                    );
-                    let texels = Size::from(size);
-                    self.glow.insert(
-                        name.clone(),
-                        GlowBuffer {
-                            key,
-                            buffer,
-                            texels,
-                        },
-                    );
+                    let lights = Lights::new(lit, dark, colors, cinema.glow);
+                    let state = self.glow.entry(name.clone()).or_insert_with(|| GlowState {
+                        key: key.clone(),
+                        lights: lights.clone(),
+                        id: Id::new(),
+                        commit: CommitCounter::default(),
+                    });
+                    state.key = key;
+                    state.lights = lights;
+                    state.commit.increment();
                 }
-                self.glow.get(&name).map(|g| (g.buffer.clone(), g.texels))
+                self.glow.get(&name).map(|g| GlowCover {
+                    id: g.id.clone(),
+                    commit: g.commit,
+                    lights: g.lights.clone(),
+                })
             }
             _ => {
                 self.glow.remove(&name);
@@ -555,26 +472,54 @@ impl CinemaRender {
         }))
     }
 
-    /// Takes the border colors read from the lit output's frame.
-    pub fn submit(&mut self, strips: &BorderStrips) {
-        let colors = BorderColors::from_strips(strips);
-        // The first colors fade in from black instead of popping.
-        self.displayed.get_or_insert_with(BorderColors::black);
-        self.target = Some(colors);
+    /// Marks that the lit output's border was just sampled (or tried to be),
+    /// starting the wait for the next sample. Not done by `frame`: a frame
+    /// without changes is not sampled, and must not use up the interval -
+    /// the glow would then wait a whole interval after the picture changed.
+    pub fn sampled(&mut self) {
+        self.last_sample = Some(Instant::now());
     }
 
-    /// Eases the displayed colors towards the sampled ones for the time
-    /// passed since the last frame.
+    /// Takes the border colors read from the lit output's frame.
+    pub fn submit(&mut self, strips: &BorderStrips, sample_px: u32) {
+        self.submit_at(strips, sample_px, Instant::now());
+    }
+
+    fn submit_at(&mut self, strips: &BorderStrips, sample_px: u32, now: Instant) {
+        let colors = BorderColors::from_strips(strips, sample_px);
+        // The first colors fade in from black instead of popping; later ones
+        // are reached over the time the sample took to arrive, from wherever
+        // the glow is now, so it never jumps.
+        let len = match self.last_submit.replace(now) {
+            Some(last) if self.displayed.is_some() => {
+                now.saturating_duration_since(last).clamp(BLEND.0, BLEND.1)
+            }
+            _ => FADE_IN,
+        };
+        self.from = Some(
+            self.displayed
+                .get_or_insert_with(|| BorderColors::black_like(&colors))
+                .clone(),
+        );
+        self.target = Some(colors);
+        self.blend = Some((now, len));
+    }
+
+    /// Slides the displayed colors from where they were towards the latest
+    /// sample, for the time passed since it came in.
     fn tick(&mut self, now: Instant) {
-        let dt = self
-            .last_tick
-            .replace(now)
-            .map_or(Duration::ZERO, |at| now.saturating_duration_since(at));
-        let (Some(displayed), Some(target)) = (&mut self.displayed, &self.target) else {
+        let (Some(from), Some(target), Some((start, len))) = (&self.from, &self.target, self.blend)
+        else {
             return;
         };
-        let k = 1.0 - (-dt.as_secs_f32() / COLOR_SMOOTHING.as_secs_f32()).exp();
-        if displayed.approach(target, k) {
+        let t = (now.saturating_duration_since(start).as_secs_f32() / len.as_secs_f32()).min(1.0);
+        let next = if t >= 1.0 {
+            target.clone()
+        } else {
+            from.lerp(target, t)
+        };
+        if self.displayed.as_ref() != Some(&next) {
+            self.displayed = Some(next);
             self.generation += 1;
         }
     }
@@ -591,6 +536,15 @@ impl CinemaRender {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pixels of an edge per color in these tests.
+    const PX: u32 = 10;
+    /// The sample interval (25 Hz) the tests run at.
+    const SAMPLE_INTERVAL: Duration = Duration::from_millis(40);
+
+    fn colors_of(strips: &BorderStrips) -> BorderColors {
+        BorderColors::from_strips(strips, PX)
+    }
 
     fn rect(x: i32, y: i32, w: i32, h: i32) -> Rectangle<i32, Logical> {
         Rectangle::new((x, y).into(), (w, h).into())
@@ -617,9 +571,24 @@ mod tests {
         }
     }
 
-    fn pixel(image: &GlowImage, col: usize, row: usize) -> [u8; 3] {
-        let px = &image.pixels[(row * image.width + col) * 4..][..4];
-        [px[2], px[1], px[0]] // RGB
+    /// The glow on `dark` (a lit output at `lit` next to it) as 8-bit RGB at
+    /// `(x, y)` logical pixels from the top left of `dark`.
+    fn glow_at(
+        lit: Rectangle<i32, Logical>,
+        dark: Rectangle<i32, Logical>,
+        colors: &BorderColors,
+        strength: f32,
+        (x, y): (i32, i32),
+    ) -> [u8; 3] {
+        let lights = Lights::new(lit, dark, colors, strength);
+        lights
+            .at((x as f32, y as f32))
+            .map(|c| (c * 255.0 + 0.5) as u8)
+    }
+
+    /// The usual layout: a 1920x1080 output with another one to its right.
+    fn left_of_dark() -> (Rectangle<i32, Logical>, Rectangle<i32, Logical>) {
+        (rect(0, 0, 1920, 1080), rect(1920, 0, 1920, 1080))
     }
 
     #[test]
@@ -629,12 +598,34 @@ mod tests {
             360,
             [[255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 255]],
         );
-        let colors = BorderColors::from_strips(&strips);
-        assert_eq!(colors.top.len(), EDGE_SAMPLES);
+        let colors = colors_of(&strips);
+        assert_eq!(colors.top.len(), 64);
+        assert_eq!(colors.left.len(), 36);
         assert_eq!(colors.top[7], [1.0, 0.0, 0.0]);
         assert_eq!(colors.bottom[0], [0.0, 1.0, 0.0]);
-        assert_eq!(colors.left[EDGE_SAMPLES - 1], [0.0, 0.0, 1.0]);
+        assert_eq!(colors.left[35], [0.0, 0.0, 1.0]);
         assert_eq!(colors.right[20], [1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn the_sample_width_sets_the_number_of_colors_per_side() {
+        let strips = flat_strips(1920, 1080, [[10, 20, 30]; 4]);
+        for (px, top, left) in [(1, 1920, 1080), (10, 192, 108), (100, 20, 11), (4000, 4, 3)] {
+            let colors = BorderColors::from_strips(&strips, px);
+            assert_eq!((colors.top.len(), colors.left.len()), (top, left), "{px}");
+            assert_eq!(colors.bottom.len(), top);
+            assert_eq!(colors.right.len(), left);
+        }
+        // 0 and absurd values are clamped rather than dividing by zero.
+        assert_eq!(BorderColors::from_strips(&strips, 0).top.len(), 1920);
+        assert_eq!(BorderColors::from_strips(&strips, u32::MAX).top.len(), 4);
+    }
+
+    #[test]
+    fn blending_between_different_numbers_of_colors_snaps() {
+        let coarse = BorderColors::from_strips(&flat_strips(640, 360, [[255; 3]; 4]), 100);
+        let fine = BorderColors::from_strips(&flat_strips(640, 360, [[0; 3]; 4]), 10);
+        assert_eq!(coarse.lerp(&fine, 0.5), fine);
     }
 
     #[test]
@@ -651,12 +642,9 @@ mod tests {
                 });
             }
         }
-        let colors = BorderColors::from_strips(&strips);
+        let colors = colors_of(&strips);
         assert_eq!(colors.top[0], [1.0, 0.0, 0.0]);
-        assert_eq!(colors.top[EDGE_SAMPLES - 1], [0.0, 0.0, 1.0]);
-        // Interpolating between cells stays between the two.
-        let mid = side_color(&colors.top, 0.5);
-        assert!(mid[0] > 0.2 && mid[0] < 0.8, "{mid:?}");
+        assert_eq!(colors.top[63], [0.0, 0.0, 1.0]);
     }
 
     #[test]
@@ -677,30 +665,24 @@ mod tests {
 
     #[test]
     fn glow_on_a_right_neighbour_takes_the_lit_outputs_right_edge() {
-        let colors = BorderColors::from_strips(&flat_strips(
+        let colors = colors_of(&flat_strips(
             640,
             360,
             [[0, 0, 0], [0, 0, 0], [0, 0, 0], [255, 128, 0]],
         ));
-        let image = rasterize_glow(
-            rect(0, 0, 1920, 1080),
-            rect(1920, 0, 1920, 1080),
-            &colors,
-            1.0,
-        );
+        let (lit, dark) = left_of_dark();
+        let at = |x, y| glow_at(lit, dark, &colors, 1.0, (x, y));
 
         // Left edge of the dark output: the right edge's orange, bright.
-        let near = pixel(&image, 0, image.height / 2);
+        let near = at(6, 540);
         assert!(
             near[0] > 200 && near[1] > 80 && near[1] < near[0] && near[2] == 0,
             "{near:?}"
         );
         // It fades with distance and is black beyond the reach.
-        let mid = pixel(&image, image.width / 8, image.height / 2);
-        assert!(mid[0] < near[0] && mid[0] > 0, "{mid:?} vs {near:?}");
-        assert_eq!(pixel(&image, image.width - 1, image.height / 2), [0, 0, 0]);
-        // Fully opaque.
-        assert!(image.pixels.chunks_exact(4).all(|p| p[3] == 255));
+        let mid = at(240, 540);
+        assert!(mid[1] < near[1] && mid[1] > 0, "{mid:?} vs {near:?}");
+        assert_eq!(at(1914, 540), [0, 0, 0]);
     }
 
     #[test]
@@ -717,74 +699,174 @@ mod tests {
                 });
             }
         }
-        let colors = BorderColors::from_strips(&strips);
-        let image = rasterize_glow(
-            rect(0, 0, 1920, 1080),
-            rect(1920, 0, 1920, 1080),
-            &colors,
-            1.0,
+        let colors = colors_of(&strips);
+        let (lit, dark) = left_of_dark();
+        let upper = glow_at(lit, dark, &colors, 1.0, (6, 270));
+        let lower = glow_at(lit, dark, &colors, 1.0, (6, 810));
+        // Each half is dominated by its own color; the other one's light
+        // reaches over a little, since lights mix.
+        assert!(upper[0] > 100 && upper[2] < upper[0] / 2, "{upper:?}");
+        assert!(lower[2] > 100 && lower[0] < lower[2] / 2, "{lower:?}");
+    }
+
+    /// The right edge of a 640x360 frame, white where `lit(y)` and black elsewhere.
+    fn right_edge_lit_where(lit: impl Fn(usize) -> bool) -> BorderColors {
+        let mut strips = flat_strips(640, 360, [[0; 3]; 4]);
+        for y in 0..360 {
+            for x in 0..strips.depth {
+                let px = &mut strips.right[(y * strips.depth + x) * 4..][..4];
+                px.copy_from_slice(if lit(y) {
+                    &[255, 255, 255, 255]
+                } else {
+                    &[0, 0, 0, 255]
+                });
+            }
+        }
+        colors_of(&strips)
+    }
+
+    #[test]
+    fn a_bright_spot_on_the_edge_lights_a_disc_not_a_stripe() {
+        // A short bright stretch in the middle of the right edge.
+        let colors = right_edge_lit_where(|y| (170..190).contains(&y));
+        let (lit, dark) = left_of_dark();
+        let at = |x, y| glow_at(lit, dark, &colors, 1.0, (x, y))[0];
+
+        let at_spot = at(12, 540);
+        // A quarter of the screen above and below the spot (still within
+        // reach) the light has spread there, dimmer than at the spot, and
+        // the same either way.
+        let (above, below) = (at(12, 270), at(12, 810));
+        assert!(above > 0 && below > 0, "{above} {below}");
+        assert!(
+            above < at_spot && below < at_spot,
+            "{above} {below} vs {at_spot}"
         );
-        let upper = pixel(&image, 1, image.height / 4);
-        let lower = pixel(&image, 1, image.height * 3 / 4);
-        assert!(upper[0] > 100 && upper[2] < 20, "{upper:?}");
-        assert!(lower[2] > 100 && lower[0] < 20, "{lower:?}");
+        assert!(above.abs_diff(below) <= 1, "{above} {below}");
+        // It dims smoothly going out, in every direction.
+        let along: Vec<u8> = (0..12).map(|i| at(12 + i * 50, 540)).collect();
+        assert!(along.windows(2).all(|w| w[1] <= w[0]), "{along:?}");
+        let away: Vec<u8> = (0..10).map(|i| at(12, 540 + i * 50)).collect();
+        assert!(away.windows(2).all(|w| w[1] <= w[0]), "{away:?}");
+    }
+
+    #[test]
+    fn lights_of_different_colors_mix_between_them() {
+        // Right edge: red in the upper quarter, blue in the lower quarter.
+        let mut strips = flat_strips(640, 360, [[0; 3]; 4]);
+        for y in 0..360 {
+            for x in 0..strips.depth {
+                let px = &mut strips.right[(y * strips.depth + x) * 4..][..4];
+                px.copy_from_slice(if y < 90 {
+                    &[0, 0, 255, 255]
+                } else if y >= 270 {
+                    &[255, 0, 0, 255]
+                } else {
+                    &[0, 0, 0, 255]
+                });
+            }
+        }
+        let (lit, dark) = left_of_dark();
+        let middle = glow_at(lit, dark, &colors_of(&strips), 1.0, (6, 540));
+        // Halfway between them both reach the texel: a mix, the same of each.
+        assert!(middle[0] > 10 && middle[2] > 10, "{middle:?}");
+        assert!(middle[0].abs_diff(middle[2]) <= 1, "{middle:?}");
+        assert_eq!(middle[1], 0);
+    }
+
+    #[test]
+    fn a_uniform_edge_is_as_bright_as_its_color_whatever_the_sample_width() {
+        let strips = flat_strips(640, 360, [[0, 0, 0], [0, 0, 0], [0, 0, 0], [100, 100, 100]]);
+        let (lit, dark) = left_of_dark();
+        // Half strength boosts the colors 1.15 times.
+        for px in [1, 4, 10, 64, 512] {
+            let colors = BorderColors::from_strips(&strips, px);
+            // (Away from the ends of the edge, where a line of lights is short of
+            // the lights beyond it.)
+            for y in [400, 540, 680] {
+                let at_edge = glow_at(lit, dark, &colors, 0.5, (0, y))[0];
+                assert!(
+                    (f32::from(at_edge) - 100.0 * 1.15).abs() < 8.0,
+                    "{px} px, y {y}: {at_edge}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn moving_a_small_bright_object_along_the_edge_moves_the_glow_smoothly() {
+        // A 4 px bright dot on a 1920 px edge, far narrower than the 60 px
+        // between lights, moved a color (10 px) at a time: where the glow
+        // is brightest along the edge must follow it step by step, not
+        // stay at a light and then leap to the next.
+        let (lit, dark) = (rect(0, 1080, 1920, 1080), rect(0, 0, 1920, 1080));
+        let centroid = |dot_x: usize| {
+            let mut strips = flat_strips(1920, 1080, [[0; 3]; 4]);
+            for y in 0..strips.depth {
+                for x in dot_x..dot_x + 4 {
+                    strips.top[(y * 1920 + x) * 4..][..4].copy_from_slice(&[255, 255, 255, 255]);
+                }
+            }
+            let lights = Lights::new(lit, dark, &colors_of(&strips), 1.0);
+            let (mut sum, mut weighted) = (0.0f32, 0.0f32);
+            for x in (0..1920).step_by(4) {
+                let brightness = lights.at((x as f32, 1074.0))[0];
+                sum += brightness;
+                weighted += brightness * x as f32;
+            }
+            weighted / sum
+        };
+        let positions: Vec<f32> = (0..9).map(|i| centroid(900 + 10 * i)).collect();
+        let steps: Vec<f32> = positions.windows(2).map(|w| w[1] - w[0]).collect();
+        assert!(
+            steps.iter().all(|&s| (5.0..=15.0).contains(&s)),
+            "{steps:?} (positions {positions:?})"
+        );
     }
 
     #[test]
     fn a_monitor_above_gets_the_top_edge_and_a_diagonal_one_the_corner() {
-        let colors = BorderColors::from_strips(&flat_strips(
+        let colors = colors_of(&flat_strips(
             640,
             360,
             [[0, 255, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0]],
         ));
         let lit = rect(0, 1080, 1920, 1080);
-        let above = rasterize_glow(lit, rect(0, 0, 1920, 1080), &colors, 1.0);
+        let above = rect(0, 0, 1920, 1080);
         // Bottom of the dark output touches the lit one's top edge.
-        let near = pixel(&above, above.width / 2, above.height - 1);
+        let near = glow_at(lit, above, &colors, 1.0, (960, 1074));
         assert!(near[1] > 150 && near[0] == 0, "{near:?}");
-        assert_eq!(pixel(&above, above.width / 2, 0), [0, 0, 0]);
+        assert_eq!(glow_at(lit, above, &colors, 1.0, (960, 0)), [0, 0, 0]);
 
         // Diagonally up-left: only the corner's neighbourhood glows, and
         // only faintly compared to the directly adjacent one.
-        let diagonal = rasterize_glow(lit, rect(-1920, 0, 1920, 1080), &colors, 1.0);
-        let corner = pixel(&diagonal, diagonal.width - 1, diagonal.height - 1);
+        let diagonal = rect(-1920, 0, 1920, 1080);
+        let corner = glow_at(lit, diagonal, &colors, 1.0, (1914, 1074));
         assert!(corner[1] > 0 && corner[1] <= near[1], "{corner:?}");
-        assert_eq!(pixel(&diagonal, 0, 0), [0, 0, 0]);
+        assert_eq!(glow_at(lit, diagonal, &colors, 1.0, (0, 0)), [0, 0, 0]);
     }
 
     #[test]
     fn a_stronger_glow_is_brighter_and_reaches_further() {
-        let colors = BorderColors::from_strips(&flat_strips(640, 360, [[200, 200, 200]; 4]));
-        let lit = rect(0, 0, 1920, 1080);
-        let dark = rect(1920, 0, 1920, 1080);
-        let weak = rasterize_glow(lit, dark, &colors, 0.1);
-        let strong = rasterize_glow(lit, dark, &colors, 1.0);
-        let row = weak.height / 2;
-        assert!(pixel(&strong, 0, row)[0] > pixel(&weak, 0, row)[0]);
-        let lit_texels = |image: &GlowImage| {
-            (0..image.width)
-                .filter(|&c| pixel(image, c, row)[0] > 0)
-                .count()
-        };
-        assert!(lit_texels(&strong) > lit_texels(&weak));
+        let colors = colors_of(&flat_strips(640, 360, [[200, 200, 200]; 4]));
+        let (lit, dark) = left_of_dark();
+        let at = |strength, x| glow_at(lit, dark, &colors, strength, (x, 540))[0];
+        assert!(at(1.0, 0) > at(0.1, 0));
+        let reach = |strength| (0..1920).filter(|&x| at(strength, x) > 0).count();
+        assert!(reach(1.0) > reach(0.1));
     }
 
     #[test]
     fn a_dark_output_inside_the_lit_one_still_glows_from_its_edges() {
-        let colors = BorderColors::from_strips(&flat_strips(
+        let colors = colors_of(&flat_strips(
             640,
             360,
             [[0, 0, 0], [0, 0, 0], [0, 0, 0], [255, 255, 255]],
         ));
         // Overlapping layout: the dark output sits over the lit one's right half.
-        let image = rasterize_glow(
-            rect(0, 0, 1920, 1080),
-            rect(960, 0, 960, 1080),
-            &colors,
-            1.0,
-        );
+        let (lit, dark) = (rect(0, 0, 1920, 1080), rect(960, 0, 960, 1080));
         // Its right side is next to the lit output's right edge: bright.
-        assert!(pixel(&image, image.width - 1, image.height / 2)[0] > 200);
+        assert!(glow_at(lit, dark, &colors, 1.0, (954, 540))[0] > 200);
     }
 
     fn output(name: &str, x: i32) -> Output {
@@ -827,17 +909,17 @@ mod tests {
 
         // Off: nothing special anywhere.
         assert!(matches!(
-            render.frame_at(None, &space, &left, now),
+            render.frame_at(None, &space, &left, SAMPLE_INTERVAL, now),
             CinemaFrame::Normal
         ));
 
         // Without a glow the lit output is left alone, the other gets a plain cover.
         let plain = cinema("DP-1", 0.0);
         assert!(matches!(
-            render.frame_at(Some(&plain), &space, &left, now),
+            render.frame_at(Some(&plain), &space, &left, SAMPLE_INTERVAL, now),
             CinemaFrame::Normal
         ));
-        match render.frame_at(Some(&plain), &space, &right, now) {
+        match render.frame_at(Some(&plain), &space, &right, SAMPLE_INTERVAL, now) {
             CinemaFrame::Dark(cover) => {
                 assert_eq!(cover.size, Size::from((1920, 1080)));
                 assert!(cover.glow.is_none());
@@ -848,35 +930,51 @@ mod tests {
         // With a glow the lit output is sampled, forced while there are no colors yet.
         let glowing = cinema("DP-1", 1.0);
         assert!(matches!(
-            render.frame_at(Some(&glowing), &space, &left, now),
+            render.frame_at(Some(&glowing), &space, &left, SAMPLE_INTERVAL, now),
+            CinemaFrame::Lit { force: true }
+        ));
+        // A frame that was not sampled (no changes) leaves the sample due.
+        assert!(matches!(
+            render.frame_at(
+                Some(&glowing),
+                &space,
+                &left,
+                SAMPLE_INTERVAL,
+                now + SAMPLE_INTERVAL / 2
+            ),
             CinemaFrame::Lit { force: true }
         ));
         // Not again before the interval is over.
+        render.last_sample = Some(now);
         assert!(matches!(
-            render.frame_at(Some(&glowing), &space, &left, now + SAMPLE_INTERVAL / 2),
+            render.frame_at(
+                Some(&glowing),
+                &space,
+                &left,
+                SAMPLE_INTERVAL,
+                now + SAMPLE_INTERVAL / 2
+            ),
             CinemaFrame::Normal
         ));
+        let later = now + SAMPLE_INTERVAL;
         // Until colors are in, the dark output has no glow image.
-        match render.frame_at(Some(&glowing), &space, &right, now) {
+        match render.frame_at(Some(&glowing), &space, &right, SAMPLE_INTERVAL, now) {
             CinemaFrame::Dark(cover) => assert!(cover.glow.is_none()),
             other => panic!("{other:?}"),
         }
 
-        render.submit(&flat_strips(640, 360, [[255, 255, 255]; 4]));
-        let later = now + SAMPLE_INTERVAL;
+        render.submit_at(&flat_strips(640, 360, [[255, 255, 255]; 4]), PX, later);
         assert!(matches!(
-            render.frame_at(Some(&glowing), &space, &left, later),
+            render.frame_at(Some(&glowing), &space, &left, SAMPLE_INTERVAL, later),
             CinemaFrame::Lit { force: false }
         ));
         // The glow fades in over a few frames rather than appearing at once.
         let mut brightness = vec![];
         for frame in 1..=40 {
             let at = later + Duration::from_millis(16 * frame);
-            match render.frame_at(Some(&glowing), &space, &right, at) {
+            match render.frame_at(Some(&glowing), &space, &right, SAMPLE_INTERVAL, at) {
                 CinemaFrame::Dark(cover) => {
-                    let (buffer, texels) = cover.glow.expect("colors are in");
-                    assert_eq!(texels, Size::from((160, 90)));
-                    drop(buffer);
+                    assert!(cover.glow.is_some(), "colors are in");
                 }
                 other => panic!("{other:?}"),
             }
@@ -885,17 +983,52 @@ mod tests {
         assert!(brightness[0] > 0.0 && brightness[0] < 1.0, "{brightness:?}");
         assert!(brightness.windows(2).all(|w| w[1] >= w[0]));
         assert!(
-            brightness.iter().filter(|&&b| b < 1.0).count() > 20,
+            brightness.iter().filter(|&&b| b < 1.0).count() > 10,
             "{brightness:?}"
         );
         assert_eq!(*brightness.last().unwrap(), 1.0);
 
         // Back to off: everything is forgotten.
         assert!(matches!(
-            render.frame_at(None, &space, &right, later),
+            render.frame_at(None, &space, &right, SAMPLE_INTERVAL, later),
             CinemaFrame::Normal
         ));
         assert!(render.displayed.is_none() && render.glow.is_empty());
+    }
+
+    #[test]
+    fn the_sample_rate_sets_how_often_the_lit_output_is_sampled() {
+        let (left, right) = (output("DP-1", 0), output("DP-2", 1920));
+        let mut space = Space::<WindowElement>::default();
+        space.map_output(&left, (0, 0));
+        space.map_output(&right, (1920, 0));
+        let glowing = cinema("DP-1", 1.0);
+        let now = Instant::now();
+
+        // Counts the samples asked for over one second of 60 Hz frames, each
+        // answered as soon as it is asked for.
+        let samples_at = |interval: Duration| {
+            let mut render = CinemaRender::default();
+            (0..60)
+                .filter(|frame| {
+                    let at = now + Duration::from_micros(1_000_000 * frame / 60);
+                    let due = matches!(
+                        render.frame_at(Some(&glowing), &space, &left, interval, at),
+                        CinemaFrame::Lit { .. }
+                    );
+                    if due {
+                        render.last_sample = Some(at);
+                    }
+                    due
+                })
+                .count()
+        };
+        assert_eq!(samples_at(Duration::from_secs_f64(1.0 / 10.0)), 10);
+        assert_eq!(samples_at(Duration::from_secs_f64(1.0 / 30.0)), 30);
+        // As often as there are frames, or more: every frame.
+        assert_eq!(samples_at(Duration::from_secs_f64(1.0 / 60.0)), 60);
+        assert_eq!(samples_at(Duration::from_secs_f64(1.0 / 240.0)), 60);
+        assert_eq!(samples_at(Duration::ZERO), 60);
     }
 
     #[test]
@@ -906,23 +1039,58 @@ mod tests {
         let mut render = CinemaRender::default();
         let unplugged = cinema("HDMI-A-1", 1.0);
         assert!(matches!(
-            render.frame_at(Some(&unplugged), &space, &only, Instant::now()),
+            render.frame_at(
+                Some(&unplugged),
+                &space,
+                &only,
+                SAMPLE_INTERVAL,
+                Instant::now()
+            ),
             CinemaFrame::Normal
         ));
     }
 
     #[test]
-    fn displayed_colors_ease_towards_the_samples_and_settle() {
-        let target = BorderColors::from_strips(&flat_strips(640, 360, [[255, 255, 255]; 4]));
-        let mut displayed = BorderColors::black();
-        assert!(displayed.approach(&target, 0.5));
-        assert!((displayed.top[0][0] - 0.5).abs() < 1e-6);
-        let mut steps = 0;
-        while displayed.approach(&target, 0.5) {
-            steps += 1;
-            assert!(steps < 50, "never settles");
-        }
-        assert_eq!(displayed, target);
-        assert!(!displayed.approach(&target, 0.5));
+    fn displayed_colors_slide_from_the_old_sample_to_the_new_one() {
+        let white = colors_of(&flat_strips(640, 360, [[255, 255, 255]; 4]));
+        let black = BorderColors::black_like(&white);
+        assert_eq!(black.lerp(&white, 0.0), black);
+        assert_eq!(black.lerp(&white, 1.0), white);
+        assert!((black.lerp(&white, 0.25).top[0][0] - 0.25).abs() < 1e-6);
+
+        let mut render = CinemaRender::default();
+        let start = Instant::now();
+        render.submit_at(&flat_strips(640, 360, [[255, 255, 255]; 4]), PX, start);
+        render.tick(start + FADE_IN);
+        assert_eq!(render.displayed.as_ref(), Some(&white));
+
+        // A darker sample after a long pause is reached linearly over the
+        // longest slide, starting from the colors shown when it came in.
+        let at = start + FADE_IN + Duration::from_millis(500);
+        render.submit_at(&flat_strips(640, 360, [[0, 0, 0]; 4]), PX, at);
+        render.tick(at + BLEND.1 / 2);
+        let half = render.displayed.as_ref().unwrap().top[0][0];
+        assert!((half - 0.5).abs() < 1e-3, "{half}");
+        render.tick(at + BLEND.1);
+        assert_eq!(render.displayed.as_ref(), Some(&black));
+
+        // A sample 40 ms after a slide starts takes 40 ms, and starts from
+        // the mid-slide colors rather than jumping.
+        let first = at + BLEND.1 + Duration::from_millis(500);
+        render.submit_at(&flat_strips(640, 360, [[255, 255, 255]; 4]), PX, first);
+        let next = first + Duration::from_millis(40);
+        render.tick(next);
+        assert!((render.displayed.as_ref().unwrap().top[0][0] - 0.5).abs() < 1e-3);
+        render.submit_at(&flat_strips(640, 360, [[0, 0, 0]; 4]), PX, next);
+        render.tick(next + Duration::from_millis(20));
+        let quarter = render.displayed.as_ref().unwrap().top[0][0];
+        assert!((quarter - 0.25).abs() < 1e-3, "{quarter}");
+        render.tick(next + Duration::from_millis(40));
+        assert_eq!(render.displayed.as_ref(), Some(&black));
+
+        // Settled colors stop bumping the generation (no re-rasterizing).
+        let generation = render.generation;
+        render.tick(next + Duration::from_millis(100));
+        assert_eq!(render.generation, generation);
     }
 }

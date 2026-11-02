@@ -552,6 +552,34 @@ impl Default for PerformanceSettings {
     }
 }
 
+/// Cinema mode (see the `ironland-cinema-mode-v1` protocol): the glow cast
+/// on the dark outputs by the lit output's border.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct CinemaSettings {
+    /// Width, in pixels of the lit output, of one color sample along its
+    /// edges: one averaged color is taken per this many pixels of each edge
+    /// and then spread over the glow's lights (32 per side). Smaller keeps
+    /// the position of small bright objects moving along the edge more
+    /// exactly (and flickers more with fine detail); beyond a few pixels
+    /// it makes no visible difference. Clamped to 1..=512 when used.
+    pub edge_sample_px: u32,
+    /// How many times a second, at most, the lit output's border is sampled
+    /// (only frames with changes are). Higher follows the picture more
+    /// closely but costs more GPU time per second, since each sample reads
+    /// the frame back; `0` samples every frame with changes.
+    pub sample_rate_hz: u32,
+}
+
+impl Default for CinemaSettings {
+    fn default() -> Self {
+        Self {
+            edge_sample_px: 10,
+            sample_rate_hz: 25,
+        }
+    }
+}
+
 /// Key-state overlay for diagnosing stuck/phantom keys (e.g. a Ctrl key that
 /// reads as held without being touched). Off by default - purely a
 /// diagnostic tool.
@@ -610,6 +638,7 @@ struct RawConfig {
     session: SessionSettings,
     vm: VmSettings,
     performance: PerformanceSettings,
+    cinema: CinemaSettings,
     key_tracker: KeyTrackerSettings,
     shortcuts: HashMap<String, Vec<String>>,
     gestures: HashMap<String, Vec<String>>,
@@ -658,6 +687,8 @@ pub struct Config {
     pub vm: VmSettings,
     /// FPS overlay and frame stutter analytics (see [`PerformanceSettings`]).
     pub performance: PerformanceSettings,
+    /// Cinema mode's glow (see [`CinemaSettings`]).
+    pub cinema: CinemaSettings,
     /// Key-state overlay for finding stuck keys (see [`KeyTrackerSettings`]).
     pub key_tracker: KeyTrackerSettings,
     /// action name -> key combos, e.g. `"toggle_launcher" -> ["ctrl+space"]`.
@@ -701,6 +732,7 @@ impl Default for Config {
             session: SessionSettings::default(),
             vm: VmSettings::default(),
             performance: PerformanceSettings::default(),
+            cinema: CinemaSettings::default(),
             key_tracker: KeyTrackerSettings::default(),
             shortcuts: default_shortcuts(),
             gestures: default_gestures(),
@@ -1073,6 +1105,7 @@ impl Config {
                     session: raw.session,
                     vm: raw.vm,
                     performance: raw.performance,
+                    cinema: raw.cinema,
                     key_tracker: raw.key_tracker,
                     shortcuts,
                     gestures,
@@ -1161,6 +1194,7 @@ mod tests {
             session: SessionSettings::default(),
             vm: VmSettings::default(),
             performance: PerformanceSettings::default(),
+            cinema: CinemaSettings::default(),
             key_tracker: KeyTrackerSettings::default(),
             shortcuts,
             gestures: HashMap::new(),
@@ -1496,6 +1530,19 @@ mod tests {
         assert_eq!(raw.performance.stutter_threshold_ms, 20.0);
         assert!(!raw.performance.stutter_log);
         assert_eq!(raw.performance.fps_overlay_interval_ms, 1000);
+    }
+
+    #[test]
+    fn cinema_edge_sample_width_defaults_and_parses() {
+        let raw: RawConfig = toml::from_str("").unwrap();
+        assert_eq!(raw.cinema, CinemaSettings::default());
+        assert_eq!(raw.cinema.edge_sample_px, 10);
+        assert_eq!(raw.cinema.sample_rate_hz, 25);
+
+        let raw: RawConfig =
+            toml::from_str("[cinema]\nedge_sample_px = 4\nsample_rate_hz = 60\n").unwrap();
+        assert_eq!(raw.cinema.edge_sample_px, 4);
+        assert_eq!(raw.cinema.sample_rate_hz, 60);
     }
 
     #[test]

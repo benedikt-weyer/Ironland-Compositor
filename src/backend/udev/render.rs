@@ -351,7 +351,13 @@ impl AnvilState<UdevData> {
             )
         });
         let cinema = self.cinema_mode_state.current();
-        let cinema_frame = self.cinema.frame(cinema.as_ref(), &self.space, &output);
+        let cinema_frame = self.cinema.frame(
+            cinema.as_ref(),
+            &self.space,
+            &output,
+            self.config.cinema.sample_rate_hz,
+        );
+        let wants_border_sample = matches!(cinema_frame, crate::cinema::CinemaFrame::Lit { .. });
         let capture_frame_index = surface.capture_frame_index;
         let since_vblank = surface.pending_vblank_at.take().map(|at| at.elapsed());
         let result = render_surface(
@@ -391,8 +397,15 @@ impl AnvilState<UdevData> {
         );
         let reschedule = match result {
             Ok((has_rendered, states, timings, border_strips)) => {
+                let sampled = border_strips.is_some();
                 if let Some(strips) = border_strips {
-                    self.cinema.submit(&strips);
+                    self.cinema.submit(&strips, self.config.cinema.edge_sample_px);
+                }
+                // Only a frame that was really sampled (or failed to be)
+                // starts the wait for the next sample; one without changes
+                // is skipped and tried again on the next.
+                if wants_border_sample && (has_rendered || sampled) {
+                    self.cinema.sampled();
                 }
                 let dmabuf_feedback = surface.dmabuf_feedback.clone();
                 if has_rendered {

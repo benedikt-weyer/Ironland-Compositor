@@ -74,6 +74,9 @@ smithay::backend::renderer::element::render_elements! {
     // The focus-highlight border around the currently focused window (see
     // `crate::border`).
     Border=crate::border::BorderRenderElement,
+    // The glow of a dark output in cinema mode: a pixel shader (see
+    // `crate::cinema`).
+    Glow=crate::cinema::GlowRenderElement,
     // A solid quad over the whole output: the night-mode tint (see
     // `crate::tint`) or the black cover of a dark output in cinema mode (see
     // `crate::cinema`).
@@ -95,6 +98,7 @@ impl<R: Renderer> std::fmt::Debug for CustomRenderElements<R> {
             Self::Blur(arg0) => f.debug_tuple("Blur").field(arg0).finish(),
             Self::Thumbnail(arg0) => f.debug_tuple("Thumbnail").field(arg0).finish(),
             Self::Border(_) => f.debug_tuple("Border").finish(),
+            Self::Glow(_) => f.debug_tuple("Glow").finish(),
             Self::Tint(arg0) => f.debug_tuple("Tint").field(arg0).finish(),
             #[cfg(feature = "debug")]
             Self::Fps(arg0) => f.debug_tuple("Fps").field(arg0).finish(),
