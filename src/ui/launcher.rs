@@ -174,10 +174,41 @@ fn parse_exec(exec: &str, name: &str) -> Option<(String, Vec<String>)> {
     Some((program, iter.collect()))
 }
 
+/// `PATH` for a launched program: the compositor's own plus the places a
+/// program installed for the user normally lives. The compositor often runs
+/// as a systemd user unit whose `PATH` is a fixed list of store paths, which
+/// has none of these - `steam` (system package) then fails with ENOENT while
+/// a program that happens to be on that list launches fine.
+fn launch_path(current: Option<&std::ffi::OsStr>, home: Option<&Path>, user: Option<&str>) -> std::ffi::OsString {
+    let mut dirs: Vec<PathBuf> = current.map(|p| env::split_paths(p).collect()).unwrap_or_default();
+    let mut fallbacks: Vec<PathBuf> = Vec::new();
+    if let Some(home) = home {
+        fallbacks.push(home.join(".nix-profile/bin"));
+    }
+    if let Some(user) = user {
+        fallbacks.push(PathBuf::from(format!("/etc/profiles/per-user/{user}/bin")));
+    }
+    fallbacks.push("/run/wrappers/bin".into());
+    fallbacks.push("/run/current-system/sw/bin".into());
+    fallbacks.push("/nix/var/nix/profiles/default/bin".into());
+    for dir in fallbacks {
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    env::join_paths(dirs).unwrap_or_default()
+}
+
 /// Applies compositor-provided environment overrides to `cmd`. A `None` value
 /// unsets the variable instead of setting it (used to strip an inherited
 /// `DISPLAY` so X11-capable toolkits can't fall back to the host's X server).
 fn apply_envs<'a>(cmd: &mut Command, envs: impl IntoIterator<Item = &'a (&'static str, Option<String>)>) {
+    let home = env::var_os("HOME").map(PathBuf::from);
+    let user = env::var("USER").ok();
+    cmd.env(
+        "PATH",
+        launch_path(env::var_os("PATH").as_deref(), home.as_deref(), user.as_deref()),
+    );
     for (key, value) in envs {
         match value {
             Some(value) => {
@@ -280,6 +311,30 @@ pub fn filter_entries(entries: &[DesktopEntry], query: &str) -> Vec<usize> {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsStr;
+
+    #[test]
+    fn launch_path_adds_system_dirs_without_duplicates() {
+        let out = launch_path(
+            Some(OsStr::new("/a/bin:/run/current-system/sw/bin")),
+            Some(Path::new("/home/u")),
+            Some("u"),
+        );
+        let dirs: Vec<PathBuf> = env::split_paths(&out).collect();
+        assert_eq!(dirs[0], PathBuf::from("/a/bin"));
+        assert!(dirs.contains(&PathBuf::from("/home/u/.nix-profile/bin")));
+        assert!(dirs.contains(&PathBuf::from("/etc/profiles/per-user/u/bin")));
+        assert_eq!(
+            dirs.iter().filter(|d| **d == Path::new("/run/current-system/sw/bin")).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn launch_path_works_without_a_path() {
+        let out = launch_path(None, None, None);
+        assert!(env::split_paths(&out).any(|d| d == Path::new("/run/current-system/sw/bin")));
+    }
     use super::*;
 
     fn entry(name: &str) -> DesktopEntry {

@@ -911,7 +911,20 @@ impl Drop for SurfaceData {
     fn drop(&mut self) {
         self.output.leave_all();
         if let Some(global) = self.global.take() {
-            self.dh.remove_global::<AnvilState<UdevData>>(global);
+            // Two-step removal, as the Wayland protocol intends: disabling
+            // sends `global_remove` and hides the global from new registries,
+            // but a client that already saw it in its registry can still bind
+            // it. Destroying it right away turns that race into a fatal
+            // protocol error for the client - at startup the NVIDIA connector
+            // rescan tears outputs down within a second, which killed
+            // XWayland ("global wl_output is unavailable") and left the whole
+            // session without X11 (Steam: "Unable to open X11 display").
+            self.dh.disable_global::<AnvilState<UdevData>>(global.clone());
+            let dh = self.dh.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                dh.remove_global::<AnvilState<UdevData>>(global);
+            });
         }
     }
 }
