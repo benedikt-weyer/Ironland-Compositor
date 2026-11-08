@@ -20,6 +20,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicU8, Ordering},
     },
+    thread::JoinHandle,
     time::{Duration, Instant},
 };
 
@@ -46,6 +47,8 @@ pub struct TorService {
     child: Option<Child>,
     bootstrap: Arc<AtomicU8>,
     problem: Arc<Mutex<Option<String>>>,
+    /// The threads reading Tor's output; they end when Tor's pipes close.
+    readers: Vec<JoinHandle<()>>,
     last_attempt: Option<Instant>,
 }
 
@@ -90,7 +93,10 @@ fn is_problem(line: &str) -> bool {
     line.contains("[warn]") || line.contains("[err]") || line.contains("[error]")
 }
 
-fn read_lines(pipe: impl Read + Send + 'static, mut on_line: impl FnMut(&str) + Send + 'static) {
+fn read_lines(
+    pipe: impl Read + Send + 'static,
+    mut on_line: impl FnMut(&str) + Send + 'static,
+) -> Option<JoinHandle<()>> {
     let spawned = std::thread::Builder::new()
         .name("vm-tor-log".into())
         .spawn(move || {
@@ -98,9 +104,9 @@ fn read_lines(pipe: impl Read + Send + 'static, mut on_line: impl FnMut(&str) + 
                 on_line(&line);
             }
         });
-    if let Err(err) = spawned {
-        warn!(%err, "Could not start the Tor log reader");
-    }
+    spawned
+        .inspect_err(|err| warn!(%err, "Could not start the Tor log reader"))
+        .ok()
 }
 
 impl TorService {
@@ -110,6 +116,7 @@ impl TorService {
             child: None,
             bootstrap: Arc::new(AtomicU8::new(0)),
             problem: Arc::new(Mutex::new(None)),
+            readers: Vec::new(),
             last_attempt: None,
         }
     }
@@ -133,6 +140,7 @@ impl TorService {
             Ok(None) => true,
             Ok(Some(status)) => {
                 warn!(%status, "Tor exited");
+                self.drain_readers();
                 if self.problem.lock().is_ok_and(|p| p.is_none()) {
                     self.set_problem(Some(format!("tor exited ({status})")));
                 }
@@ -142,6 +150,16 @@ impl TorService {
             }
             Err(_) => false,
         }
+    }
+
+    /// Waits (briefly) for the log readers to deliver what Tor printed before
+    /// it exited, so the reason it gave beats the bare exit status.
+    fn drain_readers(&mut self) {
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < deadline && self.readers.iter().any(|r| !r.is_finished()) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        self.readers.clear();
     }
 
     pub fn status(&mut self) -> TorStatus {
@@ -195,8 +213,9 @@ impl TorService {
 
         let bootstrap = self.bootstrap.clone();
         let problem = self.problem.clone();
+        self.readers.clear();
         if let Some(stdout) = child.stdout.take() {
-            read_lines(stdout, move |line| {
+            self.readers.extend(read_lines(stdout, move |line| {
                 if let Some(percent) = parse_bootstrap(line) {
                     bootstrap.store(percent, Ordering::Relaxed);
                 } else if is_problem(line)
@@ -204,15 +223,15 @@ impl TorService {
                 {
                     *problem = Some(line.split("] ").last().unwrap_or(line).to_string());
                 }
-            });
+            }));
         }
         if let Some(stderr) = child.stderr.take() {
             let problem = self.problem.clone();
-            read_lines(stderr, move |line| {
+            self.readers.extend(read_lines(stderr, move |line| {
                 if let Ok(mut problem) = problem.lock() {
                     *problem = Some(line.split("] ").last().unwrap_or(line).to_string());
                 }
-            });
+            }));
         }
         info!(port, binary, "Started Tor");
         self.endpoint.set(Some(port));
