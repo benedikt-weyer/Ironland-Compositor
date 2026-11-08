@@ -33,7 +33,7 @@ pub use backend::x11;
 pub use input::{focus, input_handler, keybindings};
 pub use protocols::{
     cinema_mode, clipboard, display_filter, ext_workspace, focus_grab, foreign_toplevel, frame_capture, ironland_protocols,
-    screencopy, shortcuts, vm_launch, workspace_windows,
+    screencopy, shortcuts, vm_launch, workspace_windows, xdg_session,
 };
 #[cfg(any(feature = "udev", feature = "xwayland"))]
 pub use render::cursor;

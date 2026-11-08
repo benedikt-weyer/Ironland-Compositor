@@ -49,6 +49,71 @@ enum Node {
     },
 }
 
+/// The shape of one workspace's tiling tree with the windows replaced by
+/// labels `L`: what [`crate::shell::session_restore`] saves and puts back.
+/// Splits keep their orientation and ratio, so a restored layout is the saved
+/// one however its windows turn up.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TreeShape<L> {
+    Leaf {
+        window: L,
+    },
+    Split {
+        /// `true` = children sit side by side; see [`Node::Split`].
+        vertical: bool,
+        ratio: f32,
+        a: Box<TreeShape<L>>,
+        b: Box<TreeShape<L>>,
+    },
+}
+
+impl<L> TreeShape<L> {
+    /// The shape with every leaf that `keep` rejects removed, its sibling
+    /// taking over the split's whole area. `None` if nothing is left.
+    pub fn pruned(self, keep: &impl Fn(&L) -> bool) -> Option<TreeShape<L>> {
+        match self {
+            TreeShape::Leaf { window } => keep(&window).then_some(TreeShape::Leaf { window }),
+            TreeShape::Split { vertical, ratio, a, b } => match (a.pruned(keep), b.pruned(keep)) {
+                (Some(a), Some(b)) => Some(TreeShape::Split {
+                    vertical,
+                    ratio,
+                    a: Box::new(a),
+                    b: Box::new(b),
+                }),
+                (one, other) => one.or(other),
+            },
+        }
+    }
+
+    /// The leaves, first to last.
+    pub fn leaves(&self) -> Vec<&L> {
+        match self {
+            TreeShape::Leaf { window } => vec![window],
+            TreeShape::Split { a, b, .. } => {
+                let mut leaves = a.leaves();
+                leaves.extend(b.leaves());
+                leaves
+            }
+        }
+    }
+
+    fn map<M>(&self, label: &mut impl FnMut(&L) -> Option<M>) -> Option<TreeShape<M>> {
+        match self {
+            TreeShape::Leaf { window } => label(window).map(|window| TreeShape::Leaf { window }),
+            TreeShape::Split { vertical, ratio, a, b } => match (a.map(label), b.map(label)) {
+                (Some(a), Some(b)) => Some(TreeShape::Split {
+                    vertical: *vertical,
+                    ratio: *ratio,
+                    a: Box::new(a),
+                    b: Box::new(b),
+                }),
+                (one, other) => one.or(other),
+            },
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct TilingLayout {
     root: Option<Node>,
@@ -87,6 +152,61 @@ impl TilingLayout {
             walk(root, &mut out);
         }
         out
+    }
+
+    /// The tree's shape with each window replaced by `label(window)`;
+    /// windows `label` gives no label for are left out (their sibling takes
+    /// the space). `None` for an empty tree.
+    pub fn shape<L>(&self, mut label: impl FnMut(&WindowElement) -> Option<L>) -> Option<TreeShape<L>> {
+        fn walk<L>(node: &Node, label: &mut impl FnMut(&WindowElement) -> Option<L>) -> Option<TreeShape<L>> {
+            match node {
+                Node::Leaf(w) => label(w).map(|window| TreeShape::Leaf { window }),
+                Node::Split { vertical, ratio, a, b } => match (walk(a, label), walk(b, label)) {
+                    (Some(a), Some(b)) => Some(TreeShape::Split {
+                        vertical: *vertical,
+                        ratio: *ratio,
+                        a: Box::new(a),
+                        b: Box::new(b),
+                    }),
+                    (one, other) => one.or(other),
+                },
+            }
+        }
+        walk(self.root.as_ref()?, &mut label)
+    }
+
+    /// Rebuilds the tree from `shape`, whose leaves are looked up in `placed`;
+    /// a leaf with no window there is dropped like in [`TreeShape::pruned`].
+    /// Windows already in the tree that `placed` doesn't contain keep their
+    /// place in the layout by being inserted afterwards the usual way.
+    pub fn restore_shape(
+        &mut self,
+        shape: &TreeShape<usize>,
+        placed: &std::collections::HashMap<usize, WindowElement>,
+        area: Rectangle<i32, Logical>,
+    ) {
+        fn build(shape: TreeShape<WindowElement>) -> Node {
+            match shape {
+                TreeShape::Leaf { window } => Node::Leaf(window),
+                TreeShape::Split { vertical, ratio, a, b } => Node::Split {
+                    vertical,
+                    ratio,
+                    a: Box::new(build(*a)),
+                    b: Box::new(build(*b)),
+                },
+            }
+        }
+        let extras: Vec<WindowElement> = self
+            .windows()
+            .into_iter()
+            .filter(|w| !placed.values().any(|p| p == w))
+            .collect();
+        let shape = shape.map(&mut |id: &usize| placed.get(id).cloned());
+        self.root = shape.map(build);
+        self.last = self.windows().last().cloned();
+        for window in extras {
+            self.insert(window, area, None);
+        }
     }
 
     /// Insert `window`, splitting the leaf for `target` (or the last-touched
@@ -1531,5 +1651,67 @@ mod window_animation_tests {
         let (sx, sy) = center(shrunk);
         assert!((cx - sx).abs() <= 1);
         assert!((cy - sy).abs() <= 1);
+    }
+}
+
+#[cfg(test)]
+mod shape_tests {
+    use super::TreeShape::{self, Leaf, Split};
+
+    fn split(vertical: bool, ratio: f32, a: TreeShape<u32>, b: TreeShape<u32>) -> TreeShape<u32> {
+        Split { vertical, ratio, a: Box::new(a), b: Box::new(b) }
+    }
+
+    fn leaf(window: u32) -> TreeShape<u32> {
+        Leaf { window }
+    }
+
+    #[test]
+    fn pruning_a_leaf_lets_its_sibling_take_the_whole_split() {
+        let tree = split(true, 0.3, leaf(1), split(false, 0.6, leaf(2), leaf(3)));
+        let pruned = tree.pruned(&|w| *w != 1).unwrap();
+        assert_eq!(pruned, split(false, 0.6, leaf(2), leaf(3)));
+    }
+
+    #[test]
+    fn pruning_keeps_the_ratios_of_what_remains() {
+        let tree = split(true, 0.3, leaf(1), split(false, 0.6, leaf(2), leaf(3)));
+        let pruned = tree.pruned(&|w| *w != 3).unwrap();
+        assert_eq!(pruned, split(true, 0.3, leaf(1), leaf(2)));
+    }
+
+    #[test]
+    fn pruning_everything_leaves_nothing() {
+        assert_eq!(split(true, 0.5, leaf(1), leaf(2)).pruned(&|_| false), None);
+    }
+
+    #[test]
+    fn leaves_are_listed_first_to_last() {
+        let tree = split(true, 0.5, split(false, 0.5, leaf(4), leaf(2)), leaf(9));
+        assert_eq!(tree.leaves(), vec![&4, &2, &9]);
+    }
+
+    #[test]
+    fn a_shape_survives_json() {
+        let tree = split(true, 0.25, leaf(0), split(false, 0.5, leaf(1), leaf(2)));
+        let json = serde_json::to_string(&tree).unwrap();
+        assert_eq!(serde_json::from_str::<TreeShape<u32>>(&json).unwrap(), tree);
+    }
+
+    #[test]
+    fn map_relabels_and_drops_unlabelled_leaves() {
+        let tree = split(true, 0.4, leaf(1), split(false, 0.5, leaf(2), leaf(3)));
+        let mapped = tree
+            .map(&mut |w: &u32| (*w != 2).then(|| format!("w{w}")))
+            .unwrap();
+        assert_eq!(
+            mapped,
+            Split {
+                vertical: true,
+                ratio: 0.4,
+                a: Box::new(Leaf { window: "w1".to_string() }),
+                b: Box::new(Leaf { window: "w3".to_string() }),
+            }
+        );
     }
 }

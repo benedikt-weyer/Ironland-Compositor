@@ -198,6 +198,24 @@ type WindowAnimationSettings struct {
 	DurationMs uint32 `json:"duration_ms"`
 }
 
+// SessionRestoreSettings mirrors `ironland_config::SessionRestoreSettings`:
+// saving the desktop layout and bringing it back at login. Defaults come
+// from `ironlandctl defaults`, like every other section.
+type SessionRestoreSettings struct {
+	Enabled bool `json:"enabled"`
+	// SaveDelayMs is how long the layout has to stay unchanged before it is
+	// written out.
+	SaveDelayMs uint32 `json:"save_delay_ms"`
+	// RestoreDelayMs is how long after the session came up the apps start.
+	RestoreDelayMs uint32 `json:"restore_delay_ms"`
+	// ClaimTimeoutSecs is how long a started app has to show its window.
+	ClaimTimeoutSecs uint32 `json:"claim_timeout_secs"`
+	// ExcludeAppIDs are never saved or restored (case-insensitive).
+	ExcludeAppIDs []string `json:"exclude_app_ids"`
+	// RestoreVMs starts persistent VMs again too.
+	RestoreVMs bool `json:"restore_vms"`
+}
+
 // KeyTrackerSettings mirrors `ironland_config::KeyTrackerSettings`: the
 // stuck-key diagnostic overlay, off by default. Carried here so a `Config`
 // round-tripped through this GUI doesn't wipe it (see PerformanceSettings).
@@ -246,6 +264,10 @@ type Config struct {
 	// WindowAnimations has no GUI tab yet; carried through so saving doesn't
 	// drop it (or fail to parse, since the Rust side requires the field).
 	WindowAnimations WindowAnimationSettings `json:"window_animations"`
+	// SessionRestore has only its on/off switches in the GUI (Session tab);
+	// the delays and the exclude list are carried through so saving doesn't
+	// drop them.
+	SessionRestore SessionRestoreSettings `json:"session_restore"`
 }
 
 // OutputPosition mirrors `ironland_config::OutputPosition`: exactly one of
@@ -421,6 +443,10 @@ func advertisedEventLabel(name string) string {
 // `ironland_config::default_shortcuts`.
 func defaultShortcuts() map[string][]string {
 	return defaultConfig().Shortcuts
+}
+
+func defaultSessionRestoreSettings() SessionRestoreSettings {
+	return defaultConfig().SessionRestore
 }
 
 func defaultSessionSettings() SessionSettings {

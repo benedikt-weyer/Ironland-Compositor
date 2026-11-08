@@ -107,5 +107,38 @@ func buildSessionTab(cfg *Config) fyne.CanvasObject {
 	)
 	hint.Wrapping = fyne.TextWrapWord
 
-	return resets.page(container.NewVBox(form, warning, hint))
+	// Saving the layout and restoring it at login.
+	restoreDefaults := defaultSessionRestoreSettings()
+	restoreVMs := widget.NewCheck("Also start persistent VMs again", func(checked bool) {
+		cfg.SessionRestore.RestoreVMs = checked
+		resets.refresh()
+	})
+	restoreVMs.SetChecked(cfg.SessionRestore.RestoreVMs)
+	restoreEnabled := widget.NewCheck("Restore the desktop at login", func(checked bool) {
+		cfg.SessionRestore.Enabled = checked
+		if checked {
+			restoreVMs.Enable()
+		} else {
+			restoreVMs.Disable()
+		}
+		resets.refresh()
+	})
+	restoreEnabled.SetChecked(cfg.SessionRestore.Enabled)
+	if !cfg.SessionRestore.Enabled {
+		restoreVMs.Disable()
+	}
+	restoreForm := widget.NewForm(
+		widget.NewFormItem("", resets.item(restoreEnabled, func() bool { return cfg.SessionRestore.Enabled != restoreDefaults.Enabled }, func() { restoreEnabled.SetChecked(restoreDefaults.Enabled) })),
+		widget.NewFormItem("", resets.item(restoreVMs, func() bool { return cfg.SessionRestore.RestoreVMs != restoreDefaults.RestoreVMs }, func() { restoreVMs.SetChecked(restoreDefaults.RestoreVMs) })),
+	)
+	restoreHint := widget.NewLabel(
+		"The compositor keeps the workspaces, the position of every window and how to start its app in" +
+			" ~/.local/state/ironland-compositor/session.json, and starts those apps again at the next login," +
+			" putting their windows back. Apps that support the xdg-session-management protocol restore" +
+			" their own windows exactly. Throw-away VMs and dialogs are never saved. Takes effect the next" +
+			" time the compositor starts.",
+	)
+	restoreHint.Wrapping = fyne.TextWrapWord
+
+	return resets.page(container.NewVBox(form, warning, hint, widget.NewSeparator(), restoreForm, restoreHint))
 }

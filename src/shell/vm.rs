@@ -249,6 +249,9 @@ struct PersistState {
 struct VmInstance {
     /// Display name of the launched application, for logs.
     name: String,
+    /// Desktop entry id of the launched application (what a session restore
+    /// starts again).
+    entry_id: String,
     /// Scratch directory holding this VM's logs.
     dir: PathBuf,
     qemu: Child,
@@ -302,6 +305,13 @@ struct Usage {
     cpu_percent: f32,
 }
 
+/// A running VM as [`VmManager::describe`] reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VmDescription {
+    pub entry_id: String,
+    pub persistent: bool,
+}
+
 /// All running VMs, plus the plumbing they share.
 #[derive(Debug)]
 pub struct VmManager {
@@ -332,6 +342,16 @@ impl VmManager {
 
     pub fn len(&self) -> usize {
         self.instances.len()
+    }
+
+    /// What a session restore needs to know about the running VM `id`: the
+    /// program it runs and whether it is persistent.
+    pub fn describe(&self, id: VmId) -> Option<VmDescription> {
+        let vm = self.instances.get(&id)?;
+        Some(VmDescription {
+            entry_id: vm.entry_id.clone(),
+            persistent: vm.persist.is_some(),
+        })
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1283,6 +1303,7 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             id,
             VmInstance {
                 name: entry.name.clone(),
+                entry_id: entry.id.clone(),
                 dir,
                 qemu,
                 waypipe: None,
@@ -2162,6 +2183,7 @@ mod tests {
     ) -> VmInstance {
         VmInstance {
             name: "test".into(),
+            entry_id: "test.desktop".into(),
             dir: PathBuf::from("/nonexistent"),
             qemu,
             waypipe,

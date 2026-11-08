@@ -349,6 +349,47 @@ impl Default for SessionSettings {
     }
 }
 
+/// Saving the desktop layout and bringing it back at the next login (see
+/// `shell::session_restore` in the compositor crate).
+///
+/// The compositor keeps `session.json` in `$XDG_STATE_HOME/ironland-compositor`
+/// up to date (workspaces, where every window sits, how to start its app) and,
+/// when it starts, relaunches those apps and puts their windows back.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct SessionRestoreSettings {
+    /// Master switch: neither saves nor restores when off.
+    pub enabled: bool,
+    /// How long the layout has to stay unchanged before it is written out.
+    /// Also what keeps a logout (every window closing at once) from
+    /// overwriting the saved layout with an empty one.
+    pub save_delay_ms: u32,
+    /// How long after the session came up the apps are started, so the shell
+    /// and the portals are ready for them.
+    pub restore_delay_ms: u32,
+    /// How long a started app has to show its window before its place is
+    /// given up on.
+    pub claim_timeout_secs: u32,
+    /// App ids that are never saved or restored (matched case-insensitively).
+    pub exclude_app_ids: Vec<String>,
+    /// Whether persistent VMs are started again too (throw-away VMs never
+    /// are: they hold nothing worth coming back to).
+    pub restore_vms: bool,
+}
+
+impl Default for SessionRestoreSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            save_delay_ms: 3000,
+            restore_delay_ms: 1500,
+            claim_timeout_secs: 60,
+            exclude_app_ids: Vec::new(),
+            restore_vms: true,
+        }
+    }
+}
+
 /// Running programs inside QEMU virtual machines whose windows are forwarded
 /// to the host desktop (see `shell::vm` in the compositor crate).
 ///
@@ -646,6 +687,7 @@ struct RawConfig {
     focus: FocusSettings,
     lock: LockSettings,
     session: SessionSettings,
+    session_restore: SessionRestoreSettings,
     vm: VmSettings,
     performance: PerformanceSettings,
     cinema: CinemaSettings,
@@ -692,6 +734,9 @@ pub struct Config {
     pub lock: LockSettings,
     /// Session bring-up, e.g. starting the shell (see [`SessionSettings`]).
     pub session: SessionSettings,
+    /// Saving the layout and restoring it at login (see
+    /// [`SessionRestoreSettings`]).
+    pub session_restore: SessionRestoreSettings,
     /// Launching programs inside QEMU VMs with host-integrated windows (see
     /// [`VmSettings`]).
     pub vm: VmSettings,
@@ -740,6 +785,7 @@ impl Default for Config {
             focus: FocusSettings::default(),
             lock: LockSettings::default(),
             session: SessionSettings::default(),
+            session_restore: SessionRestoreSettings::default(),
             vm: VmSettings::default(),
             performance: PerformanceSettings::default(),
             cinema: CinemaSettings::default(),
@@ -1113,6 +1159,7 @@ impl Config {
                     focus: raw.focus,
                     lock: raw.lock,
                     session: raw.session,
+                    session_restore: raw.session_restore,
                     vm: raw.vm,
                     performance: raw.performance,
                     cinema: raw.cinema,
@@ -1202,6 +1249,7 @@ mod tests {
             focus: FocusSettings::default(),
             lock: LockSettings::default(),
             session: SessionSettings::default(),
+            session_restore: SessionRestoreSettings::default(),
             vm: VmSettings::default(),
             performance: PerformanceSettings::default(),
             cinema: CinemaSettings::default(),
@@ -1405,6 +1453,32 @@ mod tests {
         assert_eq!(raw.session, SessionSettings::default());
         assert!(!raw.session.start_shell);
         assert_eq!(raw.session.shell_unit, "desktop-shell.service");
+    }
+
+    #[test]
+    fn session_restore_is_on_by_default_with_a_save_delay_that_survives_a_logout() {
+        let raw: RawConfig = toml::from_str("").unwrap();
+        assert_eq!(raw.session_restore, SessionRestoreSettings::default());
+        assert!(raw.session_restore.enabled);
+        assert!(raw.session_restore.restore_vms);
+        assert!(raw.session_restore.exclude_app_ids.is_empty());
+        // Long enough that every window of a logout closing at once is never
+        // mistaken for a layout worth saving.
+        assert!(raw.session_restore.save_delay_ms >= 1000);
+    }
+
+    #[test]
+    fn session_restore_settings_are_read_from_their_section() {
+        let raw: RawConfig = toml::from_str(
+            "[session_restore]\nenabled = false\nsave_delay_ms = 500\nexclude_app_ids = [\"steam\", \"Discord\"]\nrestore_vms = false\n",
+        )
+        .unwrap();
+        assert!(!raw.session_restore.enabled);
+        assert_eq!(raw.session_restore.save_delay_ms, 500);
+        assert_eq!(raw.session_restore.exclude_app_ids, ["steam", "Discord"]);
+        assert!(!raw.session_restore.restore_vms);
+        // What isn't given keeps its default.
+        assert_eq!(raw.session_restore.claim_timeout_secs, 60);
     }
 
     #[test]

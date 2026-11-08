@@ -703,8 +703,9 @@ pub fn run_udev() {
     #[cfg(feature = "xwayland")]
     let socket_name = state.socket_name.clone();
     #[cfg(feature = "xwayland")]
-    state.start_xwayland(move |_| {
-        crate::session::announce_session_start(socket_name.as_deref(), shell_unit.as_deref())
+    state.start_xwayland(move |state| {
+        crate::session::announce_session_start(socket_name.as_deref(), shell_unit.as_deref());
+        state.start_session_restore();
     });
 
     #[cfg(feature = "libei")]
@@ -712,6 +713,7 @@ pub fn run_udev() {
 
     #[cfg(not(feature = "xwayland"))]
     crate::session::announce_session_start(state.socket_name.as_deref(), shell_unit.as_deref());
+    state.start_session_restore();
 
     /*
      * And run our loop

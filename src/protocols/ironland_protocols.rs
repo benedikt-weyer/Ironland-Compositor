@@ -146,3 +146,22 @@ pub mod cinema_mode {
 
     wayland_scanner::generate_server_code!("./protocols/ironland-cinema-mode-v1.xml");
 }
+
+/// `xdg-session-management-v1` (staging in wayland-protocols). The crate
+/// ships the XML (vendored in `protocols/`) but no generated bindings for it,
+/// and Smithay has no support, so they are generated here like the custom
+/// protocols. It refers to `xdg_toplevel`, which comes from xdg-shell.
+pub mod xdg_session_management {
+    use wayland_protocols::xdg::shell::server::*;
+    use wayland_server;
+    use wayland_server::protocol::*;
+
+    pub mod __interfaces {
+        use wayland_protocols::xdg::shell::server::__interfaces::*;
+        use wayland_server::protocol::__interfaces::*;
+        wayland_scanner::generate_interfaces!("./protocols/xdg-session-management-v1.xml");
+    }
+    use self::__interfaces::*;
+
+    wayland_scanner::generate_server_code!("./protocols/xdg-session-management-v1.xml");
+}

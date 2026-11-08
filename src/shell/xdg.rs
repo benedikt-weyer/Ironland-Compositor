@@ -78,6 +78,9 @@ impl<BackendData: Backend> XdgShellHandler for AnvilState<BackendData> {
             tiling::resync_committed_window(state, surface);
         });
 
+        // Part of a session being restored? (By process; the app id comes later.)
+        self.session_window_created(&window);
+
         crate::foreign_toplevel::sync(self);
     }
 
@@ -85,7 +88,10 @@ impl<BackendData: Backend> XdgShellHandler for AnvilState<BackendData> {
         crate::foreign_toplevel::sync(self);
     }
 
-    fn app_id_changed(&mut self, _surface: ToplevelSurface) {
+    fn app_id_changed(&mut self, surface: ToplevelSurface) {
+        if let Some(window) = self.any_window_for_surface(surface.wl_surface()) {
+            self.session_window_identified(&window);
+        }
         crate::foreign_toplevel::sync(self);
     }
 

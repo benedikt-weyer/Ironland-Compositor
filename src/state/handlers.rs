@@ -687,4 +687,35 @@ impl<BackendData: Backend> crate::clipboard::ClipboardHistoryHandler for AnvilSt
     }
 }
 
+impl<BackendData: Backend + 'static> crate::xdg_session::XdgSessionHandler for AnvilState<BackendData> {
+    fn xdg_session_state(&mut self) -> &mut crate::xdg_session::XdgSessionState {
+        &mut self.xdg_session_state
+    }
+
+    fn xdg_toplevel_surface(
+        &mut self,
+        toplevel: &smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::XdgToplevel,
+    ) -> Option<smithay::reexports::wayland_server::protocol::wl_surface::WlSurface> {
+        self.xdg_shell_state
+            .get_toplevel(toplevel)
+            .map(|toplevel| toplevel.wl_surface().clone())
+    }
+
+    fn xdg_registry(&mut self) -> &mut crate::shell::session_restore::XdgRegistry {
+        &mut self.session_restore.xdg
+    }
+
+    fn xdg_restore_surface(
+        &mut self,
+        surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+        session: &str,
+        name: &str,
+    ) -> bool {
+        let Some(window) = self.any_window_for_surface(surface) else {
+            return false;
+        };
+        self.xdg_restore_toplevel(&window, session, name)
+    }
+}
+
 delegate_dispatch2!(@<BackendData: Backend + 'static> AnvilState<BackendData>);

@@ -777,7 +777,7 @@ mod tests {
     }
 
     fn entry(id: &str, name: &str) -> DesktopEntry {
-        DesktopEntry { id: id.into(), name: name.into(), exec: name.into(), terminal: false }
+        DesktopEntry { id: id.into(), name: name.into(), exec: name.into(), terminal: false, startup_wm_class: None }
     }
 
     /// A launcher showing Alacritty, Firefox and foot, of which only

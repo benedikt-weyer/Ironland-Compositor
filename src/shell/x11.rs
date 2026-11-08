@@ -128,6 +128,8 @@ impl<BackendData: Backend> XwmHandler for AnvilState<BackendData> {
                 xsurface.configure(Some(bbox)).unwrap();
             }
         }
+        // X11 windows have no pid to go by, but their class is known by now.
+        self.session_window_identified(&window);
         crate::foreign_toplevel::sync(self);
     }
 

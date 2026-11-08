@@ -214,6 +214,11 @@ pub struct AnvilState<BackendData: Backend + 'static> {
     pub display_filter_state: crate::display_filter::DisplayFilterState,
     pub cinema_mode_state: crate::cinema_mode::CinemaModeState,
     pub vm_launch_state: crate::vm_launch::VmLaunchState,
+    /// Saving the layout and bringing it back at login (see
+    /// `crate::shell::session_restore`).
+    pub session_restore: crate::shell::session_restore::SessionRestore,
+    /// The `xdg-session-management-v1` global.
+    pub xdg_session_state: crate::xdg_session::XdgSessionState,
     /// Per-output buffers for the night-mode tint overlay (see `crate::tint`).
     pub display_tint: crate::tint::DisplayTint,
     /// Cinema mode's covers and sampled border colors (see `crate::cinema`).
@@ -549,6 +554,7 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
         let display_filter_state = crate::display_filter::DisplayFilterState::new::<Self>(&dh);
         let cinema_mode_state = crate::cinema_mode::CinemaModeState::new::<Self>(&dh);
         let vm_launch_state = crate::vm_launch::VmLaunchState::new::<Self>(&dh);
+        let xdg_session_state = crate::xdg_session::XdgSessionState::new::<Self>(&dh);
         let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(&dh);
         let primary_selection_state = PrimarySelectionState::new::<Self>(&dh);
         let data_control_state =
@@ -651,6 +657,8 @@ impl<BackendData: Backend + 'static> AnvilState<BackendData> {
             display_filter_state,
             cinema_mode_state,
             vm_launch_state,
+            session_restore: Default::default(),
+            xdg_session_state,
             display_tint: Default::default(),
             cinema: Default::default(),
             output_manager_state,

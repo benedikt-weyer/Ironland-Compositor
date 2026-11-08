@@ -8,7 +8,7 @@ impl<BackendData: Backend> AnvilState<BackendData> {
     /// Wayland socket and, when there's no XWayland to fall back to, strip any
     /// inherited `DISPLAY` so X11-capable toolkits can't quietly reconnect to
     /// the host's X server instead of rendering here. `None` means "unset".
-    pub(super) fn compositor_envs(&self) -> impl Iterator<Item = (&'static str, Option<String>)> {
+    pub(crate) fn compositor_envs(&self) -> impl Iterator<Item = (&'static str, Option<String>)> {
         let wayland_display = self
             .socket_name
             .clone()

@@ -49,6 +49,7 @@ use crate::{
 mod element;
 mod grabs;
 pub(crate) mod ssd;
+pub mod session_restore;
 pub mod tiling;
 pub mod vm;
 pub mod vm_state;

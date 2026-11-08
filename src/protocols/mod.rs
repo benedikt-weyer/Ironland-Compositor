@@ -13,3 +13,4 @@ pub mod screencopy;
 pub mod shortcuts;
 pub mod vm_launch;
 pub mod workspace_windows;
+pub mod xdg_session;

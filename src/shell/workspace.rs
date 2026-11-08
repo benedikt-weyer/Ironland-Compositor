@@ -1272,7 +1272,7 @@ pub fn overlay_info(output: &Output) -> (usize, usize) {
 
 /// Every window belonging to `output`, across *every* workspace it has (not
 /// just the active one) - tiled and floating alike.
-fn all_windows_on_output(output: &Output) -> Vec<WindowElement> {
+pub(crate) fn windows_on_output(output: &Output) -> Vec<WindowElement> {
     let mut windows: Vec<WindowElement> = tiling::TilingState::all(output)
         .iter()
         .flat_map(tiling::TilingLayout::windows)
@@ -1294,7 +1294,7 @@ fn all_windows_on_output(output: &Output) -> Vec<WindowElement> {
 /// `state.space.elements()`, which only sees the *visible* (active-workspace)
 /// ones.
 pub(crate) fn all_windows<B: Backend>(state: &AnvilState<B>) -> Vec<WindowElement> {
-    state.all_outputs().flat_map(all_windows_on_output).collect()
+    state.all_outputs().flat_map(windows_on_output).collect()
 }
 
 /// The output+workspace `window` is currently homed to (tiled or floating),
@@ -1303,6 +1303,27 @@ pub(crate) fn window_home(window: &WindowElement) -> Option<(Output, usize)> {
     let home = WindowHome::get(window);
     let output = home.output.borrow().clone()?;
     Some((output, *home.index.borrow()))
+}
+
+/// Makes sure `output` has at least `count` workspaces, adding empty ones.
+pub(crate) fn ensure_workspaces(output: &Output, count: usize) {
+    let ws = WorkspaceState::get(output);
+    if count > ws.count() {
+        *ws.count.borrow_mut() = count;
+    }
+}
+
+/// Where a floating `window` is to appear when its workspace is shown: the
+/// spot remembered when the workspace was last hidden (or the window last
+/// moved). The live position of a *visible* window is in the space instead.
+pub(crate) fn floating_position(window: &WindowElement) -> Option<Point<i32, Logical>> {
+    *WindowHome::get(window).floating_pos.borrow()
+}
+
+/// Sets the spot [`floating_position`] reports; a hidden window appears
+/// there when its workspace is shown.
+pub(crate) fn set_floating_position(window: &WindowElement, pos: Point<i32, Logical>) {
+    *WindowHome::get(window).floating_pos.borrow_mut() = Some(pos);
 }
 
 /// Whether `window` is currently floating rather than tiled. `false` for a

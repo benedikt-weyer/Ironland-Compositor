@@ -102,6 +102,15 @@ pub fn write(doc: &mut DocumentMut, full: &FullConfig) {
     session["start_shell"] = value(cfg.session.start_shell);
     session["shell_unit"] = value(cfg.session.shell_unit.as_str());
 
+    let restore = ensure_table(doc, "session_restore");
+    restore["enabled"] = value(cfg.session_restore.enabled);
+    restore["save_delay_ms"] = value(i64::from(cfg.session_restore.save_delay_ms));
+    restore["restore_delay_ms"] = value(i64::from(cfg.session_restore.restore_delay_ms));
+    restore["claim_timeout_secs"] = value(i64::from(cfg.session_restore.claim_timeout_secs));
+    let excluded: Array = cfg.session_restore.exclude_app_ids.iter().map(String::as_str).collect();
+    restore["exclude_app_ids"] = value(excluded);
+    restore["restore_vms"] = value(cfg.session_restore.restore_vms);
+
     let window_animations = ensure_table(doc, "window_animations");
     window_animations["enabled"] = value(cfg.window_animations.enabled);
     window_animations["duration_ms"] = value(i64::from(cfg.window_animations.duration_ms));
@@ -185,4 +194,52 @@ pub fn write(doc: &mut DocumentMut, full: &FullConfig) {
         outputs.insert(name.as_str(), Item::Table(out));
     }
     doc["outputs"] = Item::Table(outputs);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What a save writes must read back identically, or a settings GUI
+    /// save would quietly reset the section.
+    #[test]
+    fn the_session_restore_section_is_written_and_read_back() {
+        let mut full = FullConfig::default();
+        full.config.session_restore.enabled = false;
+        full.config.session_restore.save_delay_ms = 750;
+        full.config.session_restore.restore_delay_ms = 4000;
+        full.config.session_restore.claim_timeout_secs = 20;
+        full.config.session_restore.exclude_app_ids = vec!["steam".into(), "Discord".into()];
+        full.config.session_restore.restore_vms = false;
+
+        let mut doc = DocumentMut::new();
+        write(&mut doc, &full);
+        let section = &doc["session_restore"];
+        assert_eq!(section["enabled"].as_bool(), Some(false));
+        assert_eq!(section["save_delay_ms"].as_integer(), Some(750));
+        assert_eq!(section["restore_delay_ms"].as_integer(), Some(4000));
+        assert_eq!(section["claim_timeout_secs"].as_integer(), Some(20));
+        assert_eq!(section["restore_vms"].as_bool(), Some(false));
+        let excluded: Vec<&str> = section["exclude_app_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(excluded, ["steam", "Discord"]);
+    }
+
+    /// A user's hand-written comments and layout around the section survive.
+    #[test]
+    fn saving_keeps_the_rest_of_the_file() {
+        let mut doc: DocumentMut = "# my notes\nterminal = \"foot\"\n\n[session_restore]\n# keep Steam out\nexclude_app_ids = [\"steam\"]\n"
+            .parse()
+            .unwrap();
+        let mut full = FullConfig::default();
+        full.config.session_restore.exclude_app_ids = vec!["steam".into()];
+        write(&mut doc, &full);
+        let text = doc.to_string();
+        assert!(text.contains("# my notes"), "{text}");
+        assert!(text.contains("# keep Steam out"), "{text}");
+    }
 }

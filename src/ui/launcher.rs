@@ -17,6 +17,9 @@ pub struct DesktopEntry {
     pub name: String,
     pub exec: String,
     pub terminal: bool,
+    /// `StartupWMClass=`: the app id / WM_CLASS the app's windows carry, when
+    /// that isn't the desktop file's own name.
+    pub startup_wm_class: Option<String>,
 }
 
 /// Directories to look for `applications/*.desktop` in, in priority order
@@ -86,6 +89,30 @@ pub fn find_entry(id: &str) -> Option<DesktopEntry> {
         .find(|entry| entry_id_matches(&entry.id, id))
 }
 
+/// The entry in `entries` whose windows carry `app_id`: by desktop file id
+/// (`org.mozilla.firefox` for `org.mozilla.firefox.desktop`), else by
+/// `StartupWMClass`, else by display name - each compared case-insensitively,
+/// since toolkits disagree about the case of an app id (`Alacritty` vs
+/// `alacritty`). Entries earlier in the slice win ties.
+pub fn entry_for_app_id<'a>(entries: &'a [DesktopEntry], app_id: &str) -> Option<&'a DesktopEntry> {
+    if app_id.is_empty() {
+        return None;
+    }
+    let same = |a: &str, b: &str| a.eq_ignore_ascii_case(b);
+    fn strip(id: &str) -> &str {
+        id.strip_suffix(".desktop").unwrap_or(id)
+    }
+    entries
+        .iter()
+        .find(|e| same(strip(&e.id), strip(app_id)))
+        .or_else(|| {
+            entries
+                .iter()
+                .find(|e| e.startup_wm_class.as_deref().is_some_and(|c| same(c, app_id)))
+        })
+        .or_else(|| entries.iter().find(|e| same(&e.name, app_id)))
+}
+
 fn parse_desktop_file(path: &Path, id: String) -> Option<DesktopEntry> {
     let contents = fs::read_to_string(path).ok()?;
 
@@ -93,6 +120,7 @@ fn parse_desktop_file(path: &Path, id: String) -> Option<DesktopEntry> {
     let mut name = None;
     let mut exec = None;
     let mut terminal = false;
+    let mut startup_wm_class = None;
     let mut is_application = true;
     let mut no_display = false;
     let mut hidden = false;
@@ -117,6 +145,7 @@ fn parse_desktop_file(path: &Path, id: String) -> Option<DesktopEntry> {
             "Name" => name = Some(value.to_string()),
             "Exec" => exec = Some(value.to_string()),
             "Terminal" => terminal = value.eq_ignore_ascii_case("true"),
+            "StartupWMClass" => startup_wm_class = Some(value.to_string()),
             "Type" => is_application = value == "Application",
             "NoDisplay" => no_display = value.eq_ignore_ascii_case("true"),
             "Hidden" => hidden = value.eq_ignore_ascii_case("true"),
@@ -133,6 +162,7 @@ fn parse_desktop_file(path: &Path, id: String) -> Option<DesktopEntry> {
         name: name?,
         exec: exec?,
         terminal,
+        startup_wm_class,
     })
 }
 
@@ -249,6 +279,23 @@ pub fn launch<'a>(
     }
 }
 
+/// Spawns `argv` (program first) with the same environment fixes as
+/// [`launch`]. For apps without a desktop entry, e.g. a session restore
+/// starting a program by the command line it was running with.
+pub fn launch_command<'a>(
+    argv: &[String],
+    envs: impl IntoIterator<Item = &'a (&'static str, Option<String>)>,
+) -> std::io::Result<Child> {
+    let (program, args) = argv
+        .split_first()
+        .ok_or_else(|| std::io::Error::other("empty command"))?;
+    info!(program, "Launching command");
+    let mut cmd = Command::new(program);
+    cmd.args(args);
+    apply_envs(&mut cmd, envs);
+    cmd.spawn()
+}
+
 /// The command line to run inside a VM guest for `entry`: its `Exec=`
 /// program and arguments (field codes stripped, see [`parse_exec`]), wrapped
 /// in `<terminal> -e ...` for `Terminal=true` entries just like [`launch`] does
@@ -343,7 +390,29 @@ mod tests {
             name: name.to_string(),
             exec: String::new(),
             terminal: false,
+            startup_wm_class: None,
         }
+    }
+
+    #[test]
+    fn app_ids_find_their_entry_by_id_then_wm_class_then_name() {
+        let mut firefox = entry("org.mozilla.firefox");
+        firefox.name = "Firefox".into();
+        let mut code = entry("code");
+        code.startup_wm_class = Some("Code".into());
+        let entries = vec![firefox, code, entry("Alacritty")];
+
+        let id = |app_id: &str| entry_for_app_id(&entries, app_id).map(|e| e.id.as_str());
+        assert_eq!(id("org.mozilla.firefox"), Some("org.mozilla.firefox.desktop"));
+        assert_eq!(id("org.mozilla.firefox.desktop"), Some("org.mozilla.firefox.desktop"));
+        // Case differs between toolkits.
+        assert_eq!(id("alacritty"), Some("Alacritty.desktop"));
+        // Not the file name: matched through StartupWMClass.
+        assert_eq!(id("Code"), Some("code.desktop"));
+        // Last resort: the display name.
+        assert_eq!(id("firefox"), Some("org.mozilla.firefox.desktop"));
+        assert_eq!(id("unknown-app"), None);
+        assert_eq!(id(""), None);
     }
 
     #[test]

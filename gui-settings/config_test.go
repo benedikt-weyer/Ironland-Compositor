@@ -109,6 +109,39 @@ func TestSaveThenLoadRoundTrips(t *testing.T) {
 	}
 }
 
+// The session-restore section has only two switches in the GUI; everything
+// else in it must survive a save untouched, or editing any setting would
+// quietly reset the user's exclude list and delays.
+func TestSessionRestoreSurvivesASave(t *testing.T) {
+	requireIronlandctl(t)
+	dir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", dir)
+	t.Setenv("IRONLAND_COMPOSITOR_CONFIG", "")
+
+	cfg := defaultConfig()
+	if !cfg.SessionRestore.Enabled {
+		t.Fatalf("session restore should default to on, got %+v", cfg.SessionRestore)
+	}
+	cfg.SessionRestore = SessionRestoreSettings{
+		Enabled:          false,
+		SaveDelayMs:      750,
+		RestoreDelayMs:   4000,
+		ClaimTimeoutSecs: 20,
+		ExcludeAppIDs:    []string{"steam", "Discord"},
+		RestoreVMs:       false,
+	}
+	if _, err := saveConfig(cfg); err != nil {
+		t.Fatalf("saveConfig: %v", err)
+	}
+	loaded, _, err := loadConfig()
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if !reflect.DeepEqual(loaded.SessionRestore, cfg.SessionRestore) {
+		t.Fatalf("session_restore changed in a save: got %+v, want %+v", loaded.SessionRestore, cfg.SessionRestore)
+	}
+}
+
 func TestEqualStrings(t *testing.T) {
 	for _, test := range []struct {
 		name string
